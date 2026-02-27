@@ -21,6 +21,26 @@ const cstd = struct {
 
 const trace = @import("trace.zig");
 
+const darwin = if (builtin.os.tag.isDarwin()) struct {
+    const mach_port_t = c_uint;
+    const clock_serv_t = mach_port_t;
+    const kern_return_t = c_int;
+    const mach_timespec_t = extern struct {
+        sec: c_uint,
+        nsec: c_int,
+    };
+    const CALENDAR_CLOCK: c_int = 1;
+
+    extern "c" fn mach_host_self() mach_port_t;
+    extern "c" fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) kern_return_t;
+    extern "c" fn clock_get_time(clock_serv: clock_serv_t, cur_time: *mach_timespec_t) kern_return_t;
+    extern "c" fn host_get_clock_service(
+        host: mach_port_t,
+        clock_id: c_int,
+        clock_serv: *clock_serv_t,
+    ) kern_return_t;
+} else struct {};
+
 const global = struct {
     export var optarg: ?[*:0]u8 = null;
     export var opterr: c_int = 1;
@@ -307,19 +327,45 @@ comptime {
     }
 }
 
+fn setTimespec(tp: *os.timespec, sec: anytype, nsec: anytype) void {
+    if (@hasField(os.timespec, "tv_sec")) {
+        tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(sec));
+        tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(nsec));
+    } else {
+        tp.sec = @as(@TypeOf(tp.sec), @intCast(sec));
+        tp.nsec = @as(@TypeOf(tp.nsec), @intCast(nsec));
+    }
+}
+
 export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
+    if (builtin.os.tag.isDarwin()) {
+        if (clk_id != c.CLOCK_REALTIME) {
+            c.errno = c.EINVAL;
+            return -1;
+        }
+        const host = darwin.mach_host_self();
+        var clock_serv: darwin.clock_serv_t = 0;
+        if (darwin.host_get_clock_service(host, darwin.CALENDAR_CLOCK, &clock_serv) != 0) {
+            c.errno = c.EINVAL;
+            return -1;
+        }
+        defer _ = darwin.mach_port_deallocate(host, clock_serv);
+
+        var now: darwin.mach_timespec_t = undefined;
+        if (darwin.clock_get_time(clock_serv, &now) != 0) {
+            c.errno = c.EINVAL;
+            return -1;
+        }
+        setTimespec(tp, now.sec, now.nsec);
+        return 0;
+    }
+
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
             const ns = std.time.nanoTimestamp();
             const sec = @divFloor(ns, std.time.ns_per_s);
             const nsec = @mod(ns, std.time.ns_per_s);
-            if (@hasField(os.timespec, "tv_sec")) {
-                tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(sec));
-                tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(nsec));
-            } else {
-                tp.sec = @as(@TypeOf(tp.sec), @intCast(sec));
-                tp.nsec = @as(@TypeOf(tp.nsec), @intCast(nsec));
-            }
+            setTimespec(tp, sec, nsec);
             return 0;
         }
         // TODO POSIX implementation of CLOCK.MONOTONIC on Windows.
