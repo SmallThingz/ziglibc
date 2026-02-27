@@ -3,14 +3,23 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <fcntl.h>
 
 // --------------------------------------------------------------------------------
 // fcntl
 // --------------------------------------------------------------------------------
-int open(const char *path, int oflag)
+int _zopen(const char *path, int oflag, unsigned mode);
+
+int open(const char *path, int oflag, ...)
 {
-    fprintf(stderr, "open function not implemented\n");
-    abort();
+    unsigned mode = 0;
+    if (oflag & O_CREAT) {
+        va_list args;
+        va_start(args, oflag);
+        mode = va_arg(args, unsigned);
+        va_end(args);
+    }
+    return _zopen(path, oflag, mode);
 }
 
 // --------------------------------------------------------------------------------

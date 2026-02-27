@@ -7,6 +7,7 @@ const c = @cImport({
     @cInclude("string.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
+    @cInclude("unistd.h");
     @cInclude("time.h");
     @cInclude("signal.h");
     @cInclude("termios.h");
@@ -18,6 +19,8 @@ const c = @cImport({
 const cstd = struct {
     extern fn __zreserveFile() callconv(.c) ?*c.FILE;
 };
+
+extern "c" fn syscall(number: c_long, ...) c_long;
 
 const trace = @import("trace.zig");
 
@@ -39,6 +42,13 @@ const darwin = if (builtin.os.tag.isDarwin()) struct {
         clock_id: c_int,
         clock_serv: *clock_serv_t,
     ) kern_return_t;
+} else struct {};
+
+const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
+    // Stable BSD syscall numbers used by Darwin's syscall(2) ABI.
+    const read: c_long = 3;
+    const write: c_long = 4;
+    const open: c_long = 5;
 } else struct {};
 
 // C ABI globals: `extern char *optarg; extern int opterr, optind, optopt;`
@@ -105,7 +115,11 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
     return @as(c_int, arg[1]);
 }
 
-export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.c) isize {
+fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.write, fd, buf, nbyte);
+        return if (rc == -1) -1 else @as(isize, @intCast(rc));
+    }
     if (builtin.os.tag == .windows) {
         @panic("write not implemented on windows");
     }
@@ -119,7 +133,11 @@ export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.c) isize {
     }
 }
 
-export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
+fn zreadRaw(fd: c_int, buf: [*]u8, len: usize) isize {
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.read, fd, buf, len);
+        return if (rc == -1) -1 else @as(isize, @intCast(rc));
+    }
     trace.log("read fd={} buf={*} len={}", .{ fd, buf, len });
     if (builtin.os.tag == .windows) {
         @panic("read not implemented on windows");
@@ -132,6 +150,38 @@ export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
             return -1;
         },
     }
+}
+
+fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.open, path, oflag, mode);
+        return if (rc == -1) -1 else @as(c_int, @intCast(rc));
+    }
+    if (builtin.os.tag == .windows) {
+        @panic("open not implemented on windows");
+    }
+    const flags_bits: u32 = @bitCast(oflag);
+    const flags: os.O = @bitCast(flags_bits);
+    const rc = os.system.open(path, flags, @as(std.posix.mode_t, @intCast(mode)));
+    switch (os.errno(rc)) {
+        .SUCCESS => return @as(c_int, @intCast(rc)),
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
+}
+
+export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.c) isize {
+    return zwriteRaw(fd, buf, nbyte);
+}
+
+export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
+    return zreadRaw(fd, buf, len);
+}
+
+export fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
+    return zopenRaw(path, oflag, mode);
 }
 
 // --------------------------------------------------------------------------------
@@ -186,16 +236,15 @@ export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.
             .EXCL = true,
         };
         const merged_flags: os.O = @bitCast(@as(u32, @bitCast(required_flags)) | extra_flags);
-        const fd = os.system.open(template, merged_flags, @as(std.posix.mode_t, 0o600));
-        switch (os.errno(fd)) {
-            .SUCCESS => return @as(c_int, @intCast(fd)),
-            else => |e| {
-                if (attempt >= max_attempts) {
-                    rand_part.* = [_]u8{ 'X', 'X', 'X', 'X', 'X', 'X' };
-                    c.errno = @intFromEnum(e);
-                    return -1;
-                }
-            },
+        const fd = zopenRaw(
+            template,
+            @as(c_int, @bitCast(@as(u32, @bitCast(merged_flags)))),
+            0o600,
+        );
+        if (fd >= 0) return fd;
+        if (attempt >= max_attempts) {
+            rand_part.* = [_]u8{ 'X', 'X', 'X', 'X', 'X', 'X' };
+            return -1;
         }
     }
 }
