@@ -22,16 +22,17 @@ const cstd = struct {
 const trace = @import("trace.zig");
 
 const global = struct {
-    export var optarg: [*:0]u8 = undefined;
-    export var opterr: c_int = undefined;
+    export var optarg: ?[*:0]u8 = null;
+    export var opterr: c_int = 1;
     export var optind: c_int = 1;
-    export var optopt: c_int = undefined;
+    export var optopt: c_int = 0;
 };
 
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
 export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
+    global.optarg = null;
     trace.log("getopt argc={} argv={*} opstring={f} (err={}, ind={}, opt={})", .{
         argc,
         argv,
@@ -310,10 +311,15 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
             const ns = std.time.nanoTimestamp();
-            tp.* = .{
-                .tv_sec = @as(i64, @intCast(@divFloor(ns, std.time.ns_per_s))),
-                .tv_nsec = @as(c_long, @intCast(@mod(ns, std.time.ns_per_s))),
-            };
+            const sec = @divFloor(ns, std.time.ns_per_s);
+            const nsec = @mod(ns, std.time.ns_per_s);
+            if (@hasField(os.timespec, "tv_sec")) {
+                tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(sec));
+                tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(nsec));
+            } else {
+                tp.sec = @as(@TypeOf(tp.sec), @intCast(sec));
+                tp.nsec = @as(@TypeOf(tp.nsec), @intCast(nsec));
+            }
             return 0;
         }
         // TODO POSIX implementation of CLOCK.MONOTONIC on Windows.
