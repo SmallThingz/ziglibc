@@ -193,9 +193,21 @@ pub fn build(b: *std.Build) void {
 
     const libc_conformance_step = addLibcTest(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
     const regex_conformance_step = addTinyRegexCTests(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
+    const glibc_check_step = b.step("glibc-check", "Run glibc check conformance tests");
+    const posix_test_suite_step = b.step("posix-test-suite", "Run POSIX Test Suite conformance tests");
+    const austin_group_tests_step = b.step("austin-group-tests", "Run Austin Group POSIX conformance tests");
     const conformance_step = b.step("conformance", "Run libc conformance suites");
     conformance_step.dependOn(libc_conformance_step);
     conformance_step.dependOn(regex_conformance_step);
+    // glibc-check is only relevant for Linux targets using glibc.
+    if (std.Target.isGnuLibC(&target.result)) {
+        conformance_step.dependOn(glibc_check_step);
+    }
+    // POSIX and Austin Group suites apply to POSIX targets.
+    if (supportsPosixConformance(target.result.os.tag)) {
+        conformance_step.dependOn(posix_test_suite_step);
+        conformance_step.dependOn(austin_group_tests_step);
+    }
     _ = addLua(b, target, optimize, libc_only_std_static, libc_only_posix, zig_start);
     _ = addCmph(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
     _ = addYacc(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
@@ -213,6 +225,13 @@ fn installArtifact(b: *std.Build, artifact: anytype) *std.Build.Step.InstallArti
     const install = b.addInstallArtifact(artifact, .{});
     b.getInstallStep().dependOn(&install.step);
     return install;
+}
+
+fn supportsPosixConformance(os_tag: std.Target.Os.Tag) bool {
+    return switch (std.Target.DynamicLinker.kind(os_tag)) {
+        .none => false,
+        .arch_os, .arch_os_abi => true,
+    };
 }
 
 fn addPosix(artifact: *std.Build.Step.Compile, zig_posix: *std.Build.Step.Compile) void {

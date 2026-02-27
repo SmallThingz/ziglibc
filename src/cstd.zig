@@ -607,24 +607,26 @@ const global = struct {
     //       the address to any file can be done in O(1) by decoding
     //       the page index and file offset
     const max_file_count = 100;
-    var files_reserved: [max_file_count]bool = [_]bool{false} ** max_file_count;
+    var files_reserved: [max_file_count]bool = [_]bool{ true, true, true } ++ ([_]bool{false} ** (max_file_count - 3));
     var files: [max_file_count]c.FILE = [_]c.FILE{
-        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDIN_FILENO, .eof = 0, .errno = undefined },
-        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDOUT_FILENO, .eof = 0, .errno = undefined },
-        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDERR_FILENO, .eof = 0, .errno = undefined },
-    } ++ ([_]c.FILE{undefined} ** (max_file_count - 3));
+        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDIN_FILENO, .eof = 0, .errno = 0 },
+        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDOUT_FILENO, .eof = 0, .errno = 0 },
+        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDERR_FILENO, .eof = 0, .errno = 0 },
+    } ++ ([_]c.FILE{.{ .fd = if (builtin.os.tag == .windows) undefined else -1, .eof = 0, .errno = 0 }} ** (max_file_count - 3));
 
     fn reserveFile() *c.FILE {
         var i: usize = 0;
         while (i < files_reserved.len) : (i += 1) {
             if (!@atomicRmw(bool, &files_reserved[i], .Xchg, true, .seq_cst)) {
+                files[i].eof = 0;
+                files[i].errno = 0;
                 return &files[i];
             }
         }
         @panic("out of file handles");
     }
     fn releaseFile(file: *c.FILE) void {
-        const i = (@intFromPtr(file) - @intFromPtr(&files[0])) / @sizeOf(usize);
+        const i = (@intFromPtr(file) - @intFromPtr(&files[0])) / @sizeOf(c.FILE);
         if (!@atomicRmw(bool, &files_reserved[i], .Xchg, false, .seq_cst)) {
             std.debug.panic("released FILE (i={} ptr={*}) that was not reserved", .{ i, file });
         }
