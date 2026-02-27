@@ -141,7 +141,7 @@ static int vformat(size_t *out_written, struct Writer *writer, const char *fmt, 
           const long int value = va_arg(args, long int);
           format_len = _formatCLong(buf, value, 10);
       } else if (spec_length == SPEC_LENGTH_LONG_LONG) {
-          const long int value = va_arg(args, long long int);
+          const long long int value = va_arg(args, long long int);
           format_len = _formatCLonglong(buf, value, 10);
       } else abort();
       size_t written = writer->write(writer, buf, format_len);
@@ -149,7 +149,7 @@ static int vformat(size_t *out_written, struct Writer *writer, const char *fmt, 
       if (written != format_len) return -1; // error
       fmt++;
     } else if (fmt[0] == 'u' || fmt[0] == 'x') {
-      uint8_t base = (fmt[0] == 'd') ? 10 : 16;
+      uint8_t base = (fmt[0] == 'u') ? 10 : 16;
       if (precision != PRECISION_NONE) {
          fprintf(stderr, "error: precision not implemented for '%c' specifier\n", fmt[0]);
          return -1;
@@ -163,7 +163,7 @@ static int vformat(size_t *out_written, struct Writer *writer, const char *fmt, 
           const long unsigned value = va_arg(args, long unsigned);
           format_len = _formatCUlong(buf, value, base);
       } else if (spec_length == SPEC_LENGTH_LONG_LONG) {
-          const long unsigned value = va_arg(args, long long unsigned);
+          const long long unsigned value = va_arg(args, long long unsigned);
           format_len = _formatCUlonglong(buf, value, base);
       } else abort();
 

@@ -1015,28 +1015,18 @@ export fn putchar(ch: c_int) callconv(.c) c_int {
 
 export fn puts(s: [*:0]const u8) callconv(.c) c_int {
     trace.log("puts {f}", .{trace.fmtStr(s)});
-    return fputs(s, stdout);
+    const len = std.mem.len(s);
+    if (_fwrite_buf(s, len, stdout) != len) return c.EOF;
+    const newline = [_]u8{'\n'};
+    if (_fwrite_buf(&newline, 1, stdout) != 1) return c.EOF;
+    return 1;
 }
 
 export fn fputs(s: [*:0]const u8, stream: *c.FILE) callconv(.c) c_int {
     trace.log("fputs {f} stream={*}", .{ trace.fmtStr(s), stream });
-    // NOTE: this is inneficient
-    //       Maybe I could do a writev?
-    //       Or maybe I could make 2 write calls with a locking mechanism?
     const len = std.mem.len(s);
-    // TODO: maybe use malloc?
-    const mem = std.heap.page_allocator.alloc(u8, len + 1) catch |err| switch (err) {
-        error.OutOfMemory => {
-            // maybe fallback to 2 writes?
-            @panic("here");
-        },
-    };
-    defer std.heap.page_allocator.free(mem);
-    @memcpy(mem, s);
-    mem[len] = '\n';
-
-    const written = _fwrite_buf(mem.ptr, mem.len, stream);
-    return if (written == 0) c.EOF else 1;
+    const written = _fwrite_buf(s, len, stream);
+    return if (written == len) 1 else c.EOF;
 }
 
 export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
