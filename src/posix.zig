@@ -41,52 +41,51 @@ const darwin = if (builtin.os.tag.isDarwin()) struct {
     ) kern_return_t;
 } else struct {};
 
-const global = struct {
-    // C ABI global: `extern char *optarg;`
-    export var optarg: [*:0]allowzero u8 = @ptrFromInt(0);
-    export var opterr: c_int = 1;
-    export var optind: c_int = 1;
-    export var optopt: c_int = 0;
-};
+// C ABI globals: `extern char *optarg; extern int opterr, optind, optopt;`
+export var optarg: [*c]u8 = null;
+export var opterr: c_int = 1;
+export var optind: c_int = 1;
+export var optopt: c_int = 0;
 
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
 export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
-    global.optarg = @ptrFromInt(0);
+    optarg = null;
+    if (optind < 1) optind = 1;
     trace.log("getopt argc={} argv={*} opstring={f} (err={}, ind={}, opt={})", .{
         argc,
         argv,
         trace.fmtStr(optstring),
-        global.opterr,
-        global.optind,
-        global.optopt,
+        opterr,
+        optind,
+        optopt,
     });
-    if (global.optind >= argc) {
+    if (optind >= argc) {
         trace.log("getopt return -1", .{});
         return -1;
     }
-    const arg = argv[@as(usize, @intCast(global.optind))];
+    const arg = argv[@as(usize, @intCast(optind))];
     if (arg[0] != '-' or arg[1] == 0) {
         // Stop option parsing when we reach a non-option argument.
         return -1;
     }
     if (arg[1] == '-' and arg[2] == 0) {
         // End-of-options marker.
-        global.optind += 1;
+        optind += 1;
         return -1;
     }
     const result = c.strchr(optstring, arg[1]) orelse {
-        global.optind += 1;
-        global.optopt = @as(c_int, arg[1]);
+        optind += 1;
+        optopt = @as(c_int, arg[1]);
         return '?';
     };
-    global.optind += 1;
+    optind += 1;
 
     if (arg[2] != 0) {
         // Support compact required argument form: -ovalue
         if (result[1] == ':') {
-            global.optarg = arg + 2;
+            optarg = @ptrCast(arg + 2);
             return @as(c_int, arg[1]);
         }
         @panic("multi-letter argument not implemented");
@@ -96,12 +95,12 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
     if (takes_arg) {
         const is_optional = result[2] == ':';
         if (is_optional) @panic("optional args not implemented");
-        if (global.optind >= argc) {
-            global.optopt = @as(c_int, arg[1]);
+        if (optind >= argc) {
+            optopt = @as(c_int, arg[1]);
             return if (optstring[0] == ':') ':' else '?';
         }
-        global.optarg = @ptrCast(argv[@as(usize, @intCast(global.optind))]);
-        global.optind += 1;
+        optarg = @ptrCast(argv[@as(usize, @intCast(optind))]);
+        optind += 1;
     }
     return @as(c_int, arg[1]);
 }
