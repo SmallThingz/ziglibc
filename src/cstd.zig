@@ -321,7 +321,7 @@ export fn strstr(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) ?[*:0]const 
 export fn strcpy(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
     trace.log("strcpy {*} {*}", .{ s1, s2 });
     @memcpy(s1[0 .. std.mem.len(s2) + 1], s2);
-    return @as([*:0]u8, @ptrCast(s1)); // TODO: use std.meta.assumeSentinel if it's brought back
+    return @as([*:0]u8, @ptrCast(s1));
 }
 
 export fn strcat(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
@@ -330,7 +330,7 @@ export fn strcat(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
     while (s1[i] != 0) : (i += 1) {}
     const len = std.mem.len(s2);
     @memcpy(s1[i .. i + len + 1], s2);
-    return @as([*:0]u8, @ptrCast(s1)); // TODO: use std.meta.assumeSentinel if it's brought back
+    return @as([*:0]u8, @ptrCast(s1));
 }
 
 // TODO: find out which standard this function comes from
@@ -554,7 +554,7 @@ export fn strtoull(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) callconv
 export fn strerror(errnum: c_int) callconv(.c) [*:0]const u8 {
     std.log.warn("sterror (num={}) not implemented", .{errnum});
     _ = std.fmt.bufPrint(&global.tmp_strerror_buffer, "{}", .{errnum}) catch @panic("BUG");
-    return @as([*:0]const u8, @ptrCast(&global.tmp_strerror_buffer)); // TODO: use std.meta.assumeSentinel if it's brought back
+    return @as([*:0]const u8, @ptrCast(&global.tmp_strerror_buffer));
 }
 
 // --------------------------------------------------------------------------------

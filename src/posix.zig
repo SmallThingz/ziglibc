@@ -112,7 +112,7 @@ export fn strdup(s: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     if (optional_new_s) |new_s| {
         _ = c.strcpy(new_s, s);
     }
-    return @as([*:0]u8, @ptrCast(optional_new_s)); // TODO: use std.meta.assumeSentinel if it's brought back
+    return @as([*:0]u8, @ptrCast(optional_new_s));
 }
 
 // --------------------------------------------------------------------------------
