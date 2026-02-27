@@ -24,6 +24,9 @@ int main(int argc, char *argv[])
   expect(f != NULL);
   expect(5 == fprintf(f, "hello"));
   expect(4 == write_with_vfprintf(f, " %s", "zig"));
+  expect(3 == fwrite("abc", 1, 3, f));
+  expect(0 == fwrite("drop", 0, 4, f));
+  expect(0 == fwrite("drop", 4, 0, f));
 #ifndef _WIN32
   expect('!' == fputc('!', f));
 #endif
@@ -36,9 +39,9 @@ int main(int argc, char *argv[])
     const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     buf[n] = 0;
 #ifdef _WIN32
-    expect(0 == strcmp("hello zig", buf));
+    expect(0 == strcmp("hello zigabc", buf));
 #else
-    expect(0 == strcmp("hello zig!", buf));
+    expect(0 == strcmp("hello zigabc!", buf));
 #endif
   }
   expect(0 == fclose(f));

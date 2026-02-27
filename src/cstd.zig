@@ -40,7 +40,7 @@ const windows = struct {
             var last_written: u32 = undefined;
             const result = std.os.windows.kernel32.WriteFile(hFile, buffer.ptr + written, next_write, &last_written, null);
             written += last_written; // WriteFile always sets last_written to 0 before doing anything
-            if (result != 0) {
+            if (result == 0) {
                 out_written.* = written;
                 return error.WriteFailed;
             }
@@ -995,6 +995,7 @@ export fn _fwrite_buf(ptr: [*]const u8, size: usize, stream: *c.FILE) callconv(.
 // TODO: can stream be NULL (I don't think it can)
 export fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
     trace.log("fwrite {*} size={} n={} stream={*}", .{ ptr, size, nmemb, stream });
+    if (size == 0 or nmemb == 0) return 0;
     const total = size * nmemb;
     const result = _fwrite_buf(ptr, total, stream);
     if (result == total) return nmemb;
