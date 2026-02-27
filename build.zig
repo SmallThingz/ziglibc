@@ -193,9 +193,27 @@ pub fn build(b: *std.Build) void {
 
     const libc_conformance_step = addLibcTest(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
     const regex_conformance_step = addTinyRegexCTests(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
-    const glibc_check_step = b.step("glibc-check", "Run glibc check conformance tests");
-    const posix_test_suite_step = b.step("posix-test-suite", "Run POSIX Test Suite conformance tests");
-    const austin_group_tests_step = b.step("austin-group-tests", "Run Austin Group POSIX conformance tests");
+    const glibc_check_step = addGlibcCheck(
+        b,
+        target,
+        optimize,
+    );
+    const posix_test_suite_step = addPosixTestSuite(
+        b,
+        target,
+        optimize,
+        libc_only_std_static,
+        zig_start,
+        libc_only_posix,
+    );
+    const austin_group_tests_step = addAustinGroupTests(
+        b,
+        target,
+        optimize,
+        libc_only_std_static,
+        zig_start,
+        libc_only_posix,
+    );
     const conformance_step = b.step("conformance", "Run libc conformance suites");
     conformance_step.dependOn(libc_conformance_step);
     conformance_step.dependOn(regex_conformance_step);
@@ -264,6 +282,152 @@ fn addTest(
         exe.linkSystemLibrary("kernel32");
     }
     return exe;
+}
+
+fn addGlibcCheck(
+    b: *std.Build,
+    target: anytype,
+    optimize: anytype,
+) *std.Build.Step {
+    const glibc_check_step = b.step("glibc-check", "Run glibc check conformance tests");
+    if (!std.Target.isGnuLibC(&target.result)) {
+        return glibc_check_step;
+    }
+
+    const repo = GitRepoStep.create(b, .{
+        .url = "https://github.com/cloudius-systems/glibc-testsuite",
+        .sha = "c1278866ed57e51576a78b71c6326115004a9676",
+        .branch = null,
+        .fetch_enabled = true,
+    });
+    const repo_path = repo.path;
+
+    inline for (.{ "io/tst-getcwd.c", "libio/test-fmemopen.c", "malloc/tst-malloc.c", "rt/tst-clock.c" }) |src| {
+        const name = b.fmt("glibc-check-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
+        const exe = addExecutableCompat(b, .{
+            .name = name,
+            .root_source_file = null,
+            .target = target,
+            .optimize = optimize,
+        });
+        addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, src })}, &.{ "-D_GNU_SOURCE" });
+        exe.step.dependOn(&repo.step);
+        exe.addIncludePath(lazyPath(b, repo_path));
+        exe.linkLibC();
+        if (target.result.os.tag == .windows) {
+            exe.linkSystemLibrary("ntdll");
+            exe.linkSystemLibrary("kernel32");
+        }
+        glibc_check_step.dependOn(&b.addRunArtifact(exe).step);
+    }
+
+    return glibc_check_step;
+}
+
+fn addPosixTestSuite(
+    b: *std.Build,
+    target: anytype,
+    optimize: anytype,
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    libc_only_posix: *std.Build.Step.Compile,
+) *std.Build.Step {
+    const posix_test_suite_step = b.step("posix-test-suite", "Run POSIX Test Suite conformance tests");
+    if (!supportsPosixConformance(target.result.os.tag)) {
+        return posix_test_suite_step;
+    }
+
+    const repo = GitRepoStep.create(b, .{
+        .url = "https://github.com/nloopa/open_posix_testsuite",
+        .sha = "b803d6e01aa516b234e784bc46aa3446881fac53",
+        .branch = null,
+        .fetch_enabled = true,
+    });
+    const repo_path = repo.path;
+    const include_path = b.pathJoin(&.{ repo_path, "include" });
+
+    inline for (.{ "conformance/interfaces/clock_gettime/1-1.c" }) |src| {
+        const name = b.fmt("posix-test-suite-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
+        const exe = addExecutableCompat(b, .{
+            .name = name,
+            .root_source_file = null,
+            .target = target,
+            .optimize = optimize,
+        });
+        addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, src })}, &.{
+            "-std=c11",
+            "-D_POSIX_C_SOURCE=200112L",
+            "-D_XOPEN_SOURCE=600",
+        });
+        exe.step.dependOn(&repo.step);
+        exe.addIncludePath(lazyPath(b, include_path));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        exe.linkLibrary(libc_only_std_static);
+        exe.linkLibrary(zig_start);
+        exe.linkLibrary(libc_only_posix);
+        if (target.result.os.tag == .windows) {
+            exe.linkSystemLibrary("ntdll");
+            exe.linkSystemLibrary("kernel32");
+        }
+        posix_test_suite_step.dependOn(&b.addRunArtifact(exe).step);
+    }
+
+    return posix_test_suite_step;
+}
+
+fn addAustinGroupTests(
+    b: *std.Build,
+    target: anytype,
+    optimize: anytype,
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    libc_only_posix: *std.Build.Step.Compile,
+) *std.Build.Step {
+    const austin_group_tests_step = b.step("austin-group-tests", "Run Austin Group POSIX conformance tests");
+    if (!supportsPosixConformance(target.result.os.tag)) {
+        return austin_group_tests_step;
+    }
+
+    const repo = GitRepoStep.create(b, .{
+        .url = "git://nsz.repo.hu:49100/repo/libc-test",
+        .sha = "b7ec467969a53756258778fa7d9b045f912d1c93",
+        .branch = null,
+        .fetch_enabled = true,
+    });
+    const repo_path = repo.path;
+    const common_inc_path = b.pathJoin(&.{ repo_path, "src", "common" });
+    const common_src = &[_][]const u8{
+        b.pathJoin(&.{ repo_path, "src", "common", "print.c" }),
+    };
+
+    inline for (.{ "functional/strftime.c" }) |src| {
+        const name = b.fmt("austin-group-tests-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
+        const exe = addExecutableCompat(b, .{
+            .name = name,
+            .root_source_file = null,
+            .target = target,
+            .optimize = optimize,
+        });
+        addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, "src", src })}, &.{
+            "-Dsetenv(a,b,c)=0",
+        });
+        addCSourceFilesCompat(exe, common_src, &.{});
+        exe.step.dependOn(&repo.step);
+        exe.addIncludePath(lazyPath(b, common_inc_path));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        exe.linkLibrary(libc_only_std_static);
+        exe.linkLibrary(zig_start);
+        exe.linkLibrary(libc_only_posix);
+        if (target.result.os.tag == .windows) {
+            exe.linkSystemLibrary("ntdll");
+            exe.linkSystemLibrary("kernel32");
+        }
+        austin_group_tests_step.dependOn(&b.addRunArtifact(exe).step);
+    }
+
+    return austin_group_tests_step;
 }
 
 fn addLibcTest(

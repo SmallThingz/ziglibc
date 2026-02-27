@@ -1228,12 +1228,330 @@ export fn localtime(timer: *const c.time_t) callconv(.c) *c.tm {
     @panic("localtime not implemented");
 }
 
+const weekday_abbrev = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const month_abbrev = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+const StrftimeWriter = struct {
+    dest: [*]u8,
+    maxsize: usize,
+    len: usize = 0,
+
+    fn appendByte(self: *StrftimeWriter, value: u8) bool {
+        if (self.len + 1 >= self.maxsize) return false;
+        self.dest[self.len] = value;
+        self.len += 1;
+        return true;
+    }
+
+    fn appendSlice(self: *StrftimeWriter, value: []const u8) bool {
+        if (self.len + value.len >= self.maxsize) return false;
+        @memcpy(self.dest[self.len..][0..value.len], value);
+        self.len += value.len;
+        return true;
+    }
+
+    fn appendRepeated(self: *StrftimeWriter, value: u8, count: usize) bool {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (!self.appendByte(value)) return false;
+        }
+        return true;
+    }
+};
+
+const YearFormatOptions = struct {
+    width: ?usize = null,
+    plus_flag: bool = false,
+    default_width: usize = 4,
+    sign_for_large_without_width: bool = true,
+};
+
+fn tmYear(tm: *const c.tm) i64 {
+    return @as(i64, @intCast(tm.tm_year)) + 1900;
+}
+
+fn isLeapYear(year: i64) bool {
+    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+}
+
+fn daysFromCivil(year: i64, month: usize, day: usize) i128 {
+    var y: i128 = year;
+    const m: i128 = @intCast(month);
+    const d: i128 = @intCast(day);
+    if (m <= 2) y -= 1;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const month_offset: i128 = if (m > 2) -3 else 9;
+    const mp = m + month_offset;
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn weekdayFromCivil(year: i64, month: usize, day: usize) u8 {
+    const weekday = @mod(daysFromCivil(year, month, day) + 4, 7);
+    return @intCast(weekday);
+}
+
+fn isoWeeksInYear(year: i64) u8 {
+    const jan1_wday = weekdayFromCivil(year, 1, 1);
+    const jan1_iso = if (jan1_wday == 0) @as(u8, 7) else jan1_wday;
+    return if (jan1_iso == 4 or (jan1_iso == 3 and isLeapYear(year))) 53 else 52;
+}
+
+fn isoWeekYear(tm: *const c.tm) struct { week: u8, year: i64 } {
+    const year = tmYear(tm);
+    const yday: i64 = @intCast(tm.tm_yday);
+    const wday: i64 = @intCast(tm.tm_wday);
+    const iso_wday = if (wday == 0) @as(i64, 7) else wday;
+
+    var week = @divFloor(yday + 11 - iso_wday, 7);
+    var iso_year = year;
+    if (week < 1) {
+        iso_year -= 1;
+        week = isoWeeksInYear(iso_year);
+    } else {
+        const weeks = isoWeeksInYear(year);
+        if (week > weeks) {
+            iso_year += 1;
+            week = 1;
+        }
+    }
+
+    return .{ .week = @intCast(week), .year = iso_year };
+}
+
+fn appendUnsignedPadded(writer: *StrftimeWriter, value: u64, min_width: usize, pad: u8) bool {
+    var num_buf: [32]u8 = undefined;
+    const digits = std.fmt.bufPrint(&num_buf, "{}", .{value}) catch return false;
+    if (digits.len < min_width and !writer.appendRepeated(pad, min_width - digits.len)) return false;
+    return writer.appendSlice(digits);
+}
+
+fn appendSignedPadded(writer: *StrftimeWriter, value: i64, min_width: usize, pad: u8) bool {
+    var sign: ?u8 = null;
+    var abs_value: u64 = undefined;
+    if (value < 0) {
+        sign = '-';
+        abs_value = @intCast(-@as(i128, value));
+    } else {
+        abs_value = @intCast(value);
+    }
+
+    var num_buf: [32]u8 = undefined;
+    const digits = std.fmt.bufPrint(&num_buf, "{}", .{abs_value}) catch return false;
+    const sign_len: usize = if (sign != null) 1 else 0;
+    const digit_width = if (min_width > sign_len) min_width - sign_len else digits.len;
+
+    if (sign) |ch| {
+        if (!writer.appendByte(ch)) return false;
+    }
+    if (digits.len < digit_width and !writer.appendRepeated(pad, digit_width - digits.len)) return false;
+    return writer.appendSlice(digits);
+}
+
+fn appendYearFormatted(writer: *StrftimeWriter, year: i64, options: YearFormatOptions) bool {
+    const abs_year: u128 = if (year < 0) @intCast(-@as(i128, year)) else @intCast(year);
+    var digits_buf: [64]u8 = undefined;
+    const digits = std.fmt.bufPrint(&digits_buf, "{}", .{abs_year}) catch return false;
+
+    var sign: ?u8 = null;
+    if (year < 0) {
+        sign = '-';
+    } else if (options.plus_flag) {
+        if (options.width) |width| {
+            if (digits.len < width) sign = '+';
+        } else if (digits.len > options.default_width) {
+            sign = '+';
+        }
+    } else if (options.width == null and options.sign_for_large_without_width and digits.len > options.default_width) {
+        sign = '+';
+    }
+
+    const sign_len: usize = if (sign != null) 1 else 0;
+    const min_digits: usize = if (options.width) |width|
+        if (width > sign_len) width - sign_len else digits.len
+    else if (year >= 0 and digits.len < options.default_width)
+        options.default_width
+    else
+        digits.len;
+
+    if (sign) |ch| {
+        if (!writer.appendByte(ch)) return false;
+    }
+    if (digits.len < min_digits and !writer.appendRepeated('0', min_digits - digits.len)) return false;
+    return writer.appendSlice(digits);
+}
+
+fn appendTimeSecondsSinceEpoch(writer: *StrftimeWriter, tm: *const c.tm) bool {
+    const year = tmYear(tm);
+    const month: usize = @intCast(@as(i64, @intCast(tm.tm_mon)) + 1);
+    const day: usize = @intCast(tm.tm_mday);
+    const days = daysFromCivil(year, month, day);
+    const sod = @as(i128, @intCast(tm.tm_hour)) * 3600 + @as(i128, @intCast(tm.tm_min)) * 60 + @as(i128, @intCast(tm.tm_sec));
+    const total = days * 86400 + sod;
+    const ts = std.math.cast(c.time_t, total) orelse return false;
+
+    var num_buf: [64]u8 = undefined;
+    const digits = std.fmt.bufPrint(&num_buf, "{}", .{ts}) catch return false;
+    return writer.appendSlice(digits);
+}
+
+fn appendStrftimeDirective(
+    writer: *StrftimeWriter,
+    spec: u8,
+    width: ?usize,
+    plus_flag: bool,
+    tm: *const c.tm,
+) bool {
+    const year = tmYear(tm);
+    switch (spec) {
+        '%' => return writer.appendByte('%'),
+        'a' => {
+            if (tm.tm_wday < 0 or tm.tm_wday >= weekday_abbrev.len) return false;
+            return writer.appendSlice(weekday_abbrev[@intCast(tm.tm_wday)]);
+        },
+        'b' => {
+            if (tm.tm_mon < 0 or tm.tm_mon >= month_abbrev.len) return false;
+            return writer.appendSlice(month_abbrev[@intCast(tm.tm_mon)]);
+        },
+        'c' => {
+            if (!appendStrftimeDirective(writer, 'a', null, false, tm)) return false;
+            if (!writer.appendByte(' ')) return false;
+            if (!appendStrftimeDirective(writer, 'b', null, false, tm)) return false;
+            if (!writer.appendByte(' ')) return false;
+            if (!appendUnsignedPadded(writer, @intCast(tm.tm_mday), 2, ' ')) return false;
+            if (!writer.appendByte(' ')) return false;
+            if (!appendStrftimeDirective(writer, 'T', null, false, tm)) return false;
+            if (!writer.appendByte(' ')) return false;
+            return appendYearFormatted(writer, year, .{});
+        },
+        'C' => return appendYearFormatted(writer, @divFloor(year, 100), .{
+            .width = width,
+            .plus_flag = plus_flag,
+            .default_width = 2,
+            .sign_for_large_without_width = false,
+        }),
+        'd' => return appendUnsignedPadded(writer, @intCast(tm.tm_mday), 2, '0'),
+        'e' => return appendUnsignedPadded(writer, @intCast(tm.tm_mday), 2, ' '),
+        'F' => {
+            const year_width: ?usize = if (width) |w| if (w > 6) w - 6 else 1 else null;
+            if (!appendYearFormatted(writer, year, .{ .width = year_width, .plus_flag = plus_flag })) return false;
+            if (!writer.appendByte('-')) return false;
+            if (!appendUnsignedPadded(writer, @intCast(@as(i64, @intCast(tm.tm_mon)) + 1), 2, '0')) return false;
+            if (!writer.appendByte('-')) return false;
+            return appendUnsignedPadded(writer, @intCast(tm.tm_mday), 2, '0');
+        },
+        'g', 'G', 'V' => {
+            const iso = isoWeekYear(tm);
+            if (spec == 'V') return appendUnsignedPadded(writer, iso.week, 2, '0');
+            if (spec == 'g') {
+                const low = @mod(iso.year, 100);
+                return appendUnsignedPadded(writer, @intCast(low), 2, '0');
+            }
+            return appendYearFormatted(writer, iso.year, .{ .width = width, .plus_flag = plus_flag });
+        },
+        'H' => return appendUnsignedPadded(writer, @intCast(tm.tm_hour), 2, '0'),
+        'I' => {
+            const hour: u8 = @intCast(tm.tm_hour);
+            const hour12: u8 = if (hour % 12 == 0) 12 else hour % 12;
+            return appendUnsignedPadded(writer, hour12, 2, '0');
+        },
+        'm' => return appendUnsignedPadded(writer, @intCast(@as(i64, @intCast(tm.tm_mon)) + 1), 2, '0'),
+        'M' => return appendUnsignedPadded(writer, @intCast(tm.tm_min), 2, '0'),
+        'p' => return writer.appendSlice(if (tm.tm_hour >= 12) "PM" else "AM"),
+        'r' => {
+            if (!appendStrftimeDirective(writer, 'I', null, false, tm)) return false;
+            if (!writer.appendByte(':')) return false;
+            if (!appendStrftimeDirective(writer, 'M', null, false, tm)) return false;
+            if (!writer.appendByte(':')) return false;
+            if (!appendStrftimeDirective(writer, 'S', null, false, tm)) return false;
+            if (!writer.appendByte(' ')) return false;
+            return appendStrftimeDirective(writer, 'p', null, false, tm);
+        },
+        's' => return appendTimeSecondsSinceEpoch(writer, tm),
+        'S' => return appendUnsignedPadded(writer, @intCast(tm.tm_sec), 2, '0'),
+        'T', 'X' => {
+            if (!appendStrftimeDirective(writer, 'H', null, false, tm)) return false;
+            if (!writer.appendByte(':')) return false;
+            if (!appendStrftimeDirective(writer, 'M', null, false, tm)) return false;
+            if (!writer.appendByte(':')) return false;
+            return appendStrftimeDirective(writer, 'S', null, false, tm);
+        },
+        'U' => {
+            const wday: i64 = @intCast(tm.tm_wday);
+            const yday: i64 = @intCast(tm.tm_yday);
+            const week = @divFloor(yday + 7 - wday, 7);
+            return appendUnsignedPadded(writer, @intCast(week), 2, '0');
+        },
+        'W' => {
+            const wday: i64 = @intCast(tm.tm_wday);
+            const yday: i64 = @intCast(tm.tm_yday);
+            const monday_first_wday = @mod(wday + 6, 7);
+            const week = @divFloor(yday + 7 - monday_first_wday, 7);
+            return appendUnsignedPadded(writer, @intCast(week), 2, '0');
+        },
+        'x' => {
+            if (!appendStrftimeDirective(writer, 'm', null, false, tm)) return false;
+            if (!writer.appendByte('/')) return false;
+            if (!appendStrftimeDirective(writer, 'd', null, false, tm)) return false;
+            if (!writer.appendByte('/')) return false;
+            return appendStrftimeDirective(writer, 'y', null, false, tm);
+        },
+        'y' => {
+            const low = @mod(year, 100);
+            return appendUnsignedPadded(writer, @intCast(low), 2, '0');
+        },
+        'Y' => return appendYearFormatted(writer, year, .{ .width = width, .plus_flag = plus_flag }),
+        else => return false,
+    }
+}
+
 export fn strftime(s: [*]u8, maxsize: usize, format: [*:0]const u8, timeptr: *const c.tm) callconv(.c) usize {
-    _ = s;
-    _ = maxsize;
-    _ = format;
-    _ = timeptr;
-    @panic("strftime not implemented");
+    if (maxsize == 0) return 0;
+
+    var writer = StrftimeWriter{
+        .dest = s,
+        .maxsize = maxsize,
+    };
+
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const ch = format[i];
+        if (ch == 0) break;
+        if (ch != '%') {
+            if (!writer.appendByte(ch)) return 0;
+            continue;
+        }
+
+        i += 1;
+        var spec = format[i];
+        if (spec == 0) return 0;
+
+        var plus_flag = false;
+        if (spec == '+') {
+            plus_flag = true;
+            i += 1;
+            spec = format[i];
+        }
+
+        var width: ?usize = null;
+        if (std.ascii.isDigit(spec)) {
+            var parsed: usize = 0;
+            while (std.ascii.isDigit(spec)) : ({
+                i += 1;
+                spec = format[i];
+            }) {
+                parsed = parsed * 10 + (spec - '0');
+            }
+            width = parsed;
+        }
+
+        if (!appendStrftimeDirective(&writer, spec, width, plus_flag, timeptr)) return 0;
+    }
+
+    writer.dest[writer.len] = 0;
+    return writer.len;
 }
 
 // --------------------------------------------------------------------------------
