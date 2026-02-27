@@ -42,7 +42,8 @@ const darwin = if (builtin.os.tag.isDarwin()) struct {
 } else struct {};
 
 const global = struct {
-    export var optarg: ?[*:0]u8 = null;
+    // C ABI global: `extern char *optarg;`
+    export var optarg: [*:0]allowzero u8 = @ptrFromInt(0);
     export var opterr: c_int = 1;
     export var optind: c_int = 1;
     export var optopt: c_int = 0;
@@ -52,7 +53,7 @@ const global = struct {
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
 export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
-    global.optarg = null;
+    global.optarg = @ptrFromInt(0);
     trace.log("getopt argc={} argv={*} opstring={f} (err={}, ind={}, opt={})", .{
         argc,
         argv,
@@ -99,7 +100,7 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
             global.optopt = @as(c_int, arg[1]);
             return if (optstring[0] == ':') ':' else '?';
         }
-        global.optarg = argv[@as(usize, @intCast(global.optind))];
+        global.optarg = @ptrCast(argv[@as(usize, @intCast(global.optind))]);
         global.optind += 1;
     }
     return @as(c_int, arg[1]);
