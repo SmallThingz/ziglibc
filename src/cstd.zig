@@ -993,6 +993,409 @@ export fn _fwrite_buf(ptr: [*]const u8, size: usize, stream: *c.FILE) callconv(.
     }
 }
 
+const FormatLength = enum {
+    none,
+    long,
+    long_long,
+};
+
+const FormatWriter = union(enum) {
+    stream: *c.FILE,
+    bounded: struct {
+        buf: [*]u8,
+        len: usize,
+        overflow: bool = false,
+    },
+    unbounded: struct {
+        buf: [*]u8,
+    },
+
+    fn write(self: *FormatWriter, bytes: []const u8) usize {
+        if (bytes.len == 0) return 0;
+        return switch (self.*) {
+            .stream => |stream| _fwrite_buf(bytes.ptr, bytes.len, stream),
+            .bounded => |*bounded| blk: {
+                if (!bounded.overflow) {
+                    if (bytes.len > bounded.len) {
+                        bounded.overflow = true;
+                    } else {
+                        @memcpy(bounded.buf[0..bytes.len], bytes);
+                        bounded.buf += bytes.len;
+                        bounded.len -= bytes.len;
+                    }
+                }
+                break :blk bytes.len;
+            },
+            .unbounded => |*unbounded| blk: {
+                @memcpy(unbounded.buf[0..bytes.len], bytes);
+                unbounded.buf += bytes.len;
+                break :blk bytes.len;
+            },
+        };
+    }
+};
+
+fn stringPrintLen(s: [*:0]const u8, precision: usize) usize {
+    var len: usize = 0;
+    while (s[len] != 0 and len < precision) : (len += 1) {}
+    return len;
+}
+
+fn isFormatFlag(ch: u8) bool {
+    return ch == '-' or ch == '+' or ch == ' ' or ch == '#' or ch == '0';
+}
+
+fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) bool {
+    out_written.* = 0;
+    const fmt_slice = std.mem.span(fmt);
+    var i: usize = 0;
+
+    while (true) {
+        const next_percent = std.mem.indexOfScalarPos(u8, fmt_slice, i, '%') orelse break;
+        if (next_percent > i) {
+            const part = fmt_slice[i..next_percent];
+            const written = writer.write(part);
+            out_written.* += written;
+            if (written != part.len) return false;
+        }
+        i = next_percent + 1;
+        if (i >= fmt_slice.len) return false;
+
+        if (isFormatFlag(fmt_slice[i])) return false;
+
+        if (fmt_slice[i] == '*') {
+            return false;
+        } else if (fmt_slice[i] >= '0' and fmt_slice[i] <= '9') {
+            return false;
+        }
+
+        const precision_none: i32 = -1;
+        var precision: i32 = precision_none;
+        if (fmt_slice[i] == '.') {
+            i += 1;
+            if (i >= fmt_slice.len) return false;
+            if (fmt_slice[i] == '*') {
+                precision = @cVaArg(args, c_int);
+                i += 1;
+            } else if (fmt_slice[i] >= '0' and fmt_slice[i] <= '9') {
+                return false;
+            } else {
+                return false;
+            }
+            if (i >= fmt_slice.len) return false;
+        }
+
+        var spec_length: FormatLength = .none;
+        if (fmt_slice[i] == 'l') {
+            if (i + 1 < fmt_slice.len and fmt_slice[i + 1] == 'l') {
+                spec_length = .long_long;
+                i += 2;
+            } else {
+                spec_length = .long;
+                i += 1;
+            }
+            if (i >= fmt_slice.len) return false;
+        }
+
+        switch (fmt_slice[i]) {
+            's' => {
+                if (spec_length != .none) return false;
+                const maybe_s = @cVaArg(args, ?[*:0]const u8);
+                const s = maybe_s orelse "(null)";
+                const len = if (precision == precision_none or precision < 0)
+                    std.mem.len(s)
+                else
+                    stringPrintLen(s, @intCast(precision));
+                const written = writer.write(s[0..len]);
+                out_written.* += written;
+                if (written != len) return false;
+            },
+            'c' => {
+                if (spec_length != .none or precision != precision_none) return false;
+                const value = @cVaArg(args, c_int);
+                const ch = [_]u8{@intCast(value & 0xff)};
+                const written = writer.write(&ch);
+                out_written.* += written;
+                if (written != 1) return false;
+            },
+            'd' => {
+                if (precision != precision_none) return false;
+                var buf: [100]u8 = undefined;
+                const len = switch (spec_length) {
+                    .none => formatIntCompat(&buf, @cVaArg(args, c_int), 10),
+                    .long => formatIntCompat(&buf, @cVaArg(args, c_long), 10),
+                    .long_long => formatIntCompat(&buf, @cVaArg(args, c_longlong), 10),
+                };
+                const written = writer.write(buf[0..len]);
+                out_written.* += written;
+                if (written != len) return false;
+            },
+            'u', 'x' => |specifier| {
+                if (precision != precision_none) return false;
+                const base: u8 = if (specifier == 'u') 10 else 16;
+                var buf: [100]u8 = undefined;
+                const len = switch (spec_length) {
+                    .none => formatIntCompat(&buf, @cVaArg(args, c_uint), base),
+                    .long => formatIntCompat(&buf, @cVaArg(args, c_ulong), base),
+                    .long_long => formatIntCompat(&buf, @cVaArg(args, c_ulonglong), base),
+                };
+                const written = writer.write(buf[0..len]);
+                out_written.* += written;
+                if (written != len) return false;
+            },
+            else => return false,
+        }
+
+        i += 1;
+    }
+
+    if (i < fmt_slice.len) {
+        const rest = fmt_slice[i..];
+        const written = writer.write(rest);
+        out_written.* += written;
+        if (written != rest.len) return false;
+    }
+    return true;
+}
+
+export fn _zvfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+    var writer = FormatWriter{ .stream = stream };
+    var written: usize = 0;
+    if (vformat(&written, &writer, format, arg)) {
+        return @intCast(written);
+    } else {
+        stream.errno = c.errno;
+        return -1;
+    }
+}
+
+export fn _zvprintf(format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+    return _zvfprintf(stdout, format, arg);
+}
+
+export fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+    var writer = FormatWriter{ .bounded = .{
+        .buf = s,
+        .len = n,
+    } };
+    var written: usize = 0;
+    std.debug.assert(vformat(&written, &writer, format, arg));
+    if (written < n) s[written] = 0;
+    return @intCast(written);
+}
+
+export fn _zvsprintf(s: [*]u8, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+    var writer = FormatWriter{ .unbounded = .{
+        .buf = s,
+    } };
+    var written: usize = 0;
+    std.debug.assert(vformat(&written, &writer, format, arg));
+    s[written] = 0;
+    return @intCast(written);
+}
+
+const ScanKind = enum {
+    end,
+    token,
+    string,
+    hex,
+    scan_error,
+};
+
+const ScanMod = enum {
+    none,
+    long,
+};
+
+const Scan = union(ScanKind) {
+    end: void,
+    token: struct {
+        start: usize,
+        limit: usize,
+    },
+    string: struct {
+        width: i32,
+    },
+    hex: struct {
+        mod: ScanMod,
+    },
+    scan_error: void,
+};
+
+const FixedReader = struct {
+    buf: [*:0]const u8,
+
+    fn read(self: *FixedReader) u8 {
+        const ch = self.buf[0];
+        if (ch != 0) self.buf += 1;
+        return ch;
+    }
+};
+
+fn isWhitespace(ch: u8) bool {
+    return ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t' or ch == '\x0b' or ch == '\x0c';
+}
+
+fn parseWidth(fmt: []const u8, index: *usize) i32 {
+    if (index.* >= fmt.len) return -1;
+    const ch = fmt[index.*];
+    if (ch < '1' or ch > '9') return -1;
+    var width: i32 = ch - '0';
+    while (true) {
+        index.* += 1;
+        if (index.* >= fmt.len) break;
+        const cch = fmt[index.*];
+        if (cch < '0' or cch > '9') break;
+        width *= 10;
+        width += cch - '0';
+    }
+    return width;
+}
+
+fn hexValue(ch: u8) i32 {
+    if (ch >= '0' and ch <= '9') return ch - '0';
+    if (ch >= 'A' and ch <= 'F') return ch - 'A' + 10;
+    if (ch >= 'a' and ch <= 'f') return ch - 'a' + 10;
+    return -1;
+}
+
+fn getNextScan(fmt: []const u8, index: *usize) Scan {
+    while (index.* < fmt.len and isWhitespace(fmt[index.*])) : (index.* += 1) {}
+    if (index.* >= fmt.len) return .{ .end = {} };
+
+    const first = fmt[index.*];
+    if (first == '%' or first == '=') {
+        index.* += 1;
+        if (index.* >= fmt.len) return .{ .scan_error = {} };
+
+        var mod: ScanMod = .none;
+        if (fmt[index.*] == 'l') {
+            index.* += 1;
+            if (index.* < fmt.len and fmt[index.*] == 'l') {
+                return .{ .scan_error = {} };
+            }
+            mod = .long;
+        }
+
+        const width = parseWidth(fmt, index);
+        if (index.* >= fmt.len) return .{ .scan_error = {} };
+        const cch = fmt[index.*];
+        index.* += 1;
+        if (cch == 's') {
+            if (mod != .none) return .{ .scan_error = {} };
+            return .{ .string = .{ .width = width } };
+        }
+        if (cch == 'x' or cch == 'X') {
+            if (width != -1) return .{ .scan_error = {} };
+            return .{ .hex = .{ .mod = mod } };
+        }
+        return .{ .scan_error = {} };
+    }
+
+    const start = index.*;
+    while (index.* < fmt.len) : (index.* += 1) {
+        const cch = fmt[index.*];
+        if (cch == '%' or cch == '=' or isWhitespace(cch)) break;
+    }
+    return .{ .token = .{
+        .start = start,
+        .limit = index.*,
+    } };
+}
+
+fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) c_int {
+    const fmt_slice = std.mem.span(fmt);
+    var fmt_index: usize = 0;
+    var scan_count: c_int = 0;
+
+    while (true) {
+        const scan = getNextScan(fmt_slice, &fmt_index);
+        switch (scan) {
+            .end => return scan_count,
+            .scan_error => return -1,
+            .token => |token| {
+                var ch: u8 = 0;
+                while (true) {
+                    ch = reader.read();
+                    if (!isWhitespace(ch)) break;
+                }
+                var pos = token.start;
+                while (true) {
+                    if (fmt_slice[pos] != ch) return if (scan_count == 0) -1 else scan_count;
+                    pos += 1;
+                    if (pos >= token.limit) break;
+                    ch = reader.read();
+                }
+            },
+            .string => |scan_string| {
+                var ch: u8 = 0;
+                while (true) {
+                    ch = reader.read();
+                    if (!isWhitespace(ch)) break;
+                }
+
+                const out = @cVaArg(args, [*]u8);
+                var total_read: usize = 0;
+                while (ch != 0) {
+                    out[total_read] = ch;
+                    total_read += 1;
+                    if (scan_string.width != -1 and total_read >= @as(usize, @intCast(scan_string.width))) break;
+                    ch = reader.read();
+                    if (isWhitespace(ch)) break;
+                }
+                if (total_read == 0) return if (scan_count == 0) -1 else scan_count;
+                out[total_read] = 0;
+                scan_count += 1;
+            },
+            .hex => |scan_hex| {
+                var ch: u8 = 0;
+                while (true) {
+                    ch = reader.read();
+                    if (!isWhitespace(ch)) break;
+                }
+
+                var read_at_least_one = false;
+                switch (scan_hex.mod) {
+                    .none => {
+                        var value: c_int = 0;
+                        while (true) {
+                            const v = hexValue(ch);
+                            if (v == -1) break;
+                            read_at_least_one = true;
+                            value *%= 16;
+                            value +%= @as(c_int, @intCast(v));
+                            ch = reader.read();
+                        }
+                        if (!read_at_least_one) return if (scan_count == 0) -1 else scan_count;
+                        const out = @cVaArg(args, *c_int);
+                        out.* = value;
+                    },
+                    .long => {
+                        var value: c_long = 0;
+                        while (true) {
+                            const v = hexValue(ch);
+                            if (v == -1) break;
+                            read_at_least_one = true;
+                            value *%= 16;
+                            value +%= @as(c_long, @intCast(v));
+                            ch = reader.read();
+                        }
+                        if (!read_at_least_one) return if (scan_count == 0) -1 else scan_count;
+                        const out = @cVaArg(args, *c_long);
+                        out.* = value;
+                    },
+                }
+                scan_count += 1;
+            },
+        }
+    }
+}
+
+export fn _zvsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+    var reader = FixedReader{ .buf = s };
+    return vscan(&reader, fmt, arg);
+}
+
 // TODO: can ptr be NULL?
 // TODO: can stream be NULL (I don't think it can)
 export fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {

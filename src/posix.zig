@@ -26,22 +26,10 @@ const trace = @import("trace.zig");
 
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const mach_port_t = c_uint;
-    const clock_serv_t = mach_port_t;
     const kern_return_t = c_int;
-    const mach_timespec_t = extern struct {
-        sec: c_uint,
-        nsec: c_int,
-    };
-    const CALENDAR_CLOCK: c_int = 1;
 
-    extern "c" fn mach_host_self() mach_port_t;
-    extern "c" fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) kern_return_t;
-    extern "c" fn clock_get_time(clock_serv: clock_serv_t, cur_time: *mach_timespec_t) kern_return_t;
-    extern "c" fn host_get_clock_service(
-        host: mach_port_t,
-        clock_id: c_int,
-        clock_serv: *clock_serv_t,
-    ) kern_return_t;
+    extern "c" fn mach_absolute_time() u64;
+    extern "c" fn mach_timebase_info(info: *std.c.mach_timebase_info_data) kern_return_t;
 } else struct {};
 
 const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
@@ -49,6 +37,7 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const read: c_long = 3;
     const write: c_long = 4;
     const open: c_long = 5;
+    const gettimeofday: c_long = 116;
 } else struct {};
 
 // C ABI globals: `extern char *optarg; extern int opterr, optind, optopt;`
@@ -388,25 +377,32 @@ fn setTimespec(tp: *os.timespec, sec: anytype, nsec: anytype) void {
 
 export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
     if (builtin.os.tag.isDarwin()) {
-        if (clk_id != c.CLOCK_REALTIME) {
-            c.errno = c.EINVAL;
-            return -1;
+        if (clk_id == c.CLOCK_REALTIME) {
+            var tv: c.timeval = undefined;
+            const rc = syscall(darwin_syscall.gettimeofday, &tv, @as(?*anyopaque, null));
+            if (rc == -1) return -1;
+            setTimespec(tp, tv.tv_sec, tv.tv_usec * 1000);
+            return 0;
         }
-        const host = darwin.mach_host_self();
-        var clock_serv: darwin.clock_serv_t = 0;
-        if (darwin.host_get_clock_service(host, darwin.CALENDAR_CLOCK, &clock_serv) != 0) {
-            c.errno = c.EINVAL;
-            return -1;
-        }
-        defer _ = darwin.mach_port_deallocate(host, clock_serv);
 
-        var now: darwin.mach_timespec_t = undefined;
-        if (darwin.clock_get_time(clock_serv, &now) != 0) {
-            c.errno = c.EINVAL;
-            return -1;
+        const monotonic_id: c.clockid_t = @as(c.clockid_t, @intCast(@intFromEnum(os.CLOCK.MONOTONIC)));
+        if (clk_id == monotonic_id) {
+            var timebase: std.c.mach_timebase_info_data = undefined;
+            if (darwin.mach_timebase_info(&timebase) != 0 or timebase.denom == 0) {
+                c.errno = c.EINVAL;
+                return -1;
+            }
+            const ticks = darwin.mach_absolute_time();
+            const nanos: u128 = @divFloor(
+                @as(u128, ticks) * @as(u128, timebase.numer),
+                @as(u128, timebase.denom),
+            );
+            setTimespec(tp, @divFloor(nanos, std.time.ns_per_s), @mod(nanos, std.time.ns_per_s));
+            return 0;
         }
-        setTimespec(tp, now.sec, now.nsec);
-        return 0;
+
+        c.errno = c.EINVAL;
+        return -1;
     }
 
     if (builtin.os.tag == .windows) {
@@ -433,7 +429,17 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
 
 export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
     trace.log("gettimeofday tv={*} tz={*}", .{ tv, tz });
-    @panic("gettimeofday not implemented");
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.gettimeofday, tv, tz);
+        return if (rc == -1) -1 else 0;
+    }
+    if (builtin.os.tag == .windows) {
+        @panic("gettimeofday not implemented on windows");
+    }
+    const ns = std.time.nanoTimestamp();
+    tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(@divFloor(ns, std.time.ns_per_s)));
+    tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(@divFloor(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)));
+    return 0;
 }
 
 export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
