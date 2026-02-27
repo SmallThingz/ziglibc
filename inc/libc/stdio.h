@@ -43,6 +43,7 @@ char *tmpnam(char *s);
 int fclose(FILE *stream);
 int fflush(FILE *stream);
 FILE *fopen(const char *filename, const char *mode);
+FILE *fopen64(const char *filename, const char *mode);
 FILE *freopen(const char *filename, const char *mode, FILE *stream);
 void setbuf(FILE *stream, char *buf);
 int setvbuf(FILE *stream, char *buf, int mode, size_t size);

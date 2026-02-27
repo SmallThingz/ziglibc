@@ -324,6 +324,15 @@ export fn strcpy(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
     return @as([*:0]u8, @ptrCast(s1)); // TODO: use std.meta.assumeSentinel if it's brought back
 }
 
+export fn strcat(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
+    trace.log("strcat {*} {f}", .{ s1, trace.fmtStr(s2) });
+    var i: usize = 0;
+    while (s1[i] != 0) : (i += 1) {}
+    const len = std.mem.len(s2);
+    @memcpy(s1[i .. i + len + 1], s2);
+    return @as([*:0]u8, @ptrCast(s1)); // TODO: use std.meta.assumeSentinel if it's brought back
+}
+
 // TODO: find out which standard this function comes from
 export fn strncpy(s1: [*]u8, s2: [*:0]const u8, n: usize) callconv(.c) [*]u8 {
     trace.log("strncpy {*} {f} n={}", .{ s1, trace.fmtStr(s2), n });
@@ -784,8 +793,13 @@ export fn feof(stream: *c.FILE) callconv(.c) c_int {
     return stream.eof;
 }
 
-pub export fn fopen(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
-    trace.log("fopen {f} mode={f}", .{ trace.fmtStr(filename), trace.fmtStr(mode) });
+fn fopenImpl(
+    filename: [*:0]const u8,
+    mode: [*:0]const u8,
+    force_largefile: bool,
+    comptime func_name: []const u8,
+) ?*c.FILE {
+    trace.log("{s} {f} mode={f}", .{ func_name, trace.fmtStr(filename), trace.fmtStr(mode) });
     if (builtin.os.tag == .windows) {
         var create_disposition: u32 = std.os.windows.OPEN_EXISTING;
         var access: u32 = 0;
@@ -837,12 +851,15 @@ pub export fn fopen(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?
             std.debug.panic("unhandled open flag '{c}' (from {f})", .{ mode_char, trace.fmtStr(mode) });
         }
     }
+    if (force_largefile and @hasField(@TypeOf(flags), "LARGEFILE")) {
+        flags.LARGEFILE = true;
+    }
     const fd = std.posix.system.open(filename, @bitCast(flags), 0o666);
     switch (std.posix.errno(fd)) {
         .SUCCESS => {},
         else => |e| {
             errno = @intFromEnum(e);
-            trace.log("fopen return null (errno={})", .{errno});
+            trace.log("{s} return null (errno={})", .{ func_name, errno });
             return null;
         },
     }
@@ -850,6 +867,14 @@ pub export fn fopen(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?
     file.fd = @as(c_int, @intCast(fd));
     file.eof = 0;
     return file;
+}
+
+pub export fn fopen(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
+    return fopenImpl(filename, mode, false, "fopen");
+}
+
+pub export fn fopen64(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
+    return fopenImpl(filename, mode, true, "fopen64");
 }
 
 export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE) callconv(.c) *c.FILE {
