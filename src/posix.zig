@@ -45,32 +45,40 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         return -1;
     }
     const arg = argv[@as(usize, @intCast(global.optind))];
-    if (arg[0] != '-') {
-        // TODO: not sure if this is what we're supposed to do
-        //       my guess is we have to take this non-option
-        //       argument and move it to the front of argv,
-        //       then move on to the rest of the arguments to
-        //       check for more options
-        if (global.optind + 1 != argc) {
-            @panic("TODO: check the rest of the arguments");
-        }
+    if (arg[0] != '-' or arg[1] == 0) {
+        // Stop option parsing when we reach a non-option argument.
         return -1;
     }
-
-    global.optind += 1;
-    if (arg[2] != 0) @panic("multi-letter argument not implemented");
+    if (arg[1] == '-' and arg[2] == 0) {
+        // End-of-options marker.
+        global.optind += 1;
+        return -1;
+    }
     const result = c.strchr(optstring, arg[1]) orelse {
-        // I think we return '?'
-        std.debug.panic("unknown option '{}', probably return '?'", .{arg[1]});
+        global.optind += 1;
+        global.optopt = @as(c_int, arg[1]);
+        return '?';
     };
+    global.optind += 1;
+
+    if (arg[2] != 0) {
+        // Support compact required argument form: -ovalue
+        if (result[1] == ':') {
+            global.optarg = arg + 2;
+            return @as(c_int, arg[1]);
+        }
+        @panic("multi-letter argument not implemented");
+    }
+
     const takes_arg = result[1] == ':';
     if (takes_arg) {
         const is_optional = result[2] == ':';
         if (is_optional) @panic("optional args not implemented");
-        global.optarg = argv[@as(usize, @intCast(global.optind))];
-        if (global.optind >= argc or global.optarg[0] == '-') {
-            std.debug.panic("TODO: handle missing arg for option '{c}'", .{arg[1]});
+        if (global.optind >= argc) {
+            global.optopt = @as(c_int, arg[1]);
+            return if (optstring[0] == ':') ':' else '?';
         }
+        global.optarg = argv[@as(usize, @intCast(global.optind))];
         global.optind += 1;
     }
     return @as(c_int, arg[1]);
@@ -159,7 +167,7 @@ export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.
             .SUCCESS => return @as(c_int, @intCast(fd)),
             else => |e| {
                 if (attempt >= max_attempts) {
-                    // TODO: should we restore rand_part back to XXXXXX?
+                    rand_part.* = [_]u8{ 'X', 'X', 'X', 'X', 'X', 'X' };
                     c.errno = @intFromEnum(e);
                     return -1;
                 }

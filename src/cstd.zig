@@ -121,13 +121,9 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
 
 export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
     trace.log("system {f}", .{trace.fmtStr(string)});
-    if (string) |_| {
-        @panic("system function not implemented");
-    } else {
-        trace.log("system returning -1 to indicate it is not supported yet", .{});
-        // TODO: do we need to set errno?
-        return -1; // system not implemented yet
-    }
+    trace.log("system returning -1 to indicate it is not supported yet", .{});
+    errno = c.ENOSYS;
+    return -1; // system not implemented yet
 }
 
 /// alloc_align is the maximum alignment needed for all types
@@ -141,8 +137,8 @@ const alloc_metadata_len = std.mem.alignForward(usize, alloc_align, @sizeOf(usiz
 
 pub export fn malloc(size: usize) callconv(.c) ?[*]align(alloc_align) u8 {
     trace.log("malloc {}", .{size});
-    std.debug.assert(size > 0); // TODO: what should we do in this case?
-    const full_len = alloc_metadata_len + size;
+    const alloc_size = if (size == 0) 1 else size;
+    const full_len = alloc_metadata_len + alloc_size;
     const buf = global.gpa.allocator().alignedAlloc(u8, std.mem.Alignment.fromByteUnits(alloc_align), full_len) catch |err| switch (err) {
         error.OutOfMemory => {
             trace.log("malloc return null", .{});
@@ -198,8 +194,7 @@ export fn realloc(ptr: ?[*]align(alloc_align) u8, size: usize) callconv(.c) ?[*]
 
 export fn calloc(nmemb: usize, size: usize) callconv(.c) ?[*]align(alloc_align) u8 {
     const total = std.math.mul(usize, nmemb, size) catch {
-        // TODO: set errno
-        //errno = c.ENOMEM;
+        errno = c.ENOMEM;
         return null;
     };
     const ptr = malloc(total) orelse return null;
@@ -896,7 +891,6 @@ export fn fclose(stream: *c.FILE) callconv(.c) c_int {
 }
 
 export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_int {
-    // TODO: update eof when applicable
     trace.log("fseek {*} offset={} whence={}", .{ stream, offset, whence });
 
     if (builtin.os.tag == .windows) {
@@ -909,9 +903,14 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
     if (@sizeOf(usize) == 4) @panic("not implemented");
     const rc = std.posix.system.lseek(stream.fd, @as(i64, @intCast(offset)), @as(usize, @intCast(whence)));
     switch (std.posix.errno(rc)) {
-        .SUCCESS => return 0,
+        .SUCCESS => {
+            stream.eof = 0;
+            stream.errno = 0;
+            return 0;
+        },
         else => |e| {
             errno = @intFromEnum(e);
+            stream.errno = errno;
             return -1;
         },
     }
@@ -928,7 +927,6 @@ export fn rewind(stream: *c.FILE) callconv(.c) void {
         stream.eof = 0;
         stream.errno = 0;
     }
-    // TODO: should we set stream.errno if fseek failed?
 }
 
 // TODO: why is there a putc and an fputc function? They seem to be equivalent

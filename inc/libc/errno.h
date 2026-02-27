@@ -19,6 +19,7 @@ extern int errno;
     #define EACCES 13
     #define EEXIST 17
     #define EINVAL 22
+    #define ENOSYS 38
     #define ENOTTY 25
     #define EPIPE 32
     #define EDOM 33
