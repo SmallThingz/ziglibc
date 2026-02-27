@@ -191,8 +191,11 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
 
-    addLibcTest(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
-    addTinyRegexCTests(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
+    const libc_conformance_step = addLibcTest(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
+    const regex_conformance_step = addTinyRegexCTests(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
+    const conformance_step = b.step("conformance", "Run libc conformance suites");
+    conformance_step.dependOn(libc_conformance_step);
+    conformance_step.dependOn(regex_conformance_step);
     _ = addLua(b, target, optimize, libc_only_std_static, libc_only_posix, zig_start);
     _ = addCmph(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
     _ = addYacc(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
@@ -251,7 +254,7 @@ fn addLibcTest(
     libc_only_std_static: *std.Build.Step.Compile,
     zig_start: *std.Build.Step.Compile,
     libc_only_posix: *std.Build.Step.Compile,
-) void {
+) *std.Build.Step {
     const libc_test_repo = GitRepoStep.create(b, .{
         .url = "git://nsz.repo.hu:49100/repo/libc-test",
         .sha = "b7ec467969a53756258778fa7d9b045f912d1c93",
@@ -302,6 +305,7 @@ fn addLibcTest(
         }
         libc_test_step.dependOn(&b.addRunArtifact(exe).step);
     }
+    return libc_test_step;
 }
 
 fn addTinyRegexCTests(
@@ -311,7 +315,7 @@ fn addTinyRegexCTests(
     libc_only_std_static: *std.Build.Step.Compile,
     zig_start: *std.Build.Step.Compile,
     zig_posix: *std.Build.Step.Compile,
-) void {
+) *std.Build.Step {
     const repo = GitRepoStep.create(b, .{
         .url = "https://github.com/marler8997/tiny-regex-c",
         .sha = "95ef2ad35d36783d789b0ade3178b30a942f085c",
@@ -359,6 +363,7 @@ fn addTinyRegexCTests(
         const run = b.addRunArtifact(exe);
         re_step.dependOn(&run.step);
     }
+    return re_step;
 }
 
 fn addLua(
