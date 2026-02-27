@@ -55,7 +55,8 @@ const windows = struct {
         dwCreationDisposition: u32,
         dwFlagsAndAttributes: u32,
         hTemplateFile: ?HANDLE,
-    ) callconv(@import("std").os.windows.WINAPI) ?HANDLE;
+    ) callconv(.winapi) ?HANDLE;
+    pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) std.os.windows.BOOL;
 };
 
 // --------------------------------------------------------------------------------
@@ -849,7 +850,7 @@ fn fopenImpl(
     if (force_largefile and @hasField(@TypeOf(flags), "LARGEFILE")) {
         flags.LARGEFILE = true;
     }
-    const fd = std.posix.system.open(filename, @bitCast(flags), 0o666);
+    const fd = std.posix.system.open(filename, @bitCast(flags), @as(std.posix.mode_t, 0o666));
     switch (std.posix.errno(fd)) {
         .SUCCESS => {},
         else => |e| {
@@ -882,7 +883,10 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
 export fn fclose(stream: *c.FILE) callconv(.c) c_int {
     trace.log("fclose {*}", .{stream});
     if (builtin.os.tag == .windows) {
-        _ = std.posix.system.close(stream.fd.?);
+        if (windows.CloseHandle(stream.fd.?) == 0) {
+            errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
+            return c.EOF;
+        }
     } else {
         _ = std.posix.system.close(stream.fd);
     }
@@ -901,7 +905,15 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
     // return syscall3(.lseek, @bitCast(usize, @as(isize, fd)), @bitCast(usize, offset), whence);
     //                                                                   ^
     if (@sizeOf(usize) == 4) @panic("not implemented");
-    const rc = std.posix.system.lseek(stream.fd, @as(i64, @intCast(offset)), @as(usize, @intCast(whence)));
+    if (whence != c.SEEK_SET and whence != c.SEEK_CUR and whence != c.SEEK_END) {
+        errno = c.EINVAL;
+        stream.errno = errno;
+        return -1;
+    }
+    const rc = if (builtin.os.tag == .linux)
+        std.posix.system.lseek(stream.fd, @as(i64, @intCast(offset)), @as(usize, @intCast(whence)))
+    else
+        std.posix.system.lseek(stream.fd, @as(i64, @intCast(offset)), @as(c_int, @intCast(whence)));
     switch (std.posix.errno(rc)) {
         .SUCCESS => {
             stream.eof = 0;
@@ -970,7 +982,7 @@ export fn _fwrite_buf(ptr: [*]const u8, size: usize, stream: *c.FILE) callconv(.
             if (written != size) {
                 stream.errno = @intFromEnum(std.posix.E.IO);
             }
-            return written;
+            return @as(usize, @intCast(written));
         },
         else => |e| {
             stream.errno = @intFromEnum(e);

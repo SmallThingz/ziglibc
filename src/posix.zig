@@ -100,6 +100,9 @@ export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.c) isize {
 
 export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
     trace.log("read fd={} buf={*} len={}", .{ fd, buf, len });
+    if (builtin.os.tag == .windows) {
+        @panic("read not implemented on windows");
+    }
     const rc = os.system.read(fd, buf, len);
     switch (os.errno(rc)) {
         .SUCCESS => return @as(isize, @intCast(rc)),
@@ -162,7 +165,7 @@ export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.
             .EXCL = true,
         };
         const merged_flags: os.O = @bitCast(@as(u32, @bitCast(required_flags)) | extra_flags);
-        const fd = os.system.open(template, merged_flags, 0o600);
+        const fd = os.system.open(template, merged_flags, @as(std.posix.mode_t, 0o600));
         switch (os.errno(fd)) {
             .SUCCESS => return @as(c_int, @intCast(fd)),
             else => |e| {
@@ -266,10 +269,10 @@ export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
 
 export fn _exit(status: c_int) callconv(.c) noreturn {
     if (builtin.os.tag == .windows) {
-        os.windows.kernel32.ExitProcess(@as(c_uint, @bitCast(status)));
+        std.os.windows.kernel32.ExitProcess(@as(c_uint, @bitCast(status)));
     }
     if (builtin.os.tag == .wasi) {
-        os.wasi.proc_exit(status);
+        std.os.wasi.proc_exit(status);
     }
     if (builtin.os.tag == .linux and !builtin.single_threaded) {
         // TODO: is this right?
@@ -306,14 +309,10 @@ comptime {
 export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
-            var ft: os.windows.FILETIME = undefined;
-            os.windows.kernel32.GetSystemTimeAsFileTime(&ft);
-            // FileTime has a granularity of 100 nanoseconds and uses the NTFS/Windows epoch.
-            const ft64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            const ft_per_s = std.time.ns_per_s / 100;
+            const ns = std.time.nanoTimestamp();
             tp.* = .{
-                .tv_sec = @as(i64, @intCast(ft64 / ft_per_s)) + std.time.epoch.windows,
-                .tv_nsec = @as(c_long, @intCast(ft64 % ft_per_s)) * 100,
+                .tv_sec = @as(i64, @intCast(@divFloor(ns, std.time.ns_per_s))),
+                .tv_nsec = @as(c_long, @intCast(@mod(ns, std.time.ns_per_s))),
             };
             return 0;
         }
