@@ -2,7 +2,7 @@ const c = @cImport({
     @cInclude("argp.h");
 });
 
-export fn argp_usage(state: *const c.argp_state) callconv(.C) void {
+export fn argp_usage(state: *const c.argp_state) callconv(.c) void {
     _ = state;
     @panic("argp_usage not implemented");
 }
@@ -14,7 +14,7 @@ export fn argp_parse(
     flags: c_uint,
     arg_index: *c_int,
     input: *anyopaque,
-) callconv(.C) c.error_t {
+) callconv(.c) c.error_t {
     _ = argp;
     _ = argc;
     _ = argv;

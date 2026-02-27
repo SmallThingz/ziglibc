@@ -1,6 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const os = std.os;
+const os = std.posix;
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -16,7 +16,7 @@ const c = @cImport({
 });
 
 const cstd = struct {
-    extern fn __zreserveFile() callconv(.C) ?*c.FILE;
+    extern fn __zreserveFile() callconv(.c) ?*c.FILE;
 };
 
 const trace = @import("trace.zig");
@@ -31,8 +31,8 @@ const global = struct {
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
-export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.C) c_int {
-    trace.log("getopt argc={} argv={*} opstring={} (err={}, ind={}, opt={})", .{
+export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
+    trace.log("getopt argc={} argv={*} opstring={f} (err={}, ind={}, opt={})", .{
         argc,
         argv,
         trace.fmtStr(optstring),
@@ -76,7 +76,7 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
     return @as(c_int, arg[1]);
 }
 
-export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.C) isize {
+export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.c) isize {
     if (builtin.os.tag == .windows) {
         @panic("write not implemented on windows");
     }
@@ -90,9 +90,9 @@ export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.C) isize {
     }
 }
 
-export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.C) isize {
+export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
     trace.log("read fd={} buf={*} len={}", .{ fd, buf, len });
-    const rc = os.linux.read(fd, buf, len);
+    const rc = os.system.read(fd, buf, len);
     switch (os.errno(rc)) {
         .SUCCESS => return @as(isize, @intCast(rc)),
         else => |e| {
@@ -105,8 +105,8 @@ export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.C) isize {
 // --------------------------------------------------------------------------------
 // string
 // --------------------------------------------------------------------------------
-export fn strdup(s: [*:0]const u8) callconv(.C) ?[*:0]u8 {
-    trace.log("strdup '{}'", .{trace.fmtStr(s)});
+export fn strdup(s: [*:0]const u8) callconv(.c) ?[*:0]u8 {
+    trace.log("strdup '{f}'", .{trace.fmtStr(s)});
     const len = c.strlen(s);
     const optional_new_s = @as(?[*]u8, @ptrCast(c.malloc(len + 1)));
     if (optional_new_s) |new_s| {
@@ -118,12 +118,12 @@ export fn strdup(s: [*:0]const u8) callconv(.C) ?[*:0]u8 {
 // --------------------------------------------------------------------------------
 // stdlib
 // --------------------------------------------------------------------------------
-export fn mkstemp(template: [*:0]u8) callconv(.C) c_int {
+export fn mkstemp(template: [*:0]u8) callconv(.c) c_int {
     return mkostemp(template, 0, 0);
 }
 
-export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.C) c_int {
-    trace.log("mkstemp '{}'", .{trace.fmtStr(template)});
+export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.c) c_int {
+    trace.log("mkstemp '{f}'", .{trace.fmtStr(template)});
     if (builtin.os.tag == .windows) {
         @panic("mkostemp not implemented in Windows");
     }
@@ -147,7 +147,14 @@ export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         randomizeTempFilename(rand_part);
-        const fd = os.system.open(template, @as(u32, @intCast(flags | os.O.RDWR | os.O.CREAT | os.O.EXCL)), 0o600);
+        const extra_flags: u32 = @as(u32, @intCast(flags));
+        const required_flags = os.O{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .EXCL = true,
+        };
+        const merged_flags: os.O = @bitCast(@as(u32, @bitCast(required_flags)) | extra_flags);
+        const fd = os.system.open(template, merged_flags, 0o600);
         switch (os.errno(fd)) {
             .SUCCESS => return @as(c_int, @intCast(fd)),
             else => |e| {
@@ -172,7 +179,7 @@ fn randomizeTempFilename(slice: *[6]u8) void {
     var randoms: [6]u8 = undefined;
     {
         const timestamp = std.time.nanoTimestamp();
-        var prng = std.rand.DefaultPrng.init(@as(u64, @intCast(std.math.maxInt(u64) & timestamp)));
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.math.maxInt(u64) & timestamp)));
         prng.random().bytes(&randoms);
     }
     var i: usize = 0;
@@ -184,7 +191,7 @@ fn randomizeTempFilename(slice: *[6]u8) void {
 // --------------------------------------------------------------------------------
 // stdio
 // --------------------------------------------------------------------------------
-export fn fileno(stream: *c.FILE) callconv(.C) c_int {
+export fn fileno(stream: *c.FILE) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         // this probably isn't right, but might be fine for an initial implementation
         return @as(c_int, @intCast(@intFromPtr(stream.fd)));
@@ -192,16 +199,16 @@ export fn fileno(stream: *c.FILE) callconv(.C) c_int {
     @panic("fileno not implemented");
 }
 
-export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.C) *c.FILE {
-    trace.log("popen '{}' mode='{s}'", .{ trace.fmtStr(command), mode });
+export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) *c.FILE {
+    trace.log("popen '{f}' mode='{s}'", .{ trace.fmtStr(command), mode });
     @panic("popen not implemented");
 }
-export fn pclose(stream: *c.FILE) callconv(.C) c_int {
+export fn pclose(stream: *c.FILE) callconv(.c) c_int {
     _ = stream;
     @panic("pclose not implemented");
 }
 
-export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.C) ?*c.FILE {
+export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
     trace.log("fdopen {d} mode={s}", .{ fd, mode });
     if (builtin.os.tag == .windows) @panic("not impl");
 
@@ -218,20 +225,25 @@ export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.C) ?*c.FILE {
 // unistd
 // --------------------------------------------------------------------------------
 comptime {
-    if (builtin.os.tag != .windows) @export(close, .{ .name = "close" });
+    if (builtin.os.tag != .windows) @export(&close, .{ .name = "close" });
 }
-fn close(fd: c_int) callconv(.C) c_int {
+fn close(fd: c_int) callconv(.c) c_int {
     trace.log("close {}", .{fd});
-    std.os.close(fd);
-    return 0;
+    switch (os.errno(os.system.close(fd))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
-export fn access(path: [*:0]const u8, amode: c_int) callconv(.C) c_int {
-    trace.log("access '{}' mode=0x{x}", .{ trace.fmtStr(path), amode });
+export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
+    trace.log("access '{f}' mode=0x{x}", .{ trace.fmtStr(path), amode });
     @panic("acces not implemented");
 }
 
-export fn unlink(path: [*:0]const u8) callconv(.C) c_int {
+export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
     if (builtin.os.tag == .windows)
         @panic("windows unlink not implemented");
 
@@ -244,7 +256,7 @@ export fn unlink(path: [*:0]const u8) callconv(.C) c_int {
     }
 }
 
-export fn _exit(status: c_int) callconv(.C) noreturn {
+export fn _exit(status: c_int) callconv(.c) noreturn {
     if (builtin.os.tag == .windows) {
         os.windows.kernel32.ExitProcess(@as(c_uint, @bitCast(status)));
     }
@@ -253,12 +265,12 @@ export fn _exit(status: c_int) callconv(.C) noreturn {
     }
     if (builtin.os.tag == .linux and !builtin.single_threaded) {
         // TODO: is this right?
-        os.linux.exit_group(status);
+        std.os.linux.exit_group(status);
     }
     os.system.exit(status);
 }
 
-export fn isatty(fd: c_int) callconv(.C) c_int {
+export fn isatty(fd: c_int) callconv(.c) c_int {
     if (builtin.os.tag == .windows)
         @panic("isatty not supported on windows (yet?)");
 
@@ -279,11 +291,11 @@ export fn isatty(fd: c_int) callconv(.C) c_int {
 comptime {
     std.debug.assert(@sizeOf(c.timespec) == @sizeOf(os.timespec));
     if (builtin.os.tag != .windows) {
-        std.debug.assert(c.CLOCK_REALTIME == os.CLOCK.REALTIME);
+        std.debug.assert(c.CLOCK_REALTIME == @intFromEnum(os.CLOCK.REALTIME));
     }
 }
 
-export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.C) c_int {
+export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
             var ft: os.windows.FILETIME = undefined;
@@ -301,7 +313,8 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.C) c_in
         std.debug.panic("clk_id {} not implemented on Windows", .{clk_id});
     }
 
-    switch (os.errno(os.system.clock_gettime(clk_id, tp))) {
+    const posix_clk_id: os.clockid_t = @enumFromInt(@as(u32, @intCast(clk_id)));
+    switch (os.errno(os.system.clock_gettime(posix_clk_id, tp))) {
         .SUCCESS => return 0,
         else => |e| {
             c.errno = @intFromEnum(e);
@@ -310,12 +323,12 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.C) c_in
     }
 }
 
-export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.C) c_int {
+export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
     trace.log("gettimeofday tv={*} tz={*}", .{ tv, tz });
     @panic("gettimeofday not implemented");
 }
 
-export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.C) c_int {
+export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
     trace.log("setitimer which={}", .{which});
     _ = value;
     _ = avalue;
@@ -325,7 +338,7 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
 // --------------------------------------------------------------------------------
 // signal
 // --------------------------------------------------------------------------------
-export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.C) c_int {
+export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.c) c_int {
     trace.log("sigaction sig={}", .{sig});
     _ = act;
     _ = oact;
@@ -335,7 +348,7 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 // --------------------------------------------------------------------------------
 // sys/stat.h
 // --------------------------------------------------------------------------------
-export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.C) c_int {
+export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
     @panic("chmod not implemented");
 }
@@ -346,9 +359,9 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
     @panic("fstat not implemented");
 }
 
-export fn umask(mode: c.mode_t) callconv(.C) c.mode_t {
+export fn umask(mode: c.mode_t) callconv(.c) c.mode_t {
     trace.log("umask 0x{x}", .{mode});
-    const old_mode = os.linux.syscall1(.umask, @as(usize, @intCast(mode)));
+    const old_mode = std.os.linux.syscall1(.umask, @as(usize, @intCast(mode)));
     switch (os.errno(old_mode)) {
         .SUCCESS => {},
         else => |e| std.debug.panic("umask syscall should never fail but got '{s}'", .{@tagName(e)}),
@@ -359,8 +372,8 @@ export fn umask(mode: c.mode_t) callconv(.C) c.mode_t {
 // --------------------------------------------------------------------------------
 // libgen
 // --------------------------------------------------------------------------------
-export fn basename(path: ?[*:0]u8) callconv(.C) [*:0]u8 {
-    trace.log("basename {}", .{trace.fmtStr(path)});
+export fn basename(path: ?[*:0]u8) callconv(.c) [*:0]u8 {
+    trace.log("basename {f}", .{trace.fmtStr(path)});
     const path_slice = std.mem.span(path orelse return @as([*:0]u8, @ptrFromInt(@intFromPtr("."))));
     const name = std.fs.path.basename(path_slice);
     const mut_ptr = @as([*:0]u8, @ptrFromInt(@intFromPtr(name.ptr)));
@@ -378,8 +391,8 @@ export fn basename(path: ?[*:0]u8) callconv(.C) [*:0]u8 {
 // --------------------------------------------------------------------------------
 // termios
 // --------------------------------------------------------------------------------
-export fn tcgetattr(fd: c_int, ios: *os.linux.termios) callconv(.C) c_int {
-    switch (os.errno(os.linux.tcgetattr(fd, ios))) {
+export fn tcgetattr(fd: c_int, ios: *std.os.linux.termios) callconv(.c) c_int {
+    switch (os.errno(std.os.linux.tcgetattr(fd, ios))) {
         .SUCCESS => return 0,
         else => |errno| {
             c.errno = @intFromEnum(errno);
@@ -391,9 +404,9 @@ export fn tcgetattr(fd: c_int, ios: *os.linux.termios) callconv(.C) c_int {
 export fn tcsetattr(
     fd: c_int,
     optional_actions: c_int,
-    ios: *const os.linux.termios,
-) callconv(.C) c_int {
-    switch (os.errno(os.linux.tcsetattr(fd, @as(os.linux.TCSA, @enumFromInt(optional_actions)), ios))) {
+    ios: *const std.os.linux.termios,
+) callconv(.c) c_int {
+    switch (os.errno(std.os.linux.tcsetattr(fd, @as(std.os.linux.TCSA, @enumFromInt(optional_actions)), ios))) {
         .SUCCESS => return 0,
         else => |errno| {
             c.errno = @intFromEnum(errno);
@@ -405,8 +418,8 @@ export fn tcsetattr(
 // --------------------------------------------------------------------------------
 // strings
 // --------------------------------------------------------------------------------
-export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.C) c_int {
-    trace.log("strcasecmp {} {}", .{ trace.fmtStr(a), trace.fmtStr(b) });
+export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
+    trace.log("strcasecmp {f} {f}", .{ trace.fmtStr(a), trace.fmtStr(b) });
     @panic("not impl");
     //    var a_next = a;
     //    var b_next = b;
@@ -424,7 +437,7 @@ export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.C) c_int {
 // --------------------------------------------------------------------------------
 export fn _ioctlArgPtr(fd: c_int, request: c_ulong, arg_ptr: *anyopaque) c_int {
     trace.log("ioctl fd={} request=0x{x} arg={*}", .{ fd, request, arg_ptr });
-    const rc = os.linux.ioctl(fd, @as(u32, @intCast(request)), @intFromPtr(arg_ptr));
+    const rc = std.os.linux.ioctl(fd, @as(u32, @intCast(request)), @intFromPtr(arg_ptr));
     switch (os.errno(rc)) {
         .SUCCESS => return @as(c_int, @intCast(rc)),
         else => |errno| {
@@ -457,9 +470,9 @@ export fn select(
 // --------------------------------------------------------------------------------
 comptime {
     if (builtin.os.tag == .windows) {
-        @export(fileno, .{ .name = "_fileno" });
-        @export(isatty, .{ .name = "_isatty" });
-        @export(popen, .{ .name = "_popen" });
-        @export(pclose, .{ .name = "_pclose" });
+        @export(&fileno, .{ .name = "_fileno" });
+        @export(&isatty, .{ .name = "_isatty" });
+        @export(&popen, .{ .name = "_popen" });
+        @export(&pclose, .{ .name = "_pclose" });
     }
 }

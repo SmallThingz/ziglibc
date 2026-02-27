@@ -19,37 +19,33 @@ pub const ZigLibcOptions = struct {
     link: LinkKind,
     start: Start,
     trace: bool,
-    target: std.zig.CrossTarget,
-    optimize: std.builtin.Mode,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
 };
 
-fn relpath(comptime src_path: []const u8) std.Build.LazyPath {
-    if (comptime std.fs.path.dirname(@src().file)) |dir|
-        return .{ .path = dir ++ std.fs.path.sep_str ++ src_path };
-    return .{ .path = src_path };
+fn relpath(builder: *build, src_path: []const u8) std.Build.LazyPath {
+    return builder.path(src_path);
 }
 
 /// Provides a _start symbol that will call C main
 pub fn addZigStart(
     builder: *build,
-    target: std.zig.CrossTarget,
+    target: std.Build.ResolvedTarget,
     optimize: anytype,
 ) *CompileStep {
-    const lib = builder.addStaticLibrary(.{
+    const lib = addStaticLibraryCompat(builder, .{
         .name = "start",
-        .root_source_file = relpath("src" ++ std.fs.path.sep_str ++ "start.zig"),
+        .root_source_file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "start.zig"),
         .target = target,
         .optimize = optimize,
+        .pic = true,
     });
-    // TODO: not sure if this is reallly needed or not, but it shouldn't hurt
-    //       anything except performance to enable it
-    lib.force_pic = true;
     return lib;
 }
 
 // Returns ziglibc as a CompileStep
 // Caller will also need to add the include path to get the C headers
-pub fn addLibc(builder: *std.build.Builder, opt: ZigLibcOptions) *CompileStep {
+pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
     const name = switch (opt.variant) {
         .only_std => "c-only-std",
         .only_posix => "c-only-posix",
@@ -67,30 +63,29 @@ pub fn addLibc(builder: *std.build.Builder, opt: ZigLibcOptions) *CompileStep {
         .glibc => true,
         else => false,
     });
-    const index = relpath("src" ++ std.fs.path.sep_str ++ "lib.zig");
+    const index = relpath(builder, "src" ++ std.fs.path.sep_str ++ "lib.zig");
     const lib = switch (opt.link) {
-        .static => builder.addStaticLibrary(.{
+        .static => addStaticLibraryCompat(builder, .{
             .name = name,
             .root_source_file = index,
             .target = opt.target,
             .optimize = opt.optimize,
+            .pic = true,
         }),
-        .shared => builder.addSharedLibrary(.{
+        .shared => addSharedLibraryCompat(builder, .{
             .name = name,
             .root_source_file = index,
             .target = opt.target,
             .optimize = opt.optimize,
+            .pic = true,
             .version = switch (opt.variant) {
                 .full => .{ .major = 6, .minor = 0, .patch = 0 },
                 else => null,
             },
         }),
     };
-    // TODO: not sure if this is reallly needed or not, but it shouldn't hurt
-    //       anything except performance to enable it
-    lib.force_pic = true;
-    lib.addOptions("modules", modules_options);
-    lib.addOptions("trace_options", trace_options);
+    lib.root_module.addOptions("modules", modules_options);
+    lib.root_module.addOptions("trace_options", trace_options);
     const c_flags = [_][]const u8{
         "-std=c11",
     };
@@ -100,10 +95,10 @@ pub fn addLibc(builder: *std.build.Builder, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "cstd", include_cstd);
     if (include_cstd) {
-        lib.addCSourceFile(.{ .file = relpath("src" ++ std.fs.path.sep_str ++ "printf.c"), .flags = &c_flags });
-        lib.addCSourceFile(.{ .file = relpath("src" ++ std.fs.path.sep_str ++ "scanf.c"), .flags = &c_flags });
-        if (opt.target.getOsTag() == .linux) {
-            lib.addAssemblyFile(relpath("src/linux/jmp.s"));
+        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "printf.c"), .flags = &c_flags });
+        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "scanf.c"), .flags = &c_flags });
+        if (opt.target.result.os.tag == .linux) {
+            lib.addAssemblyFile(relpath(builder, "src/linux/jmp.s"));
         }
     }
     const include_posix = switch (opt.variant) {
@@ -112,7 +107,7 @@ pub fn addLibc(builder: *std.build.Builder, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "posix", include_posix);
     if (include_posix) {
-        lib.addCSourceFile(.{ .file = relpath("src" ++ std.fs.path.sep_str ++ "posix.c"), .flags = &c_flags });
+        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "posix.c"), .flags = &c_flags });
     }
     const include_linux = switch (opt.variant) {
         .only_linux, .full => true,
@@ -120,8 +115,8 @@ pub fn addLibc(builder: *std.build.Builder, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "linux", include_linux);
     if (include_cstd or include_posix) {
-        lib.addIncludePath(relpath("inc" ++ std.fs.path.sep_str ++ "libc"));
-        lib.addIncludePath(relpath("inc" ++ std.fs.path.sep_str ++ "posix"));
+        lib.addIncludePath(relpath(builder, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        lib.addIncludePath(relpath(builder, "inc" ++ std.fs.path.sep_str ++ "posix"));
     }
     const include_gnu = switch (opt.variant) {
         .only_gnu, .full => true,
@@ -129,7 +124,53 @@ pub fn addLibc(builder: *std.build.Builder, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "gnu", include_gnu);
     if (include_gnu) {
-        lib.addIncludePath(relpath("inc" ++ std.fs.path.sep_str ++ "gnu"));
+        lib.addIncludePath(relpath(builder, "inc" ++ std.fs.path.sep_str ++ "gnu"));
     }
     return lib;
+}
+
+fn addStaticLibraryCompat(
+    b: *std.Build,
+    opt: struct {
+        name: []const u8,
+        root_source_file: ?std.Build.LazyPath = null,
+        target: ?std.Build.ResolvedTarget = null,
+        optimize: ?std.builtin.OptimizeMode = null,
+        pic: ?bool = null,
+    },
+) *CompileStep {
+    return b.addLibrary(.{
+        .linkage = .static,
+        .name = opt.name,
+        .root_module = b.createModule(.{
+            .root_source_file = opt.root_source_file,
+            .target = opt.target orelse b.graph.host,
+            .optimize = opt.optimize orelse .Debug,
+            .pic = opt.pic,
+        }),
+    });
+}
+
+fn addSharedLibraryCompat(
+    b: *std.Build,
+    opt: struct {
+        name: []const u8,
+        root_source_file: ?std.Build.LazyPath = null,
+        target: ?std.Build.ResolvedTarget = null,
+        optimize: ?std.builtin.OptimizeMode = null,
+        version: ?std.SemanticVersion = null,
+        pic: ?bool = null,
+    },
+) *CompileStep {
+    return b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = opt.name,
+        .root_module = b.createModule(.{
+            .root_source_file = opt.root_source_file,
+            .target = opt.target orelse b.graph.host,
+            .optimize = opt.optimize orelse .Debug,
+            .pic = opt.pic,
+        }),
+        .version = opt.version,
+    });
 }

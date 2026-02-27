@@ -1,4 +1,4 @@
-export fn alloca(size: usize) callconv(.C) [*]u8 {
+export fn alloca(size: usize) callconv(.c) [*]u8 {
     _ = size;
     @panic("alloca not implemented");
 }

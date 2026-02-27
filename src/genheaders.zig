@@ -80,7 +80,7 @@ fn parseDefinition(
     error_reporter: *ErrorReporter,
     text: []const u8,
 ) !?*Definition {
-    var line_it = std.mem.split(u8, text, "\n");
+    var line_it = std.mem.splitScalar(u8, text, '\n');
     const first_line = line_it.next().?;
     if (!std.mem.eql(u8, first_line, "c89")) {
         std.debug.panic("first line not being 'c89', instead is '{s}', not implemented", .{first_line});
@@ -166,7 +166,7 @@ const Parser = struct {
 
     fn genHeaders(self: *Parser) !void {
         var started: ?struct { ptr: [*]const u8, line_number: u32 } = null;
-        var line_it = std.mem.split(u8, self.contents, "\n");
+        var line_it = std.mem.splitScalar(u8, self.contents, '\n');
         var line_number: u32 = 0;
 
         while (line_it.next()) |line_untrimmed| {

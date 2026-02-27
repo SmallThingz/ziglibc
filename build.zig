@@ -5,13 +5,13 @@ const luabuild = @import("luabuild.zig");
 const awkbuild = @import("awkbuild.zig");
 const gnumakebuild = @import("gnumakebuild.zig");
 
-pub fn build(b: *std.build.Builder) void {
+pub fn build(b: *std.Build) void {
     const trace_enabled = b.option(bool, "trace", "enable libc tracing") orelse false;
 
     {
-        const exe = b.addExecutable(.{
+        const exe = addExecutableCompat(b, .{
             .name = "genheaders",
-            .root_source_file = .{ .path = "src" ++ std.fs.path.sep_str ++ "genheaders.zig" },
+            .root_source_file = lazyPath(b, "src" ++ std.fs.path.sep_str ++ "genheaders.zig"),
         });
         const run = b.addRunArtifact(exe);
         run.addArg(b.pathFromRoot("capi.txt"));
@@ -96,9 +96,9 @@ pub fn build(b: *std.build.Builder) void {
 
     const test_step = b.step("test", "Run unit tests");
 
-    const test_env_exe = b.addExecutable(.{
+    const test_env_exe = addExecutableCompat(b, .{
         .name = "testenv",
-        .root_source_file = .{ .path = "test" ++ std.fs.path.sep_str ++ "testenv.zig" },
+        .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "testenv.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -132,7 +132,7 @@ pub fn build(b: *std.build.Builder) void {
     {
         const exe = addTest("types", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = b.addRunArtifact(exe);
-        run_step.addArg(b.fmt("{}", .{@divExact(target.toTarget().ptrBitWidth(), 8)}));
+        run_step.addArg(b.fmt("{}", .{@divExact(target.result.ptrBitWidth(), 8)}));
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -171,7 +171,7 @@ pub fn build(b: *std.build.Builder) void {
     }
 
     // this test only works on linux right now
-    if (target.getOsTag() == .linux) {
+    if (target.result.os.tag == .linux) {
         const exe = addTest("jmp", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = b.addRunArtifact(exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
@@ -199,32 +199,32 @@ fn installArtifact(b: *std.Build, artifact: anytype) *std.Build.Step.InstallArti
     return install;
 }
 
-fn addPosix(artifact: *std.build.LibExeObjStep, zig_posix: *std.build.LibExeObjStep) void {
+fn addPosix(artifact: *std.Build.Step.Compile, zig_posix: *std.Build.Step.Compile) void {
     artifact.linkLibrary(zig_posix);
-    artifact.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "posix" });
+    artifact.addIncludePath(lazyPath(artifact.step.owner, "inc" ++ std.fs.path.sep_str ++ "posix"));
 }
 
 fn addTest(
     comptime name: []const u8,
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
-    const exe = b.addExecutable(.{
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const exe = addExecutableCompat(b, .{
         .name = name,
-        .root_source_file = .{ .path = "test" ++ std.fs.path.sep_str ++ name ++ ".c" },
+        .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ name ++ ".c"),
         .target = target,
         .optimize = optimize,
     });
-    exe.addCSourceFiles(&.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &[_][]const u8{});
-    exe.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "libc" });
-    exe.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "posix" });
+    addCSourceFilesCompat(exe, &.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &.{});
+    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
+    if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
@@ -232,12 +232,12 @@ fn addTest(
 }
 
 fn addLibcTest(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    libc_only_posix: *std.build.LibExeObjStep,
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    libc_only_posix: *std.Build.Step.Compile,
 ) void {
     const libc_test_repo = GitRepoStep.create(b, .{
         .url = "git://nsz.repo.hu:49100/repo/libc-test",
@@ -250,13 +250,13 @@ fn addLibcTest(
 
     // inttypes
     inline for (.{ "assert", "ctype", "errno", "main", "stdbool", "stddef", "string" }) |name| {
-        const lib = b.addObject(.{
+        const lib = addObjectCompat(b, .{
             .name = "libc-test-api-" ++ name,
-            .root_source_file = .{ .path = b.pathJoin(&.{ libc_test_path, "src", "api", name ++ ".c" }) },
+            .root_source_file = lazyPath(b, b.pathJoin(&.{ libc_test_path, "src", "api", name ++ ".c" })),
             .target = target,
             .optimize = optimize,
         });
-        lib.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "libc" });
+        lib.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
         lib.step.dependOn(&libc_test_repo.step);
         libc_test_step.dependOn(&lib.step);
     }
@@ -268,22 +268,22 @@ fn addLibcTest(
     // strtol, it seems there might be some disagreement between libc-test/glibc
     // about how strtoul interprets negative numbers, so leaving out strtol for now
     inline for (.{ "argv", "basename", "clock_gettime", "string" }) |name| {
-        const exe = b.addExecutable(.{
+        const exe = addExecutableCompat(b, .{
             .name = "libc-test-functional-" ++ name,
-            .root_source_file = .{ .path = b.pathJoin(&.{ libc_test_path, "src", "functional", name ++ ".c" }) },
+            .root_source_file = lazyPath(b, b.pathJoin(&.{ libc_test_path, "src", "functional", name ++ ".c" })),
             .target = target,
             .optimize = optimize,
         });
-        exe.addCSourceFiles(common_src, &[_][]const u8{});
+        addCSourceFilesCompat(exe, common_src, &.{});
         exe.step.dependOn(&libc_test_repo.step);
-        exe.addIncludePath(.{ .path = libc_inc_path });
-        exe.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "libc" });
-        exe.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "posix" });
+        exe.addIncludePath(lazyPath(b, libc_inc_path));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
         exe.linkLibrary(libc_only_std_static);
         exe.linkLibrary(zig_start);
         exe.linkLibrary(libc_only_posix);
         // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-        if (target.getOs().tag == .windows) {
+        if (target.result.os.tag == .windows) {
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
         }
@@ -292,12 +292,12 @@ fn addLibcTest(
 }
 
 fn addTinyRegexCTests(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    zig_posix: *std.build.LibExeObjStep,
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    zig_posix: *std.Build.Step.Compile,
 ) void {
     const repo = GitRepoStep.create(b, .{
         .url = "https://github.com/marler8997/tiny-regex-c",
@@ -308,7 +308,7 @@ fn addTinyRegexCTests(
 
     const re_step = b.step("re-tests", "run the tiny-regex-c tests");
     inline for (&[_][]const u8{ "test1", "test3" }) |test_name| {
-        const exe = b.addExecutable(.{
+        const exe = addExecutableCompat(b, .{
             .name = "re" ++ test_name,
             .root_source_file = null,
             .target = target,
@@ -317,7 +317,7 @@ fn addTinyRegexCTests(
         //b.installArtifact(exe);
         exe.step.dependOn(&repo.step);
         const repo_path = repo.getPath(&exe.step);
-        var files = std.ArrayList([]const u8).init(b.allocator);
+        var files = std.array_list.Managed([]const u8).init(b.allocator);
         const sources = [_][]const u8{
             "re.c", "tests" ++ std.fs.path.sep_str ++ test_name ++ ".c",
         };
@@ -325,18 +325,18 @@ fn addTinyRegexCTests(
             files.append(b.pathJoin(&.{ repo_path, src })) catch unreachable;
         }
 
-        exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+        addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
             "-std=c99",
         });
-        exe.addIncludePath(.{ .path = repo_path });
+        exe.addIncludePath(lazyPath(b, repo_path));
 
-        exe.addIncludePath(.{ .path = "inc/libc" });
-        exe.addIncludePath(.{ .path = "inc/posix" });
+        exe.addIncludePath(lazyPath(b, "inc/libc"));
+        exe.addIncludePath(lazyPath(b, "inc/posix"));
         exe.linkLibrary(libc_only_std_static);
         exe.linkLibrary(zig_start);
         exe.linkLibrary(zig_posix);
         // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-        if (target.getOs().tag == .windows) {
+        if (target.result.os.tag == .windows) {
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
         }
@@ -349,20 +349,20 @@ fn addTinyRegexCTests(
 }
 
 fn addLua(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    libc_only_posix: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
+    libc_only_std_static: *std.Build.Step.Compile,
+    libc_only_posix: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
     const lua_repo = GitRepoStep.create(b, .{
         .url = "https://github.com/lua/lua",
         .sha = "5d708c3f9cae12820e415d4f89c9eacbe2ab964b",
         .branch = "v5.4.4",
         .fetch_enabled = true,
     });
-    const lua_exe = b.addExecutable(.{
+    const lua_exe = addExecutableCompat(b, .{
         .name = "lua",
         .target = target,
         .optimize = optimize,
@@ -370,11 +370,11 @@ fn addLua(
     lua_exe.step.dependOn(&lua_repo.step);
     const install = b.addInstallArtifact(lua_exe, .{});
     // doesn't compile for windows for some reason
-    if (target.getOs().tag != .windows) {
+    if (target.result.os.tag != .windows) {
         b.getInstallStep().dependOn(&install.step);
     }
     const lua_repo_path = lua_repo.getPath(&lua_exe.step);
-    var files = std.ArrayList([]const u8).init(b.allocator);
+    var files = std.array_list.Managed([]const u8).init(b.allocator);
     files.append(b.pathJoin(&.{ lua_repo_path, "lua.c" })) catch unreachable;
     inline for (luabuild.core_objects) |obj| {
         files.append(b.pathJoin(&.{ lua_repo_path, obj ++ ".c" })) catch unreachable;
@@ -386,19 +386,19 @@ fn addLua(
         files.append(b.pathJoin(&.{ lua_repo_path, obj ++ ".c" })) catch unreachable;
     }
 
-    lua_exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+    addCSourceFilesCompat(lua_exe, files.toOwnedSlice() catch unreachable, &.{
         "-nostdinc",
         "-nostdlib",
         "-std=c99",
     });
 
-    lua_exe.addIncludePath(.{ .path = "inc" ++ std.fs.path.sep_str ++ "libc" });
+    lua_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
     lua_exe.linkLibrary(libc_only_std_static);
     lua_exe.linkLibrary(libc_only_posix);
     lua_exe.linkLibrary(zig_start);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
-        lua_exe.addIncludePath(.{ .path = "inc/win32" });
+    if (target.result.os.tag == .windows) {
+        lua_exe.addIncludePath(lazyPath(b, "inc/win32"));
         lua_exe.linkSystemLibrary("ntdll");
         lua_exe.linkSystemLibrary("kernel32");
     }
@@ -418,13 +418,13 @@ fn addLua(
 }
 
 fn addCmph(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    zig_posix: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    zig_posix: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
     const repo = GitRepoStep.create(b, .{
         //.url = "https://git.code.sf.net/p/cmph/git",
         .url = "https://github.com/bonitao/cmph",
@@ -439,7 +439,7 @@ fn addCmph(
     );
     config_step.step.dependOn(&repo.step);
 
-    const exe = b.addExecutable(.{
+    const exe = addExecutableCompat(b, .{
         .name = "cmph",
         .target = target,
         .optimize = optimize,
@@ -448,7 +448,7 @@ fn addCmph(
     exe.step.dependOn(&repo.step);
     exe.step.dependOn(&config_step.step);
     const repo_path = repo.getPath(&exe.step);
-    var files = std.ArrayList([]const u8).init(b.allocator);
+    var files = std.array_list.Managed([]const u8).init(b.allocator);
     const sources = [_][]const u8{
         "main.c",        "cmph.c",         "hash.c",           "chm.c",             "bmz.c",          "bmz8.c",   "brz.c",          "fch.c",
         "bdz.c",         "bdz_ph.c",       "chd_ph.c",         "chd.c",             "jenkins_hash.c", "graph.c",  "vqueue.c",       "buffer_manager.c",
@@ -458,18 +458,18 @@ fn addCmph(
         files.append(b.pathJoin(&.{ repo_path, "src", src })) catch unreachable;
     }
 
-    exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+    addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
         "-std=c11",
     });
 
-    exe.addIncludePath(.{ .path = "inc/libc" });
-    exe.addIncludePath(.{ .path = "inc/posix" });
-    exe.addIncludePath(.{ .path = "inc/gnu" });
+    exe.addIncludePath(lazyPath(b, "inc/libc"));
+    exe.addIncludePath(lazyPath(b, "inc/posix"));
+    exe.addIncludePath(lazyPath(b, "inc/gnu"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
+    if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
@@ -481,13 +481,13 @@ fn addCmph(
 }
 
 fn addYacc(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    zig_posix: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    zig_posix: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
     const repo = GitRepoStep.create(b, .{
         .url = "https://github.com/ibara/yacc",
         .sha = "1a4138ce2385ec676c6d374245fda5a9cd2fbee2",
@@ -515,7 +515,7 @@ fn addYacc(
     );
     gen_progname_step.step.dependOn(&repo.step);
 
-    const exe = b.addExecutable(.{
+    const exe = addExecutableCompat(b, .{
         .name = "yacc",
         .target = target,
         .optimize = optimize,
@@ -525,7 +525,7 @@ fn addYacc(
     exe.step.dependOn(&config_step.step);
     exe.step.dependOn(&gen_progname_step.step);
     const repo_path = repo.getPath(&exe.step);
-    var files = std.ArrayList([]const u8).init(b.allocator);
+    var files = std.array_list.Managed([]const u8).init(b.allocator);
     const sources = [_][]const u8{
         "closure.c",  "error.c",  "lalr.c",    "lr0.c",      "main.c",     "mkpar.c",    "output.c", "reader.c",
         "skeleton.c", "symtab.c", "verbose.c", "warshall.c", "portable.c", "progname.c",
@@ -534,17 +534,17 @@ fn addYacc(
         files.append(b.pathJoin(&.{ repo_path, src })) catch unreachable;
     }
 
-    exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+    addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
         "-std=c90",
     });
 
-    exe.addIncludePath(.{ .path = "inc/libc" });
-    exe.addIncludePath(.{ .path = "inc/posix" });
+    exe.addIncludePath(lazyPath(b, "inc/libc"));
+    exe.addIncludePath(lazyPath(b, "inc/posix"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
+    if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
@@ -556,14 +556,14 @@ fn addYacc(
 }
 
 fn addYabfc(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    zig_posix: *std.build.LibExeObjStep,
-    zig_gnu: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    zig_posix: *std.Build.Step.Compile,
+    zig_gnu: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
     const repo = GitRepoStep.create(b, .{
         .url = "https://github.com/julianneswinoga/yabfc",
         .sha = "a789be25a0918d330b7a4de12db0d33e0785f244",
@@ -571,7 +571,7 @@ fn addYabfc(
         .fetch_enabled = true,
     });
 
-    const exe = b.addExecutable(.{
+    const exe = addExecutableCompat(b, .{
         .name = "yabfc",
         .target = target,
         .optimize = optimize,
@@ -579,27 +579,27 @@ fn addYabfc(
     const install = installArtifact(b, exe);
     exe.step.dependOn(&repo.step);
     const repo_path = repo.getPath(&exe.step);
-    var files = std.ArrayList([]const u8).init(b.allocator);
+    var files = std.array_list.Managed([]const u8).init(b.allocator);
     const sources = [_][]const u8{
         "assembly.c", "elfHelper.c", "helpers.c", "optimize.c", "yabfc.c",
     };
     for (sources) |src| {
         files.append(b.pathJoin(&.{ repo_path, src })) catch unreachable;
     }
-    exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+    addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
         "-std=c99",
     });
 
-    exe.addIncludePath(.{ .path = "inc/libc" });
-    exe.addIncludePath(.{ .path = "inc/posix" });
-    exe.addIncludePath(.{ .path = "inc/linux" });
-    exe.addIncludePath(.{ .path = "inc/gnu" });
+    exe.addIncludePath(lazyPath(b, "inc/libc"));
+    exe.addIncludePath(lazyPath(b, "inc/posix"));
+    exe.addIncludePath(lazyPath(b, "inc/linux"));
+    exe.addIncludePath(lazyPath(b, "inc/gnu"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     exe.linkLibrary(zig_gnu);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
+    if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
@@ -611,14 +611,14 @@ fn addYabfc(
 }
 
 fn addSecretGame(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    zig_posix: *std.build.LibExeObjStep,
-    zig_gnu: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    zig_posix: *std.Build.Step.Compile,
+    zig_gnu: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
     const repo = GitRepoStep.create(b, .{
         .url = "https://github.com/ethinethin/Secret",
         .sha = "8ec8442f84f8bed2cb3985455e7af4d1ce605401",
@@ -626,7 +626,7 @@ fn addSecretGame(
         .fetch_enabled = true,
     });
 
-    const exe = b.addExecutable(.{
+    const exe = addExecutableCompat(b, .{
         .name = "secret",
         .target = target,
         .optimize = optimize,
@@ -634,27 +634,27 @@ fn addSecretGame(
     const install = b.addInstallArtifact(exe, .{});
     exe.step.dependOn(&repo.step);
     const repo_path = repo.getPath(&exe.step);
-    var files = std.ArrayList([]const u8).init(b.allocator);
+    var files = std.array_list.Managed([]const u8).init(b.allocator);
     const sources = [_][]const u8{
         "main.c", "inter.c", "input.c", "items.c", "rooms.c", "linenoise/linenoise.c",
     };
     for (sources) |src| {
         files.append(b.pathJoin(&.{ repo_path, src })) catch unreachable;
     }
-    exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+    addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
         "-std=c90",
     });
 
-    exe.addIncludePath(.{ .path = "inc/libc" });
-    exe.addIncludePath(.{ .path = "inc/posix" });
-    exe.addIncludePath(.{ .path = "inc/linux" });
-    exe.addIncludePath(.{ .path = "inc/gnu" });
+    exe.addIncludePath(lazyPath(b, "inc/libc"));
+    exe.addIncludePath(lazyPath(b, "inc/posix"));
+    exe.addIncludePath(lazyPath(b, "inc/linux"));
+    exe.addIncludePath(lazyPath(b, "inc/gnu"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     exe.linkLibrary(zig_gnu);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
+    if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
@@ -663,4 +663,88 @@ fn addSecretGame(
     step.dependOn(&install.step);
 
     return exe;
+}
+
+fn addExecutableCompat(
+    b: *std.Build,
+    opt: struct {
+        name: []const u8,
+        root_source_file: ?std.Build.LazyPath = null,
+        target: ?std.Build.ResolvedTarget = null,
+        optimize: ?std.builtin.OptimizeMode = null,
+    },
+) *std.Build.Step.Compile {
+    const has_zig_root = if (opt.root_source_file) |root|
+        std.mem.endsWith(u8, root.getDisplayName(), ".zig")
+    else
+        false;
+    const exe = b.addExecutable(.{
+        .name = opt.name,
+        .root_module = b.createModule(.{
+            .root_source_file = if (has_zig_root) opt.root_source_file else null,
+            .target = opt.target orelse b.graph.host,
+            .optimize = opt.optimize orelse .Debug,
+        }),
+    });
+    if (opt.root_source_file) |root| {
+        if (!has_zig_root) {
+            exe.addCSourceFile(.{
+                .file = root,
+                .flags = &.{},
+            });
+        }
+    }
+    return exe;
+}
+
+fn addObjectCompat(
+    b: *std.Build,
+    opt: struct {
+        name: []const u8,
+        root_source_file: ?std.Build.LazyPath = null,
+        target: ?std.Build.ResolvedTarget = null,
+        optimize: ?std.builtin.OptimizeMode = null,
+    },
+) *std.Build.Step.Compile {
+    const has_zig_root = if (opt.root_source_file) |root|
+        std.mem.endsWith(u8, root.getDisplayName(), ".zig")
+    else
+        false;
+    const obj = b.addObject(.{
+        .name = opt.name,
+        .root_module = b.createModule(.{
+            .root_source_file = if (has_zig_root) opt.root_source_file else null,
+            .target = opt.target orelse b.graph.host,
+            .optimize = opt.optimize orelse .Debug,
+        }),
+    });
+    if (opt.root_source_file) |root| {
+        if (!has_zig_root) {
+            obj.addCSourceFile(.{
+                .file = root,
+                .flags = &.{},
+            });
+        }
+    }
+    return obj;
+}
+
+fn addCSourceFilesCompat(
+    step: *std.Build.Step.Compile,
+    files: []const []const u8,
+    flags: []const []const u8,
+) void {
+    for (files) |file| {
+        step.addCSourceFile(.{
+            .file = lazyPath(step.step.owner, file),
+            .flags = flags,
+        });
+    }
+}
+
+fn lazyPath(b: *std.Build, path: []const u8) std.Build.LazyPath {
+    return if (std.fs.path.isAbsolute(path))
+        .{ .cwd_relative = path }
+    else
+        b.path(path);
 }

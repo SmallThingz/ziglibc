@@ -2,21 +2,21 @@ const std = @import("std");
 const GitRepoStep = @import("GitRepoStep.zig");
 
 pub fn addGnuMake(
-    b: *std.build.Builder,
+    b: *std.Build,
     target: anytype,
     optimize: anytype,
-    libc_only_std_static: *std.build.LibExeObjStep,
-    zig_start: *std.build.LibExeObjStep,
-    zig_posix: *std.build.LibExeObjStep,
-) *std.build.LibExeObjStep {
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    zig_posix: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
     const repo = GitRepoStep.create(b, .{
         .url = "https://git.savannah.gnu.org/git/make.git",
         .sha = "ed493f6c9116cc217b99c2cfa6a95f15803235a2",
         .branch = "4.4",
     });
 
-    const config_step = b.allocator.create(std.build.Step) catch unreachable;
-    config_step.* = std.build.Step.init(.{
+    const config_step = b.allocator.create(std.Build.Step) catch unreachable;
+    config_step.* = std.Build.Step.init(.{
         .id = .custom,
         .name = "configure GNU Make",
         .owner = b,
@@ -68,7 +68,7 @@ pub fn addGnuMake(
 
     // home/marler8997/zig/0.11.0-dev.12+ebf9ffd34/files/zig build-exe -cflags -std=c11 -- /home/marler8997/git/ziglibc/dep/make.git/src/ar.c /home/marler8997/git/ziglibc/dep/make.git/src/arscan.c /home/marler8997/git/ziglibc/dep/make.git/src/commands.c /home/marler8997/git/ziglibc/dep/make.git/src/default.c /home/marler8997/git/ziglibc/dep/make.git/src/dir.c /home/marler8997/git/ziglibc/dep/make.git/src/expand.c /home/marler8997/git/ziglibc/dep/make.git/src/file.c /home/marler8997/git/ziglibc/dep/make.git/src/function.c /home/marler8997/git/ziglibc/dep/make.git/src/getopt.c /home/marler8997/git/ziglibc/dep/make.git/src/getopt1.c /home/marler8997/git/ziglibc/dep/make.git/src/guile.c /home/marler8997/git/ziglibc/dep/make.git/src/hash.c /home/marler8997/git/ziglibc/dep/make.git/src/implicit.c /home/marler8997/git/ziglibc/dep/make.git/src/job.c /home/marler8997/git/ziglibc/dep/make.git/src/load.c /home/marler8997/git/ziglibc/dep/make.git/src/loadapi.c /home/marler8997/git/ziglibc/dep/make.git/src/main.c /home/marler8997/git/ziglibc/dep/make.git/src/misc.c /home/marler8997/git/ziglibc/dep/make.git/src/output.c /home/marler8997/git/ziglibc/dep/make.git/src/read.c /home/marler8997/git/ziglibc/dep/make.git/src/remake.c /home/marler8997/git/ziglibc/dep/make.git/src/rule.c /home/marler8997/git/ziglibc/dep/make.git/src/shuffle.c /home/marler8997/git/ziglibc/dep/make.git/src/signame.c /home/marler8997/git/ziglibc/dep/make.git/src/strcache.c /home/marler8997/git/ziglibc/dep/make.git/src/variable.c /home/marler8997/git/ziglibc/dep/make.git/src/version.c /home/marler8997/git/ziglibc/dep/make.git/src/vpath.c /home/marler8997/git/ziglibc/dep/make.git/src/posixos.c /home/marler8997/git/ziglibc/dep/make.git/src/remote-stub.c /home/marler8997/git/ziglibc/zig-cache/o/b2ab2b27dd98ed5352486d2081cf35bf/libc-only-std.a /home/marler8997/git/ziglibc/zig-cache/o/4d76e73699236d8f95a7f75ae51db269/libc-only-posix.a /home/marler8997/git/ziglibc/zig-cache/o/f647e7cbfedb41adc3d86981e126be58/libstart.a --verbose-cc --cache-dir /home/marler8997/git/ziglibc/zig-cache --global-cache-dir /home/marler8997/.cache/zig --name make -I /home/marler8997/git/ziglibc/inc/libc -I /home/marler8997/git/ziglibc/inc/posix -I /home/marler8997/git/ziglibc/inc/gnu --enable-cache
 
-    const exe = b.addExecutable(.{
+    const exe = addExecutableCompat(b, .{
         .name = "make",
         .target = target,
         .optimize = optimize,
@@ -77,13 +77,13 @@ pub fn addGnuMake(
     exe.step.dependOn(&repo.step);
     exe.step.dependOn(config_step);
     const repo_path = repo.getPath(&exe.step);
-    var files = std.ArrayList([]const u8).init(b.allocator);
+    var files = std.array_list.Managed([]const u8).init(b.allocator);
     for (src_filenames) |src| {
         files.append(b.pathJoin(&.{ repo_path, "src", src })) catch unreachable;
     }
 
-    exe.addIncludePath(.{ .path = b.pathJoin(&.{ repo_path, "src" }) });
-    exe.addCSourceFiles(files.toOwnedSlice() catch unreachable, &[_][]const u8{
+    exe.addIncludePath(lazyPath(b, b.pathJoin(&.{ repo_path, "src" })));
+    addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
         "-std=c99",
         "-DHAVE_CONFIG_H",
         "-Wall",
@@ -104,15 +104,15 @@ pub fn addGnuMake(
         //"-Wlogical-op", "-Wformat-signedness", "-Wduplicated-cond",
     });
 
-    exe.addIncludePath(.{ .path = "inc/libc" });
-    exe.addIncludePath(.{ .path = "inc/posix" });
-    exe.addIncludePath(.{ .path = "inc/gnu" });
-    exe.addIncludePath(.{ .path = "inc/alloca" });
+    exe.addIncludePath(lazyPath(b, "inc/libc"));
+    exe.addIncludePath(lazyPath(b, "inc/posix"));
+    exe.addIncludePath(lazyPath(b, "inc/gnu"));
+    exe.addIncludePath(lazyPath(b, "inc/alloca"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
-    if (target.getOs().tag == .windows) {
+    if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
@@ -155,3 +155,40 @@ const src_filenames = &[_][]const u8{
     "posixos.c",
     "remote-stub.c",
 };
+
+fn addExecutableCompat(
+    b: *std.Build,
+    opt: struct {
+        name: []const u8,
+        target: ?std.Build.ResolvedTarget = null,
+        optimize: ?std.builtin.OptimizeMode = null,
+    },
+) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = opt.name,
+        .root_module = b.createModule(.{
+            .target = opt.target orelse b.graph.host,
+            .optimize = opt.optimize orelse .Debug,
+        }),
+    });
+}
+
+fn addCSourceFilesCompat(
+    step: *std.Build.Step.Compile,
+    files: []const []const u8,
+    flags: []const []const u8,
+) void {
+    for (files) |file| {
+        step.addCSourceFile(.{
+            .file = lazyPath(step.step.owner, file),
+            .flags = flags,
+        });
+    }
+}
+
+fn lazyPath(b: *std.Build, path: []const u8) std.Build.LazyPath {
+    return if (std.fs.path.isAbsolute(path))
+        .{ .cwd_relative = path }
+    else
+        b.path(path);
+}

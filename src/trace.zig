@@ -9,14 +9,14 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
 
 pub fn fmtStr(s: anytype) FmtStr {
     switch (@typeInfo(@TypeOf(s))) {
-        .Pointer => |info| switch (info.size) {
-            .Slice => return FmtStr.initSlice(s),
-            .Many => if (info.sentinel) |_| {
+        .pointer => |info| switch (info.size) {
+            .slice => return FmtStr.initSlice(s),
+            .many => if (info.sentinel()) |_| {
                 return FmtStr.initSentinel(s);
             },
             else => {},
         },
-        .Optional => return fmtStr(s orelse return FmtStr.initNull()),
+        .optional => return fmtStr(s orelse return FmtStr.initNull()),
         else => {},
     }
     @compileError("fmtStr for type " ++ @typeName(@TypeOf(s)) ++ " is not implemented");
@@ -37,7 +37,7 @@ const FmtStr = struct {
         if (s.len > max_str_len) {
             return .{ .ptr_opt = s.ptr, .len = .truncated };
         }
-        return .{ .ptr_opt = s.ptr, .len = .{ .len = @as(u8, s.len) } };
+        return .{ .ptr_opt = s.ptr, .len = .{ .full = @as(u8, @intCast(s.len)) } };
     }
 
     pub fn initSentinel(s: [*:0]const u8) FmtStr {
@@ -51,12 +51,8 @@ const FmtStr = struct {
 
     pub fn format(
         self: @This(),
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
         writer: anytype,
-    ) @TypeOf(writer).Error!void {
-        _ = fmt;
-        _ = options;
+    ) std.Io.Writer.Error!void {
         const ptr = self.ptr_opt orelse {
             try writer.writeAll("NULL");
             return;
@@ -65,6 +61,6 @@ const FmtStr = struct {
             .full => |len| .{ .s_len = len, .suffix = "" },
             .truncated => .{ .s_len = max_str_len - 3, .suffix = "..." },
         };
-        try writer.print("{*} \"{}\"{s}", .{ ptr, std.zig.fmtEscapes(ptr[0..part.s_len]), part.suffix });
+        try writer.print("{*} \"{s}\"{s}", .{ ptr, ptr[0..part.s_len], part.suffix });
     }
 };

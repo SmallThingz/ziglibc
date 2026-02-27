@@ -2,7 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const c = struct {
-    extern fn main(argc: c_int, argv: [*:null]?[*:0]u8) callconv(.C) c_int;
+    extern fn main(argc: c_int, argv: [*:null]?[*:0]u8) callconv(.c) c_int;
 };
 
 pub fn main() u8 {

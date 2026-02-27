@@ -2,8 +2,8 @@ const std = @import("std");
 const ProcessFileStep = @This();
 const filecheck = @import("filecheck.zig");
 
-step: std.build.Step,
-//builder: *std.build.Builder,
+step: std.Build.Step,
+//builder: *std.Build,
 in_filename: []const u8,
 out_filename: []const u8,
 subs: []const Sub,
@@ -13,15 +13,15 @@ pub const Sub = struct {
     new: []const u8,
 };
 
-pub fn create(b: *std.build.Builder, opt: struct {
+pub fn create(b: *std.Build, opt: struct {
     in_filename: []const u8,
     out_filename: []const u8,
     subs: []const Sub = &[_]Sub{},
 }) *ProcessFileStep {
-    var result = b.allocator.create(ProcessFileStep) catch unreachable;
+    const result = b.allocator.create(ProcessFileStep) catch unreachable;
     const name = std.fmt.allocPrint(b.allocator, "process file '{s}'", .{std.fs.path.basename(opt.in_filename)}) catch unreachable;
     result.* = ProcessFileStep{
-        .step = std.build.Step.init(.{
+        .step = std.Build.Step.init(.{
             .id = .custom,
             .name = name,
             .owner = b,
@@ -34,9 +34,9 @@ pub fn create(b: *std.build.Builder, opt: struct {
     return result;
 }
 
-fn make(step: *std.build.Step, progress: *std.Progress.Node) !void {
-    _ = progress;
-    const self = @fieldParentPtr(ProcessFileStep, "step", step);
+fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
+    _ = options;
+    const self: *ProcessFileStep = @fieldParentPtr("step", step);
 
     if (try filecheck.leftFileIsNewer(self.out_filename, self.in_filename)) {
         return;
@@ -46,13 +46,13 @@ fn make(step: *std.build.Step, progress: *std.Progress.Node) !void {
     defer arena.deinit();
     const content = std.fs.cwd().readFileAlloc(arena.allocator(), self.in_filename, std.math.maxInt(usize)) catch |err| {
         std.log.err("failed to read file '{s}' to process ({s})", .{ self.in_filename, @errorName(err) });
-        std.os.exit(0xff);
+        std.process.exit(0xff);
     };
     const tmp_filename = try std.fmt.allocPrint(arena.allocator(), "{s}.processing", .{self.out_filename});
     {
         var out_file = try std.fs.cwd().createFile(tmp_filename, .{});
         defer out_file.close();
-        try process(self.subs, out_file.writer(), content);
+        try process(self.subs, out_file, content);
     }
     try std.fs.cwd().rename(tmp_filename, self.out_filename);
 }
