@@ -149,6 +149,19 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
+        const exe = addTest("stdlib_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = b.addRunArtifact(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addTest("stdio_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = b.addRunArtifact(test_env_exe);
+        run_step.addArtifactArg(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
         const exe = addTest("getopt", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
         {
