@@ -69,7 +69,7 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         if (is_optional) @panic("optional args not implemented");
         global.optarg = argv[@as(usize, @intCast(global.optind))];
         if (global.optind >= argc or global.optarg[0] == '-') {
-            std.debug.panic("TODO: handle missing arg for option '{}", .{arg[1]});
+            std.debug.panic("TODO: handle missing arg for option '{c}'", .{arg[1]});
         }
         global.optind += 1;
     }

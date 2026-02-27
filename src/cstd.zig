@@ -266,10 +266,10 @@ export fn strcmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
 
 export fn strncmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c) c_int {
     trace.log("strncmp {*} {*} n={}", .{ a, b, n });
+    if (n == 0) return 0;
     var i: usize = 0;
-    while (a[i] == b[i] and a[0] != 0) : (i += 1) {
-        if (i == n - 1) return 0;
-    }
+    while (i < n and a[i] == b[i] and a[i] != 0) : (i += 1) {}
+    if (i == n) return 0;
     return @as(c_int, @intCast(a[i])) -| @as(c_int, @intCast(b[i]));
 }
 
@@ -681,7 +681,7 @@ export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
 }
 
 export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
-    trace.log("remove {f} {f}", .{ trace.fmtStr(old), trace.fmtStr(new) });
+    trace.log("rename {f} {f}", .{ trace.fmtStr(old), trace.fmtStr(new) });
     @panic("rename not implemented");
 }
 
