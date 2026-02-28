@@ -5,6 +5,7 @@ const c = @cImport({
     // problem with LONG_MIN/LONG_MAX, they are currently assuming 64 bit
     //@cInclude("limits.h");
     @cInclude("errno.h");
+    @cInclude("stdarg.h");
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
     @cInclude("setjmp.h");
@@ -1045,12 +1046,44 @@ fn isFormatFlag(ch: u8) bool {
     return ch == '-' or ch == '+' or ch == ' ' or ch == '#' or ch == '0';
 }
 
-const VaListParam = if (@typeInfo(std.builtin.VaList) == .pointer)
+const VaListParam = if (builtin.os.tag == .windows)
+    c.va_list
+else if (@typeInfo(std.builtin.VaList) == .pointer)
     std.builtin.VaList
 else
     *std.builtin.VaList;
 
-fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) bool {
+const VaListCursor = if (builtin.os.tag == .windows)
+    *c.va_list
+else
+    *std.builtin.VaList;
+
+fn vaArgWindows(args: *c.va_list, comptime T: type) T {
+    if (comptime builtin.cpu.arch != .x86_64) {
+        return @cVaArg(args, T);
+    }
+    if (comptime @sizeOf(T) > 8) {
+        @compileError("Unsupported Win64 va_arg size");
+    }
+
+    const addr = @intFromPtr(args.*);
+    if (addr == 0) unreachable;
+
+    const src: [*]const u8 = @ptrFromInt(addr);
+    var value: T = undefined;
+    @memcpy(std.mem.asBytes(&value), src[0..@sizeOf(T)]);
+    args.* = @ptrFromInt(addr + 8);
+    return value;
+}
+
+inline fn vaArgCompat(args: VaListCursor, comptime T: type) T {
+    if (comptime builtin.os.tag == .windows) {
+        return vaArgWindows(args, T);
+    }
+    return @cVaArg(args, T);
+}
+
+fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args: VaListCursor) callconv(.c) bool {
     out_written.* = 0;
     const fmt_slice = std.mem.span(fmt);
     var i: usize = 0;
@@ -1080,7 +1113,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
             i += 1;
             if (i >= fmt_slice.len) return false;
             if (fmt_slice[i] == '*') {
-                precision = @cVaArg(args, c_int);
+                precision = vaArgCompat(args, c_int);
                 i += 1;
             } else if (fmt_slice[i] >= '0' and fmt_slice[i] <= '9') {
                 return false;
@@ -1105,7 +1138,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
         switch (fmt_slice[i]) {
             's' => {
                 if (spec_length != .none) return false;
-                const maybe_s = @cVaArg(args, ?[*:0]const u8);
+                const maybe_s = vaArgCompat(args, ?[*:0]const u8);
                 const s = maybe_s orelse "(null)";
                 const len = if (precision == precision_none or precision < 0)
                     std.mem.len(s)
@@ -1117,7 +1150,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
             },
             'c' => {
                 if (spec_length != .none or precision != precision_none) return false;
-                const value = @cVaArg(args, c_int);
+                const value = vaArgCompat(args, c_int);
                 const ch = [_]u8{@intCast(value & 0xff)};
                 const written = writer.write(&ch);
                 out_written.* += written;
@@ -1127,9 +1160,9 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 if (precision != precision_none) return false;
                 var buf: [100]u8 = undefined;
                 const len = switch (spec_length) {
-                    .none => formatIntCompat(&buf, @cVaArg(args, c_int), 10),
-                    .long => formatIntCompat(&buf, @cVaArg(args, c_long), 10),
-                    .long_long => formatIntCompat(&buf, @cVaArg(args, c_longlong), 10),
+                    .none => formatIntCompat(&buf, vaArgCompat(args, c_int), 10),
+                    .long => formatIntCompat(&buf, vaArgCompat(args, c_long), 10),
+                    .long_long => formatIntCompat(&buf, vaArgCompat(args, c_longlong), 10),
                 };
                 const written = writer.write(buf[0..len]);
                 out_written.* += written;
@@ -1140,9 +1173,9 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 const base: u8 = if (specifier == 'u') 10 else 16;
                 var buf: [100]u8 = undefined;
                 const len = switch (spec_length) {
-                    .none => formatIntCompat(&buf, @cVaArg(args, c_uint), base),
-                    .long => formatIntCompat(&buf, @cVaArg(args, c_ulong), base),
-                    .long_long => formatIntCompat(&buf, @cVaArg(args, c_ulonglong), base),
+                    .none => formatIntCompat(&buf, vaArgCompat(args, c_uint), base),
+                    .long => formatIntCompat(&buf, vaArgCompat(args, c_ulong), base),
+                    .long_long => formatIntCompat(&buf, vaArgCompat(args, c_ulonglong), base),
                 };
                 const written = writer.write(buf[0..len]);
                 out_written.* += written;
@@ -1166,7 +1199,10 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
 fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     var writer = FormatWriter{ .stream = stream };
     var written: usize = 0;
-    const ok = if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
+    const ok = if (comptime builtin.os.tag == .windows) blk: {
+        var va = arg;
+        break :blk vformat(&written, &writer, format, &va);
+    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
         var va = arg;
         break :blk vformat(&written, &writer, format, &va);
     } else vformat(&written, &writer, format, arg);
@@ -1188,7 +1224,10 @@ fn vsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: VaListParam) callco
         .len = n,
     } };
     var written: usize = 0;
-    const ok = if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
+    const ok = if (comptime builtin.os.tag == .windows) blk: {
+        var va = arg;
+        break :blk vformat(&written, &writer, format, &va);
+    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
         var va = arg;
         break :blk vformat(&written, &writer, format, &va);
     } else vformat(&written, &writer, format, arg);
@@ -1202,7 +1241,10 @@ fn vsprintf(s: [*]u8, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_in
         .buf = s,
     } };
     var written: usize = 0;
-    const ok = if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
+    const ok = if (comptime builtin.os.tag == .windows) blk: {
+        var va = arg;
+        break :blk vformat(&written, &writer, format, &va);
+    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
         var va = arg;
         break :blk vformat(&written, &writer, format, &va);
     } else vformat(&written, &writer, format, arg);
@@ -1320,7 +1362,7 @@ fn getNextScan(fmt: []const u8, index: *usize) Scan {
     } };
 }
 
-fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) c_int {
+fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: VaListCursor) callconv(.c) c_int {
     const fmt_slice = std.mem.span(fmt);
     var fmt_index: usize = 0;
     var scan_count: c_int = 0;
@@ -1351,7 +1393,7 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) ca
                     if (!isWhitespace(ch)) break;
                 }
 
-                const out = @cVaArg(args, [*]u8);
+                const out = vaArgCompat(args, [*]u8);
                 var total_read: usize = 0;
                 while (ch != 0) {
                     out[total_read] = ch;
@@ -1384,7 +1426,7 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) ca
                             ch = reader.read();
                         }
                         if (!read_at_least_one) return if (scan_count == 0) -1 else scan_count;
-                        const out = @cVaArg(args, *c_int);
+                        const out = vaArgCompat(args, *c_int);
                         out.* = value;
                     },
                     .long => {
@@ -1398,7 +1440,7 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) ca
                             ch = reader.read();
                         }
                         if (!read_at_least_one) return if (scan_count == 0) -1 else scan_count;
-                        const out = @cVaArg(args, *c_long);
+                        const out = vaArgCompat(args, *c_long);
                         out.* = value;
                     },
                 }
@@ -1410,7 +1452,10 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) ca
 
 fn vsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     var reader = FixedReader{ .buf = s };
-    if (comptime @typeInfo(std.builtin.VaList) == .pointer) {
+    if (comptime builtin.os.tag == .windows) {
+        var va = arg;
+        return vscan(&reader, fmt, &va);
+    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) {
         var va = arg;
         return vscan(&reader, fmt, &va);
     } else {
@@ -1419,13 +1464,11 @@ fn vsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: VaListParam) callconv(.c) 
 }
 
 comptime {
-    if (builtin.os.tag != .windows) {
-        @export(&vfprintf, .{ .name = "vfprintf" });
-        @export(&vprintf, .{ .name = "vprintf" });
-        @export(&vsnprintf, .{ .name = "vsnprintf" });
-        @export(&vsprintf, .{ .name = "vsprintf" });
-        @export(&vsscanf, .{ .name = "vsscanf" });
-    }
+    @export(&vfprintf, .{ .name = "vfprintf" });
+    @export(&vprintf, .{ .name = "vprintf" });
+    @export(&vsnprintf, .{ .name = "vsnprintf" });
+    @export(&vsprintf, .{ .name = "vsprintf" });
+    @export(&vsscanf, .{ .name = "vsscanf" });
 }
 
 // TODO: can ptr be NULL?
