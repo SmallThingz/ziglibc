@@ -58,13 +58,17 @@ export var optarg: [*c]u8 = null;
 export var opterr: c_int = 1;
 export var optind: c_int = 1;
 export var optopt: c_int = 0;
+var optchar_index: c_int = 1;
 
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
 export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
     optarg = null;
-    if (optind < 1) optind = 1;
+    if (optind < 1) {
+        optind = 1;
+        optchar_index = 1;
+    }
     trace.log("getopt argc={} argv={*} opstring={f} (err={}, ind={}, opt={})", .{
         argc,
         argv,
@@ -77,44 +81,77 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         trace.log("getopt return -1", .{});
         return -1;
     }
-    const arg = argv[@as(usize, @intCast(optind))];
-    if (arg[0] != '-' or arg[1] == 0) {
-        // Stop option parsing when we reach a non-option argument.
-        return -1;
+    var arg = argv[@as(usize, @intCast(optind))];
+    if (optchar_index <= 1) {
+        if (arg[0] != '-' or arg[1] == 0) {
+            // Stop option parsing when we reach a non-option argument.
+            return -1;
+        }
+        if (arg[1] == '-' and arg[2] == 0) {
+            // End-of-options marker.
+            optind += 1;
+            optchar_index = 1;
+            return -1;
+        }
+        optchar_index = 1;
     }
-    if (arg[1] == '-' and arg[2] == 0) {
-        // End-of-options marker.
+    const arg_idx: usize = @intCast(optchar_index);
+    if (arg[arg_idx] == 0) {
         optind += 1;
-        return -1;
+        optchar_index = 1;
+        return getopt(argc, argv, optstring);
     }
-    const result = c.strchr(optstring, arg[1]) orelse {
-        optind += 1;
-        optopt = @as(c_int, arg[1]);
+
+    const opt_ch = arg[arg_idx];
+    const result = c.strchr(optstring, opt_ch) orelse {
+        const next_idx = arg_idx + 1;
+        if (arg[next_idx] == 0) {
+            optind += 1;
+            optchar_index = 1;
+        } else {
+            optchar_index += 1;
+        }
+        optopt = @as(c_int, opt_ch);
         return '?';
     };
-    optind += 1;
-
-    if (arg[2] != 0) {
-        // Support compact required argument form: -ovalue
-        if (result[1] == ':') {
-            optarg = @ptrCast(arg + 2);
-            return @as(c_int, arg[1]);
-        }
-        @panic("multi-letter argument not implemented");
-    }
 
     const takes_arg = result[1] == ':';
     if (takes_arg) {
         const is_optional = result[2] == ':';
-        if (is_optional) @panic("optional args not implemented");
-        if (optind >= argc) {
-            optopt = @as(c_int, arg[1]);
+        const next_idx = arg_idx + 1;
+        if (arg[next_idx] != 0) {
+            optarg = @ptrCast(arg + next_idx);
+            optind += 1;
+            optchar_index = 1;
+            return @as(c_int, opt_ch);
+        }
+        if (is_optional) {
+            optarg = null;
+            optind += 1;
+            optchar_index = 1;
+            return @as(c_int, opt_ch);
+        }
+        if (optind + 1 >= argc) {
+            optopt = @as(c_int, opt_ch);
+            optind += 1;
+            optchar_index = 1;
             return if (optstring[0] == ':') ':' else '?';
         }
-        optarg = @ptrCast(argv[@as(usize, @intCast(optind))]);
         optind += 1;
+        arg = argv[@as(usize, @intCast(optind))];
+        optarg = @ptrCast(arg);
+        optind += 1;
+        optchar_index = 1;
+        return @as(c_int, opt_ch);
     }
-    return @as(c_int, arg[1]);
+
+    if (arg[arg_idx + 1] == 0) {
+        optind += 1;
+        optchar_index = 1;
+    } else {
+        optchar_index += 1;
+    }
+    return @as(c_int, opt_ch);
 }
 
 fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {

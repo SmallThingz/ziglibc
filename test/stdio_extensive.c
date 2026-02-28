@@ -34,6 +34,11 @@ int main(int argc, char *argv[])
 
   f = fopen(path, "r");
   expect(f != NULL);
+  expect('h' == fgetc(f));
+  expect('h' == ungetc('h', f));
+  expect('h' == fgetc(f));
+  expect(EOF == ungetc(EOF, f));
+  expect(0 == fseek(f, 0, SEEK_SET));
   {
     char buf[64];
     const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -45,6 +50,40 @@ int main(int argc, char *argv[])
 #endif
   }
   expect(0 == fclose(f));
+
+  {
+    FILE *plus = fopen("stdio-plus.txt", "w+");
+    char buf[8];
+    expect(plus != NULL);
+    expect(3 == fwrite("xyz", 1, 3, plus));
+    expect(0 == fseek(plus, 0, SEEK_SET));
+    expect(3 == fread(buf, 1, 3, plus));
+    buf[3] = 0;
+    expect(0 == strcmp("xyz", buf));
+    expect(plus == freopen("stdio-plus.txt", "r", plus));
+    expect('x' == fgetc(plus));
+    expect(0 == fclose(plus));
+  }
+
+  {
+    char tmp_name[L_tmpnam];
+    expect(tmpnam(tmp_name) == tmp_name);
+    expect(tmp_name[0] != 0);
+  }
+
+#ifndef _WIN32
+  {
+    FILE *tf = tmpfile();
+    char buf[4];
+    expect(tf != NULL);
+    expect(3 == fwrite("abc", 1, 3, tf));
+    expect(0 == fseek(tf, 0, SEEK_SET));
+    expect(3 == fread(buf, 1, 3, tf));
+    buf[3] = 0;
+    expect(0 == strcmp("abc", buf));
+    expect(0 == fclose(tf));
+  }
+#endif
 
   puts("Success!");
   return 0;

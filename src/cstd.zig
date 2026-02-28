@@ -620,11 +620,15 @@ const global = struct {
     //       the page index and file offset
     const max_file_count = 100;
     var files_reserved: [max_file_count]bool = [_]bool{ true, true, true } ++ ([_]bool{false} ** (max_file_count - 3));
+    var unread_valid: [max_file_count]bool = [_]bool{false} ** max_file_count;
+    var unread_char: [max_file_count]u8 = [_]u8{0} ** max_file_count;
     var files: [max_file_count]c.FILE = [_]c.FILE{
         .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDIN_FILENO, .eof = 0, .errno = 0 },
         .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDOUT_FILENO, .eof = 0, .errno = 0 },
         .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDERR_FILENO, .eof = 0, .errno = 0 },
     } ++ ([_]c.FILE{.{ .fd = if (builtin.os.tag == .windows) undefined else -1, .eof = 0, .errno = 0 }} ** (max_file_count - 3));
+    var tmpnam_counter: u32 = 0;
+    var tmpfile_counter: u32 = 0;
 
     fn reserveFile() *c.FILE {
         var i: usize = 0;
@@ -632,6 +636,7 @@ const global = struct {
             if (!@atomicRmw(bool, &files_reserved[i], .Xchg, true, .seq_cst)) {
                 files[i].eof = 0;
                 files[i].errno = 0;
+                unread_valid[i] = false;
                 return &files[i];
             }
         }
@@ -642,6 +647,7 @@ const global = struct {
         if (!@atomicRmw(bool, &files_reserved[i], .Xchg, false, .seq_cst)) {
             std.debug.panic("released FILE (i={} ptr={*}) that was not reserved", .{ i, file });
         }
+        unread_valid[i] = false;
     }
 
     // TODO: remove this.  Just using it to return error numbers as strings for now
@@ -691,6 +697,16 @@ const global = struct {
 export const stdin: *c.FILE = &global.files[0];
 export const stdout: *c.FILE = &global.files[1];
 export const stderr: *c.FILE = &global.files[2];
+
+fn fileSlot(stream: *c.FILE) ?usize {
+    const start = @intFromPtr(&global.files[0]);
+    const end = start + @sizeOf(c.FILE) * global.max_file_count;
+    const ptr = @intFromPtr(stream);
+    if (ptr < start or ptr >= end) return null;
+    const off = ptr - start;
+    if (off % @sizeOf(c.FILE) != 0) return null;
+    return off / @sizeOf(c.FILE);
+}
 
 // used by posix.zig
 export fn __zreserveFile() callconv(.c) ?*c.FILE {
@@ -757,8 +773,14 @@ export fn getchar() callconv(.c) c_int {
 }
 
 export fn getc(stream: *c.FILE) callconv(.c) c_int {
-    if (stream.eof != 0) @panic("getc, eof not 0 not implemented");
     trace.log("getc {*}", .{stream});
+    if (fileSlot(stream)) |slot| {
+        if (global.unread_valid[slot]) {
+            global.unread_valid[slot] = false;
+            return global.unread_char[slot];
+        }
+    }
+    if (stream.eof != 0) return c.EOF;
 
     if (builtin.os.tag == .windows) {
         var buf: [1]u8 = undefined;
@@ -789,28 +811,54 @@ export fn fgetc(stream: *c.FILE) callconv(.c) c_int {
 }
 
 export fn ungetc(char: c_int, stream: *c.FILE) callconv(.c) c_int {
-    if (stream.eof != 0) @panic("ungetc, eof not 0 not implemented");
-    _ = char;
-    @panic("ungetc not implemented");
+    if (char == c.EOF) return c.EOF;
+    const slot = fileSlot(stream) orelse {
+        errno = c.EINVAL;
+        stream.errno = errno;
+        return c.EOF;
+    };
+    if (global.unread_valid[slot]) {
+        errno = c.EINVAL;
+        stream.errno = errno;
+        return c.EOF;
+    }
+    global.unread_valid[slot] = true;
+    global.unread_char[slot] = @as(u8, @intCast(char & 0xff));
+    stream.eof = 0;
+    stream.errno = 0;
+    return char & 0xff;
 }
 
 export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usize {
     // TODO: should I check stream.eof here?
+    if (size == 0) return 0;
+    var prefilled: usize = 0;
+    if (fileSlot(stream)) |slot| {
+        if (global.unread_valid[slot]) {
+            ptr[0] = global.unread_char[slot];
+            global.unread_valid[slot] = false;
+            prefilled = 1;
+            if (size == 1) return 1;
+        }
+    }
+    const remaining = size - prefilled;
+    const dest = ptr + prefilled;
 
     if (builtin.os.tag == .windows) {
-        const actual_read_len = @as(u32, @intCast(@min(@as(u32, std.math.maxInt(u32)), size)));
+        const actual_read_len = @as(u32, @intCast(@min(@as(u32, std.math.maxInt(u32)), remaining)));
         while (true) {
             var amt_read: u32 = undefined;
             // TODO: is stream.fd.? right?
-            if (std.os.windows.kernel32.ReadFile(stream.fd.?, ptr, actual_read_len, &amt_read, null) == 0) {
+            if (std.os.windows.kernel32.ReadFile(stream.fd.?, dest, actual_read_len, &amt_read, null) == 0) {
                 switch (std.os.windows.kernel32.GetLastError()) {
                     .OPERATION_ABORTED => continue,
-                    .BROKEN_PIPE => return 0,
-                    .HANDLE_EOF => return 0,
+                    .BROKEN_PIPE => return prefilled,
+                    .HANDLE_EOF => return prefilled,
                     else => |err| std.debug.panic("ReadFile unexpected error {}", .{err}),
                 }
             }
-            return @as(usize, @intCast(amt_read));
+            if (amt_read == 0) stream.eof = 1;
+            return prefilled + @as(usize, @intCast(amt_read));
         }
     }
 
@@ -820,23 +868,29 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
         .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
         else => std.math.maxInt(isize),
     };
-    const adjusted_len = @min(max_count, size);
+    const adjusted_len = @min(max_count, remaining);
 
-    const rc = std.posix.system.read(stream.fd, ptr, adjusted_len);
+    const rc = std.posix.system.read(stream.fd, dest, adjusted_len);
     switch (std.posix.errno(rc)) {
         .SUCCESS => {
             if (rc == 0) stream.eof = 1;
-            return @as(usize, @intCast(rc));
+            return prefilled + @as(usize, @intCast(rc));
         },
         else => |e| {
             errno = @intFromEnum(e);
-            return 0;
+            return prefilled;
         },
     }
 }
 
 export fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
-    if (stream.eof != 0) @panic("fread, eof not 0 not implemented");
+    if (stream.eof != 0) {
+        if (fileSlot(stream)) |slot| {
+            if (!global.unread_valid[slot]) return 0;
+        } else {
+            return 0;
+        }
+    }
     const total = size * nmemb;
     const result = _fread_buf(ptr, total, stream);
     if (result == 0) return 0;
@@ -858,20 +912,59 @@ fn fopenImpl(
     comptime func_name: []const u8,
 ) ?*c.FILE {
     trace.log("{s} {f} mode={f}", .{ func_name, trace.fmtStr(filename), trace.fmtStr(mode) });
-    if (builtin.os.tag == .windows) {
-        var create_disposition: u32 = std.os.windows.OPEN_EXISTING;
-        var access: u32 = 0;
-        for (std.mem.span(mode)) |mode_char| {
-            if (mode_char == 'r') {
-                access |= std.os.windows.GENERIC_READ;
-            } else if (mode_char == 'w') {
-                access |= std.os.windows.GENERIC_WRITE;
-                create_disposition = std.os.windows.CREATE_ALWAYS;
-            } else if (mode_char == 'b') {
-                // not really sure what this is supposed to do yet, ignore it for now
-            } else {
-                std.debug.panic("unhandled open flag '{c}' (from {f})", .{ mode_char, trace.fmtStr(mode) });
+    const ModeKind = enum { read, write, append };
+    const ParsedMode = struct {
+        kind: ModeKind,
+        plus: bool = false,
+        excl: bool = false,
+    };
+    const parsed: ParsedMode = blk: {
+        const mode_slice = std.mem.span(mode);
+        if (mode_slice.len == 0) {
+            errno = c.EINVAL;
+            return null;
+        }
+        var p = ParsedMode{
+            .kind = switch (mode_slice[0]) {
+                'r' => .read,
+                'w' => .write,
+                'a' => .append,
+                else => {
+                    errno = c.EINVAL;
+                    return null;
+                },
+            },
+        };
+        for (mode_slice[1..]) |mode_char| {
+            switch (mode_char) {
+                'b', 't', 'e' => {},
+                '+' => p.plus = true,
+                'x' => p.excl = true,
+                else => {
+                    errno = c.EINVAL;
+                    return null;
+                },
             }
+        }
+        if (p.excl and p.kind == .read) {
+            errno = c.EINVAL;
+            return null;
+        }
+        break :blk p;
+    };
+
+    if (builtin.os.tag == .windows) {
+        const create_disposition: u32 = switch (parsed.kind) {
+            .read => std.os.windows.OPEN_EXISTING,
+            .write => if (parsed.excl) std.os.windows.CREATE_NEW else std.os.windows.CREATE_ALWAYS,
+            .append => if (parsed.excl) std.os.windows.CREATE_NEW else std.os.windows.OPEN_ALWAYS,
+        };
+        var access: u32 = 0;
+        if (parsed.plus or parsed.kind == .read) {
+            access |= std.os.windows.GENERIC_READ;
+        }
+        if (parsed.plus or parsed.kind != .read) {
+            access |= std.os.windows.GENERIC_WRITE;
         }
         const fd = windows.CreateFileA(
             filename,
@@ -889,6 +982,13 @@ fn fopenImpl(
             errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
             return null;
         }
+        if (parsed.kind == .append) {
+            std.os.windows.SetFilePointerEx_END(fd.?, 0) catch {
+                _ = windows.CloseHandle(fd.?);
+                errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
+                return null;
+            };
+        }
         const file = global.reserveFile();
         file.fd = fd;
         file.eof = 0;
@@ -896,19 +996,14 @@ fn fopenImpl(
     }
 
     var flags = std.posix.O{};
-    for (std.mem.span(mode)) |mode_char| {
-        if (mode_char == 'r') {
-            flags.ACCMODE = .RDONLY;
-        } else if (mode_char == 'w') {
-            flags.ACCMODE = .WRONLY;
-            flags.CREAT = true;
-            flags.TRUNC = true;
-        } else if (mode_char == 'b') {
-            // not really sure what this is supposed to do yet, ignore it for now
-        } else {
-            std.debug.panic("unhandled open flag '{c}' (from {f})", .{ mode_char, trace.fmtStr(mode) });
-        }
-    }
+    flags.ACCMODE = switch (parsed.kind) {
+        .read => if (parsed.plus) .RDWR else .RDONLY,
+        .write, .append => if (parsed.plus) .RDWR else .WRONLY,
+    };
+    flags.CREAT = parsed.kind != .read;
+    flags.TRUNC = parsed.kind == .write;
+    flags.APPEND = parsed.kind == .append;
+    flags.EXCL = parsed.excl;
     if (force_largefile and @hasField(@TypeOf(flags), "LARGEFILE")) {
         flags.LARGEFILE = true;
     }
@@ -935,11 +1030,20 @@ pub export fn fopen64(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c)
     return fopenImpl(filename, mode, true, "fopen64");
 }
 
-export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE) callconv(.c) *c.FILE {
-    _ = filename;
-    _ = mode;
-    _ = stream;
-    @panic("freopen not implemented");
+export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE) callconv(.c) ?*c.FILE {
+    const new_stream = fopenImpl(filename, mode, false, "freopen") orelse return null;
+    if (builtin.os.tag == .windows) {
+        _ = windows.CloseHandle(stream.fd.?);
+    } else {
+        _ = std.posix.system.close(stream.fd);
+    }
+    stream.fd = new_stream.fd;
+    stream.eof = 0;
+    stream.errno = 0;
+    if (fileSlot(stream)) |slot| global.unread_valid[slot] = false;
+    if (fileSlot(new_stream)) |slot| global.unread_valid[slot] = false;
+    if (new_stream != stream) global.releaseFile(new_stream);
+    return stream;
 }
 
 export fn fclose(stream: *c.FILE) callconv(.c) c_int {
@@ -987,6 +1091,7 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
     };
     stream.eof = 0;
     stream.errno = 0;
+    if (fileSlot(stream)) |slot| global.unread_valid[slot] = false;
     return 0;
 }
 
@@ -1026,22 +1131,10 @@ comptime {
 
 export fn fputc(character: c_int, stream: *c.FILE) callconv(.c) c_int {
     trace.log("fputc {} stream={*}", .{ character, stream });
-    if (builtin.os.tag == .windows) {
-        @panic("fputc not implemented");
-    }
     const buf = [_]u8{@as(u8, @intCast(0xff & character))};
-    const written = std.posix.system.write(stream.fd, &buf, 1);
-    switch (std.posix.errno(written)) {
-        .SUCCESS => {
-            if (written == 1) return character;
-            stream.errno = @intFromEnum(std.posix.E.IO);
-            return c.EOF;
-        },
-        else => |e| {
-            stream.errno = @intFromEnum(e);
-            return c.EOF;
-        },
-    }
+    if (_fwrite_buf(&buf, 1, stream) == 1) return character;
+    if (stream.errno == 0) stream.errno = errnoConst("EIO", c.EINVAL);
+    return c.EOF;
 }
 
 // NOTE: this is not apart of libc
@@ -1613,13 +1706,53 @@ export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
     }
 }
 
-export fn tmpfile() callconv(.c) *c.FILE {
-    @panic("tmpfile not implemented");
+export fn tmpfile() callconv(.c) ?*c.FILE {
+    if (builtin.os.tag == .windows) {
+        errno = c.ENOSYS;
+        return null;
+    }
+    var attempt: usize = 0;
+    while (attempt < 1024) : (attempt += 1) {
+        const id = @atomicRmw(u32, &global.tmpfile_counter, .Add, 1, .seq_cst);
+        var name_buf: [32:0]u8 = undefined;
+        const name = std.fmt.bufPrint(name_buf[0 .. name_buf.len - 1], "tmpfile-{x:0>8}", .{id}) catch unreachable;
+        name_buf[name.len] = 0;
+
+        var flags = std.posix.O{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .EXCL = true,
+        };
+        if (@hasField(@TypeOf(flags), "LARGEFILE")) flags.LARGEFILE = true;
+
+        const fd = std.posix.system.open(&name_buf, @bitCast(flags), @as(std.posix.mode_t, 0o600));
+        switch (std.posix.errno(fd)) {
+            .SUCCESS => {
+                _ = std.posix.system.unlink(&name_buf);
+                const file = global.reserveFile();
+                file.fd = @as(c_int, @intCast(fd));
+                file.eof = 0;
+                file.errno = 0;
+                return file;
+            },
+            .EXIST => continue,
+            else => |e| {
+                errno = @intFromEnum(e);
+                return null;
+            },
+        }
+    }
+    errno = c.EEXIST;
+    return null;
 }
 
 export fn tmpnam(s: [*]u8) callconv(.c) [*]u8 {
-    _ = s;
-    @panic("tmpnam not implemented");
+    const id = @atomicRmw(u32, &global.tmpnam_counter, .Add, 1, .seq_cst);
+    var tmp: [c.L_tmpnam]u8 = [_]u8{0} ** c.L_tmpnam;
+    const name = std.fmt.bufPrint(tmp[0 .. tmp.len - 1], "zltmp{x:0>8}", .{id}) catch unreachable;
+    @memcpy(s[0..name.len], name);
+    s[name.len] = 0;
+    return s;
 }
 
 export fn clearerr(stream: *c.FILE) callconv(.c) void {

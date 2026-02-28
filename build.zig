@@ -196,6 +196,18 @@ pub fn build(b: *std.Build) void {
             run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='hello'\n" });
             test_step.dependOn(&run.step);
         }
+        {
+            const run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "-ac", "hello" });
+            run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
+            test_step.dependOn(&run.step);
+        }
+        {
+            const run = b.addRunArtifact(exe);
+            run.addArg("-achello");
+            run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
+            test_step.dependOn(&run.step);
+        }
     }
 
     if (supportsSetjmp(target.result)) {
