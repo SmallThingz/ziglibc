@@ -24,6 +24,14 @@ extern "c" fn syscall(number: c_long, ...) c_long;
 
 const trace = @import("trace.zig");
 
+fn exportInternalSymbol(comptime f: anytype, comptime name: []const u8) void {
+    if (builtin.target.ofmt == .coff) {
+        @export(f, .{ .name = name });
+    } else {
+        @export(f, .{ .name = name, .visibility = .hidden });
+    }
+}
+
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const mach_port_t = c_uint;
     const kern_return_t = c_int;
@@ -169,8 +177,12 @@ export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
     return zreadRaw(fd, buf, len);
 }
 
-export fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
+fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
     return zopenRaw(path, oflag, mode);
+}
+
+comptime {
+    exportInternalSymbol(&_zopen, "_zopen");
 }
 
 // --------------------------------------------------------------------------------
@@ -549,7 +561,7 @@ export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
 // --------------------------------------------------------------------------------
 // sys/ioctl
 // --------------------------------------------------------------------------------
-export fn _ioctlArgPtr(fd: c_int, request: c_ulong, arg_ptr: *anyopaque) c_int {
+fn _ioctlArgPtr(fd: c_int, request: c_ulong, arg_ptr: *anyopaque) callconv(.c) c_int {
     trace.log("ioctl fd={} request=0x{x} arg={*}", .{ fd, request, arg_ptr });
     const rc = std.os.linux.ioctl(fd, @as(u32, @intCast(request)), @intFromPtr(arg_ptr));
     switch (os.errno(rc)) {
@@ -559,6 +571,10 @@ export fn _ioctlArgPtr(fd: c_int, request: c_ulong, arg_ptr: *anyopaque) c_int {
             return -1;
         },
     }
+}
+
+comptime {
+    exportInternalSymbol(&_ioctlArgPtr, "_ioctlArgPtr");
 }
 
 // --------------------------------------------------------------------------------

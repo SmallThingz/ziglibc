@@ -2,12 +2,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-extern int _zvsscanf(const char *s, const char *fmt, va_list args);
-
-int vsscanf(const char *s, const char *fmt, va_list args)
-{
-  return _zvsscanf(s, fmt, args);
-}
+int vsscanf(const char * restrict s, const char * restrict fmt, va_list args);
 
 int sscanf(const char *s, const char *fmt, ...)
 {

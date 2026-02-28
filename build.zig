@@ -183,8 +183,7 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // this test only works on linux right now
-    if (target.result.os.tag == .linux) {
+    if (supportsSetjmp(target.result)) {
         const exe = addTest("jmp", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = b.addRunArtifact(exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
@@ -249,6 +248,13 @@ fn supportsPosixConformance(os_tag: std.Target.Os.Tag) bool {
     return switch (std.Target.DynamicLinker.kind(os_tag)) {
         .none => false,
         .arch_os, .arch_os_abi => true,
+    };
+}
+
+fn supportsSetjmp(target: std.Target) bool {
+    return switch (target.cpu.arch) {
+        .x86_64, .aarch64 => true,
+        else => false,
     };
 }
 

@@ -1158,7 +1158,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
     return true;
 }
 
-export fn _zvfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+export fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
     var writer = FormatWriter{ .stream = stream };
     var written: usize = 0;
     if (vformat(&written, &writer, format, arg)) {
@@ -1169,11 +1169,11 @@ export fn _zvfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *std.builtin.V
     }
 }
 
-export fn _zvprintf(format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
-    return _zvfprintf(stdout, format, arg);
+export fn vprintf(format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+    return vfprintf(stdout, format, arg);
 }
 
-export fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+export fn vsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
     var writer = FormatWriter{ .bounded = .{
         .buf = s,
         .len = n,
@@ -1184,7 +1184,7 @@ export fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *std.built
     return @intCast(written);
 }
 
-export fn _zvsprintf(s: [*]u8, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+export fn vsprintf(s: [*]u8, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
     var writer = FormatWriter{ .unbounded = .{
         .buf = s,
     } };
@@ -1391,7 +1391,7 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) ca
     }
 }
 
-export fn _zvsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+export fn vsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
     var reader = FixedReader{ .buf = s };
     return vscan(&reader, fmt, arg);
 }
@@ -2042,19 +2042,153 @@ export fn __zassert_fail(
 // --------------------------------------------------------------------------------
 // setjmp
 // --------------------------------------------------------------------------------
-fn setjmp(env: c.jmp_buf) callconv(.c) c_int {
+const has_x86_64_setjmp_asm = builtin.cpu.arch == .x86_64;
+const has_aarch64_setjmp_asm = builtin.cpu.arch == .aarch64;
+
+fn setjmp_x86_64() callconv(.naked) c_int {
+    if (builtin.os.tag == .windows) {
+        asm volatile (
+            // Win64: env in rcx
+            \\movq %%rbx,(%%rcx)
+            \\movq %%rbp,8(%%rcx)
+            \\movq %%r12,16(%%rcx)
+            \\movq %%r13,24(%%rcx)
+            \\movq %%r14,32(%%rcx)
+            \\movq %%r15,40(%%rcx)
+            \\movq %%rdi,48(%%rcx)
+            \\movq %%rsi,56(%%rcx)
+            \\leaq 8(%%rsp),%%rdx
+            \\movq %%rdx,64(%%rcx)
+            \\movq (%%rsp),%%rdx
+            \\movq %%rdx,72(%%rcx)
+            \\xorl %%eax,%%eax
+            \\ret
+        );
+    } else {
+        asm volatile (
+            // SysV: env in rdi
+            \\movq %%rbx,(%%rdi)
+            \\movq %%rbp,8(%%rdi)
+            \\movq %%r12,16(%%rdi)
+            \\movq %%r13,24(%%rdi)
+            \\movq %%r14,32(%%rdi)
+            \\movq %%r15,40(%%rdi)
+            \\leaq 8(%%rsp),%%rdx
+            \\movq %%rdx,48(%%rdi)
+            \\movq (%%rsp),%%rdx
+            \\movq %%rdx,56(%%rdi)
+            \\xorl %%eax,%%eax
+            \\ret
+        );
+    }
+}
+
+fn longjmp_x86_64() callconv(.naked) noreturn {
+    if (builtin.os.tag == .windows) {
+        asm volatile (
+            // Win64: env in rcx, val in edx
+            \\xorl %%eax,%%eax
+            \\cmpl $1,%%edx
+            \\adcl %%edx,%%eax
+            \\movq (%%rcx),%%rbx
+            \\movq 8(%%rcx),%%rbp
+            \\movq 16(%%rcx),%%r12
+            \\movq 24(%%rcx),%%r13
+            \\movq 32(%%rcx),%%r14
+            \\movq 40(%%rcx),%%r15
+            \\movq 48(%%rcx),%%rdi
+            \\movq 56(%%rcx),%%rsi
+            \\movq 64(%%rcx),%%rsp
+            \\jmpq *72(%%rcx)
+        );
+    } else {
+        asm volatile (
+            // SysV: env in rdi, val in esi
+            \\xorl %%eax,%%eax
+            \\cmpl $1,%%esi
+            \\adcl %%esi,%%eax
+            \\movq (%%rdi),%%rbx
+            \\movq 8(%%rdi),%%rbp
+            \\movq 16(%%rdi),%%r12
+            \\movq 24(%%rdi),%%r13
+            \\movq 32(%%rdi),%%r14
+            \\movq 40(%%rdi),%%r15
+            \\movq 48(%%rdi),%%rsp
+            \\jmpq *56(%%rdi)
+        );
+    }
+}
+
+fn setjmp_aarch64() callconv(.naked) c_int {
+    asm volatile (
+        \\stp x19, x20, [x0, #0]
+        \\stp x21, x22, [x0, #16]
+        \\stp x23, x24, [x0, #32]
+        \\stp x25, x26, [x0, #48]
+        \\stp x27, x28, [x0, #64]
+        \\stp x29, x30, [x0, #80]
+        \\mov x2, sp
+        \\str x2, [x0, #96]
+        \\stp d8, d9, [x0, #104]
+        \\stp d10, d11, [x0, #120]
+        \\stp d12, d13, [x0, #136]
+        \\stp d14, d15, [x0, #152]
+        \\mov w0, wzr
+        \\ret
+    );
+}
+
+fn longjmp_aarch64() callconv(.naked) noreturn {
+    asm volatile (
+        \\ldp x19, x20, [x0, #0]
+        \\ldp x21, x22, [x0, #16]
+        \\ldp x23, x24, [x0, #32]
+        \\ldp x25, x26, [x0, #48]
+        \\ldp x27, x28, [x0, #64]
+        \\ldp x29, x30, [x0, #80]
+        \\ldr x2, [x0, #96]
+        \\ldp d8, d9, [x0, #104]
+        \\ldp d10, d11, [x0, #120]
+        \\ldp d12, d13, [x0, #136]
+        \\ldp d14, d15, [x0, #152]
+        \\mov sp, x2
+        \\mov w0, w1
+        \\cmp w0, #0
+        \\cinc w0, w0, eq
+        \\ret
+    );
+}
+
+fn setjmp_fallback(env: c.jmp_buf) callconv(.c) c_int {
     _ = env;
     @panic("setjmp not implemented on this platform yet");
 }
-fn longjmp(env: c.jmp_buf, val: c_int) callconv(.c) noreturn {
+fn longjmp_fallback(env: c.jmp_buf, val: c_int) callconv(.c) noreturn {
     _ = env;
     _ = val;
     @panic("longjmp not implemented on this platform yet");
 }
 comptime {
-    // temporary to get windows to link for now
-    if (builtin.os.tag == .windows) {
-        @export(&setjmp, .{ .name = "setjmp" });
-        @export(&longjmp, .{ .name = "longjmp" });
+    if (has_x86_64_setjmp_asm) {
+        @export(&setjmp_x86_64, .{ .name = "setjmp" });
+        @export(&setjmp_x86_64, .{ .name = "_setjmp" });
+        @export(&setjmp_x86_64, .{ .name = "__setjmp" });
+
+        @export(&longjmp_x86_64, .{ .name = "longjmp" });
+        @export(&longjmp_x86_64, .{ .name = "_longjmp" });
+    } else if (has_aarch64_setjmp_asm) {
+        @export(&setjmp_aarch64, .{ .name = "setjmp" });
+        @export(&setjmp_aarch64, .{ .name = "_setjmp" });
+        @export(&setjmp_aarch64, .{ .name = "__setjmp" });
+
+        @export(&longjmp_aarch64, .{ .name = "longjmp" });
+        @export(&longjmp_aarch64, .{ .name = "_longjmp" });
+    } else {
+        @export(&setjmp_fallback, .{ .name = "setjmp" });
+        @export(&setjmp_fallback, .{ .name = "_setjmp" });
+        @export(&setjmp_fallback, .{ .name = "__setjmp" });
+
+        @export(&longjmp_fallback, .{ .name = "longjmp" });
+        @export(&longjmp_fallback, .{ .name = "_longjmp" });
     }
 }

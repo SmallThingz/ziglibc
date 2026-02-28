@@ -3,31 +3,6 @@
 #include <stddef.h>
 #include <stdio.h>
 
-extern int _zvfprintf(FILE *stream, const char *format, va_list args);
-extern int _zvprintf(const char *format, va_list args);
-extern int _zvsnprintf(char *s, size_t n, const char *format, va_list args);
-extern int _zvsprintf(char *s, const char *format, va_list args);
-
-int vfprintf(FILE *stream, const char *format, va_list args)
-{
-  return _zvfprintf(stream, format, args);
-}
-
-int vprintf(const char *format, va_list args)
-{
-  return _zvprintf(format, args);
-}
-
-int vsnprintf(char * restrict s, size_t n, const char * restrict format, va_list args)
-{
-  return _zvsnprintf(s, n, format, args);
-}
-
-int vsprintf(char * restrict s, const char * restrict format, va_list args)
-{
-  return _zvsprintf(s, format, args);
-}
-
 int fprintf(FILE *stream, const char *format, ...)
 {
   va_list args;

@@ -1,14 +1,18 @@
-// NOTE: contains the implementations of functions for libposix
-//       that require varargs
-#include <stdlib.h>
+// NOTE: contains the implementations of functions for libposix that require varargs
 #include <stdio.h>
 #include <stdarg.h>
 #include <fcntl.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LIBCGUANA_INTERNAL __attribute__((visibility("hidden")))
+#else
+#define LIBCGUANA_INTERNAL
+#endif
+
 // --------------------------------------------------------------------------------
 // fcntl
 // --------------------------------------------------------------------------------
-int _zopen(const char *path, int oflag, unsigned mode);
+LIBCGUANA_INTERNAL int _zopen(const char *path, int oflag, unsigned mode);
 
 int open(const char *path, int oflag, ...)
 {
@@ -25,7 +29,7 @@ int open(const char *path, int oflag, ...)
 // --------------------------------------------------------------------------------
 // sys/ioctl
 // --------------------------------------------------------------------------------
-int _ioctlArgPtr(int fd, unsigned long request, void *arg);
+LIBCGUANA_INTERNAL int _ioctlArgPtr(int fd, unsigned long request, void *arg);
 
 int ioctl(int fd, unsigned long request, ...)
 {
