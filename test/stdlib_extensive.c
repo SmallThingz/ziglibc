@@ -37,9 +37,36 @@ int main(int argc, char *argv[])
     free(p);
   }
 
+  {
+    const char *path = getenv("PATH");
+    const char *home = getenv("HOME");
+    const char *pwd = getenv("PWD");
+    expect(NULL == getenv(""));
+    expect(NULL == getenv("A=B"));
+    expect(NULL == getenv("__ZIGLIBC_MISSING_VAR__"));
+#ifdef __linux__
+    expect(path != NULL || home != NULL || pwd != NULL);
+#else
+    (void)path;
+    (void)home;
+    (void)pwd;
+#endif
+  }
+
+#ifndef _WIN32
+  {
+    int status = system(NULL);
+    expect(status != 0);
+    status = system("exit 7");
+    expect(status != -1);
+    expect((status & 0x7f) == 0);
+    expect(7 == ((status >> 8) & 0xff));
+  }
+#else
   errno = 0;
   expect(-1 == system(NULL));
   expect(ENOSYS == errno);
+#endif
 
   puts("Success!");
   return 0;

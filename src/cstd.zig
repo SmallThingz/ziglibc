@@ -121,16 +121,86 @@ export fn abort() callconv(.c) noreturn {
 // TODO: should we detect and do something different if there is a '=' in name?
 export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     trace.log("getenv {f}", .{trace.fmtStr(name)});
-    return null; // not implemented
-    //const name_len = std.mem.len(name);
-    //var e: ?[*:0]u8 = environ;
+    const key = std.mem.span(name);
+    if (key.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, key, '=') != null) return null;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+
+    if (builtin.os.tag == .linux) {
+        var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return null;
+        defer file.close();
+        var src: [32768]u8 = undefined;
+        const src_len = file.readAll(&src) catch return null;
+
+        var i: usize = 0;
+        while (i < src_len) {
+            const begin = i;
+            while (i < src_len and src[i] != 0) : (i += 1) {}
+            const line = src[begin..i];
+            if (line.len > key.len and line[key.len] == '=' and std.mem.eql(u8, line[0..key.len], key)) {
+                const value = line[key.len + 1 ..];
+                const copy_len = @min(value.len, global.getenv_tmp.len - 1);
+                @memcpy(global.getenv_tmp[0..copy_len], value[0..copy_len]);
+                global.getenv_tmp[copy_len] = 0;
+                return @as([*:0]u8, @ptrCast(&global.getenv_tmp));
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    return null;
 }
 
 export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
     trace.log("system {f}", .{trace.fmtStr(string)});
-    trace.log("system returning -1 to indicate it is not supported yet", .{});
-    errno = c.ENOSYS;
-    return -1; // system not implemented yet
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        errno = c.ENOSYS;
+        return -1;
+    }
+    if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) {
+        errno = c.ENOSYS;
+        return -1;
+    }
+
+    if (string == null) {
+        const rc = std.posix.system.access("/bin/sh", std.posix.X_OK);
+        return if (std.posix.errno(rc) == .SUCCESS) 1 else 0;
+    }
+
+    const fork_rc = std.posix.system.fork();
+    switch (std.posix.errno(fork_rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            errno = @intFromEnum(e);
+            return -1;
+        },
+    }
+
+    if (fork_rc == 0) {
+        const shell_path: [*:0]const u8 = "/bin/sh";
+        const command = string.?;
+        var argv = [_:null]?[*:0]const u8{ shell_path, "-c", command, null };
+        const envp = [_:null]?[*:0]const u8{null};
+        _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&envp));
+        std.posix.system.exit(127);
+    }
+
+    var status: if (builtin.os.tag.isDarwin()) c_int else u32 = 0;
+    while (true) {
+        const wait_rc = std.posix.system.waitpid(@as(std.posix.pid_t, @intCast(fork_rc)), &status, 0);
+        switch (std.posix.errno(wait_rc)) {
+            .SUCCESS => {
+                if (builtin.os.tag.isDarwin()) return status;
+                return @as(c_int, @bitCast(status));
+            },
+            .INTR => continue,
+            else => |e| {
+                errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
 }
 
 /// alloc_align is the maximum alignment needed for all types
@@ -733,6 +803,7 @@ const global = struct {
 
     // TODO: remove this.  Just using it to return error numbers as strings for now
     var tmp_strerror_buffer: [30]u8 = undefined;
+    var getenv_tmp: [4096:0]u8 = [_:0]u8{0} ** 4096;
     var current_locale = [_:0]u8{'C'};
     var gmtime_tm: c.tm = std.mem.zeroes(c.tm);
     var localtime_tm: c.tm = std.mem.zeroes(c.tm);

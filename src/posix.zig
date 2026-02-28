@@ -70,6 +70,64 @@ export var optind: c_int = 1;
 export var optopt: c_int = 0;
 var optchar_index: c_int = 1;
 
+const PopenPid = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) usize else os.pid_t;
+
+const PopenEntry = struct {
+    stream: ?*c.FILE = null,
+    pid: PopenPid = 0,
+};
+
+var popen_entries: [c.FOPEN_MAX]PopenEntry = [_]PopenEntry{.{}} ** c.FOPEN_MAX;
+var popen_mutex: std.Thread.Mutex = .{};
+
+fn registerPopenStream(stream: *c.FILE, pid: PopenPid) bool {
+    popen_mutex.lock();
+    defer popen_mutex.unlock();
+    for (&popen_entries) |*entry| {
+        if (entry.stream == null) {
+            entry.stream = stream;
+            entry.pid = pid;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn unregisterPopenStream(stream: *c.FILE) ?PopenPid {
+    popen_mutex.lock();
+    defer popen_mutex.unlock();
+    for (&popen_entries) |*entry| {
+        if (entry.stream == stream) {
+            const pid = entry.pid;
+            entry.* = .{};
+            return pid;
+        }
+    }
+    return null;
+}
+
+fn waitForPidStatus(pid: PopenPid) c_int {
+    if (comptime (builtin.os.tag == .windows or builtin.os.tag == .wasi)) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+    var status: if (builtin.os.tag.isDarwin()) c_int else u32 = 0;
+    while (true) {
+        const wait_rc = os.system.waitpid(pid, &status, 0);
+        switch (os.errno(wait_rc)) {
+            .SUCCESS => {
+                if (builtin.os.tag.isDarwin()) return status;
+                return @as(c_int, @bitCast(status));
+            },
+            .INTR => continue,
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+}
+
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
@@ -371,13 +429,97 @@ export fn fileno(stream: *c.FILE) callconv(.c) c_int {
 
 export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
     trace.log("popen '{f}' mode='{s}'", .{ trace.fmtStr(command), mode });
-    c.errno = errnoConst("ENOSYS", c.EINVAL);
-    return null;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return null;
+    }
+    if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return null;
+    }
+
+    const mode_ch = mode[0];
+    if (mode_ch != 'r' and mode_ch != 'w') {
+        c.errno = c.EINVAL;
+        return null;
+    }
+
+    var pipe_fds: [2]os.fd_t = undefined;
+    const pipe_rc = os.system.pipe(&pipe_fds);
+    switch (os.errno(pipe_rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return null;
+        },
+    }
+
+    const fork_rc = os.system.fork();
+    switch (os.errno(fork_rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            _ = os.system.close(pipe_fds[0]);
+            _ = os.system.close(pipe_fds[1]);
+            c.errno = @intFromEnum(e);
+            return null;
+        },
+    }
+
+    if (fork_rc == 0) {
+        if (mode_ch == 'r') {
+            _ = os.system.close(pipe_fds[0]);
+            if (os.system.dup2(pipe_fds[1], c.STDOUT_FILENO) == -1) {
+                os.system.exit(127);
+            }
+            _ = os.system.close(pipe_fds[1]);
+        } else {
+            _ = os.system.close(pipe_fds[1]);
+            if (os.system.dup2(pipe_fds[0], c.STDIN_FILENO) == -1) {
+                os.system.exit(127);
+            }
+            _ = os.system.close(pipe_fds[0]);
+        }
+
+        const shell_path: [*:0]const u8 = "/bin/sh";
+        var argv = [_:null]?[*:0]const u8{ shell_path, "-c", command, null };
+        const envp = [_:null]?[*:0]const u8{null};
+        _ = os.system.execve(shell_path, &argv, @ptrCast(&envp));
+        os.system.exit(127);
+    }
+
+    const parent_fd = if (mode_ch == 'r') pipe_fds[0] else pipe_fds[1];
+    if (mode_ch == 'r') {
+        _ = os.system.close(pipe_fds[1]);
+    } else {
+        _ = os.system.close(pipe_fds[0]);
+    }
+
+    const stream = fdopen(@as(c_int, @intCast(parent_fd)), mode) orelse {
+        const saved_errno = c.errno;
+        _ = os.system.close(parent_fd);
+        _ = waitForPidStatus(@as(PopenPid, @intCast(fork_rc)));
+        c.errno = saved_errno;
+        return null;
+    };
+
+    if (!registerPopenStream(stream, @as(PopenPid, @intCast(fork_rc)))) {
+        c.errno = errnoConst("EMFILE", c.ENOMEM);
+        _ = c.fclose(stream);
+        _ = waitForPidStatus(@as(PopenPid, @intCast(fork_rc)));
+        return null;
+    }
+    return stream;
 }
 export fn pclose(stream: *c.FILE) callconv(.c) c_int {
-    _ = stream;
-    c.errno = errnoConst("ENOSYS", c.EINVAL);
-    return -1;
+    const pid = unregisterPopenStream(stream) orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    };
+    const close_rc = c.fclose(stream);
+    const wait_rc = waitForPidStatus(pid);
+    if (wait_rc == -1) return -1;
+    if (close_rc != 0) return -1;
+    return wait_rc;
 }
 
 export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.c) ?*c.FILE {

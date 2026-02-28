@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -53,6 +54,28 @@ int main(int argc, char *argv[])
     expect(0 == chmod(name, 0600));
     expect(0 == close(fd));
     expect(0 == unlink(name));
+  }
+
+  {
+    FILE *p = popen("printf popen-ok", "r");
+    char buf[64];
+    expect(p != NULL);
+    expect(NULL != fgets(buf, sizeof(buf), p));
+    expect(0 == strcmp(buf, "popen-ok"));
+    expect(0 == pclose(p));
+  }
+
+  {
+    FILE *p = popen("cat > /dev/null", "w");
+    expect(p != NULL);
+    expect(fputs("payload\n", p) >= 0);
+    expect(0 == pclose(p));
+  }
+
+  {
+    errno = 0;
+    expect(NULL == popen("echo invalid", "x"));
+    expect(EINVAL == errno);
   }
 #endif
 

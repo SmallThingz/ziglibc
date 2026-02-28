@@ -92,6 +92,7 @@ void perror(const char *s);
     #define STDOUT_FILENO 1
     #define STDERR_FILENO 2
     FILE *popen(const char *command, const char *mode);
+    int pclose(FILE *stream);
     FILE *fdopen(int filedes, const char *mode);
     int fileno(FILE *stream);
 #endif
