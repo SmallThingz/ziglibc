@@ -24,6 +24,11 @@ extern "c" fn syscall(number: c_long, ...) c_long;
 
 const trace = @import("trace.zig");
 
+fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
+    if (@hasDecl(c, name)) return @field(c, name);
+    return fallback;
+}
+
 fn exportInternalSymbol(comptime f: anytype, comptime name: []const u8) void {
     if (builtin.target.ofmt == .coff) {
         @export(f, .{ .name = name });
@@ -278,7 +283,7 @@ export fn fileno(stream: *c.FILE) callconv(.c) c_int {
         // this probably isn't right, but might be fine for an initial implementation
         return @as(c_int, @intCast(@intFromPtr(stream.fd)));
     }
-    @panic("fileno not implemented");
+    return stream.fd;
 }
 
 export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) *c.FILE {
@@ -322,20 +327,47 @@ fn close(fd: c_int) callconv(.c) c_int {
 
 export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
     trace.log("access '{f}' mode=0x{x}", .{ trace.fmtStr(path), amode });
-    @panic("acces not implemented");
+    const mode: u32 = @intCast(amode);
+    std.posix.accessZ(path, mode) catch |err| {
+        c.errno = switch (err) {
+            error.AccessDenied => c.EACCES,
+            error.PermissionDenied => c.EPERM,
+            error.FileNotFound => c.ENOENT,
+            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+            error.InputOutput => errnoConst("EIO", c.EINVAL),
+            error.SystemResources => c.ENOMEM,
+            error.BadPathName, error.InvalidUtf8, error.InvalidWtf8 => c.EINVAL,
+            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        return -1;
+    };
+    return 0;
 }
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
-    if (builtin.os.tag == .windows)
-        @panic("windows unlink not implemented");
-
-    switch (os.errno(os.system.unlink(path))) {
-        .SUCCESS => return 0,
-        else => |e| {
-            c.errno = @intFromEnum(e);
-            return -1;
-        },
-    }
+    std.posix.unlinkZ(path) catch |err| {
+        c.errno = switch (err) {
+            error.AccessDenied => c.EACCES,
+            error.PermissionDenied => c.EPERM,
+            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+            error.FileSystem => errnoConst("EIO", c.EINVAL),
+            error.IsDir => errnoConst("EISDIR", c.EINVAL),
+            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+            error.FileNotFound => c.ENOENT,
+            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+            error.SystemResources => c.ENOMEM,
+            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
+            error.NetworkNotFound => c.ENOENT,
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        return -1;
+    };
+    return 0;
 }
 
 export fn _exit(status: c_int) callconv(.c) noreturn {
@@ -425,8 +457,8 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
             setTimespec(tp, sec, nsec);
             return 0;
         }
-        // TODO POSIX implementation of CLOCK.MONOTONIC on Windows.
-        std.debug.panic("clk_id {} not implemented on Windows", .{clk_id});
+        c.errno = c.EINVAL;
+        return -1;
     }
 
     const posix_clk_id: os.clockid_t = @enumFromInt(@as(u32, @intCast(clk_id)));
@@ -446,7 +478,10 @@ export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
         return if (rc == -1) -1 else 0;
     }
     if (builtin.os.tag == .windows) {
-        @panic("gettimeofday not implemented on windows");
+        const ns = std.time.nanoTimestamp();
+        tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(@divFloor(ns, std.time.ns_per_s)));
+        tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(@divFloor(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)));
+        return 0;
     }
     const ns = std.time.nanoTimestamp();
     tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(@divFloor(ns, std.time.ns_per_s)));
@@ -546,16 +581,14 @@ export fn tcsetattr(
 // --------------------------------------------------------------------------------
 export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
     trace.log("strcasecmp {f} {f}", .{ trace.fmtStr(a), trace.fmtStr(b) });
-    @panic("not impl");
-    //    var a_next = a;
-    //    var b_next = b;
-    //    while (a_next[0] == b_next[0] and a_next[0] != 0) {
-    //        a_next += 1;
-    //        b_next += 1;
-    //    }
-    //    const result = @intCast(c_int, a_next[0]) -| @intCast(c_int, b_next[0]);
-    //    trace.log("strcmp return {}", .{result});
-    //    return result;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const a_ch = std.ascii.toLower(a[i]);
+        const b_ch = std.ascii.toLower(b[i]);
+        if (a_ch != b_ch or a_ch == 0) {
+            return @as(c_int, @intCast(a_ch)) -| @as(c_int, @intCast(b_ch));
+        }
+    }
 }
 
 // --------------------------------------------------------------------------------

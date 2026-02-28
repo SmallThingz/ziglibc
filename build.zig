@@ -162,6 +162,21 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
+        const exe = addTest("panic_replacements", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = b.addRunArtifact(test_env_exe);
+        run_step.addArtifactArg(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addTest("posix_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        addPosix(exe, libc_only_posix);
+        const run_step = b.addRunArtifact(test_env_exe);
+        run_step.addArtifactArg(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
         const exe = addTest("getopt", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
         {
@@ -316,7 +331,7 @@ fn addGlibcCheck(
             .target = target,
             .optimize = optimize,
         });
-        addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, src })}, &.{ "-D_GNU_SOURCE" });
+        addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, src })}, &.{"-D_GNU_SOURCE"});
         exe.step.dependOn(&repo.step);
         exe.addIncludePath(lazyPath(b, repo_path));
         exe.linkLibC();
@@ -352,7 +367,7 @@ fn addPosixTestSuite(
     const repo_path = repo.path;
     const include_path = b.pathJoin(&.{ repo_path, "include" });
 
-    inline for (.{ "conformance/interfaces/clock_gettime/1-1.c" }) |src| {
+    inline for (.{"conformance/interfaces/clock_gettime/1-1.c"}) |src| {
         const name = b.fmt("posix-test-suite-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
         const exe = addExecutableCompat(b, .{
             .name = name,
@@ -407,7 +422,7 @@ fn addAustinGroupTests(
         b.pathJoin(&.{ repo_path, "src", "common", "print.c" }),
     };
 
-    inline for (.{ "functional/strftime.c" }) |src| {
+    inline for (.{"functional/strftime.c"}) |src| {
         const name = b.fmt("austin-group-tests-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
         const exe = addExecutableCompat(b, .{
             .name = name,

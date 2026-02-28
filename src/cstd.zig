@@ -17,6 +17,11 @@ const c = @cImport({
 
 const trace = @import("trace.zig");
 
+fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
+    if (@hasDecl(c, name)) return @field(c, name);
+    return fallback;
+}
+
 // __main appears to be a design inherited by LLVM from gcc.
 // it's typically provided by libgcc and is used to call constructors
 fn __main() callconv(.c) void {
@@ -550,7 +555,11 @@ export fn strtoull(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) callconv
 
 export fn strerror(errnum: c_int) callconv(.c) [*:0]const u8 {
     std.log.warn("sterror (num={}) not implemented", .{errnum});
-    _ = std.fmt.bufPrint(&global.tmp_strerror_buffer, "{}", .{errnum}) catch @panic("BUG");
+    @memset(&global.tmp_strerror_buffer, 0);
+    const out = std.fmt.bufPrint(&global.tmp_strerror_buffer, "{}", .{errnum}) catch @panic("BUG");
+    if (out.len < global.tmp_strerror_buffer.len) {
+        global.tmp_strerror_buffer[out.len] = 0;
+    }
     return @as([*:0]const u8, @ptrCast(&global.tmp_strerror_buffer));
 }
 
@@ -596,6 +605,8 @@ export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
 // --------------------------------------------------------------------------------
 const global = struct {
     var rand: std.Random.DefaultPrng = undefined;
+    var clock_start_ns: i128 = 0;
+    var clock_started = false;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .MutexType = std.Thread.Mutex,
@@ -635,6 +646,9 @@ const global = struct {
 
     // TODO: remove this.  Just using it to return error numbers as strings for now
     var tmp_strerror_buffer: [30]u8 = undefined;
+    var current_locale = [_:0]u8{'C'};
+    var gmtime_tm: c.tm = std.mem.zeroes(c.tm);
+    var localtime_tm: c.tm = std.mem.zeroes(c.tm);
 
     var atexit_mutex = std.Thread.Mutex{};
     var atexit_started = false;
@@ -685,12 +699,57 @@ export fn __zreserveFile() callconv(.c) ?*c.FILE {
 
 export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
     trace.log("remove {f}", .{trace.fmtStr(filename)});
-    @panic("remove not implemented");
+    std.posix.unlinkZ(filename) catch |err| {
+        errno = switch (err) {
+            error.AccessDenied => c.EACCES,
+            error.PermissionDenied => c.EPERM,
+            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+            error.FileSystem => errnoConst("EIO", c.EINVAL),
+            error.IsDir => errnoConst("EISDIR", c.EINVAL),
+            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+            error.FileNotFound => c.ENOENT,
+            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+            error.SystemResources => c.ENOMEM,
+            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
+            error.NetworkNotFound => c.ENOENT,
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        return -1;
+    };
+    return 0;
 }
 
 export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
     trace.log("rename {f} {f}", .{ trace.fmtStr(old), trace.fmtStr(new) });
-    @panic("rename not implemented");
+    std.posix.renameZ(old, new) catch |err| {
+        errno = switch (err) {
+            error.AccessDenied => c.EACCES,
+            error.PermissionDenied => c.EPERM,
+            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+            error.DiskQuota => errnoConst("EDQUOT", errnoConst("ENOSPC", c.ENOMEM)),
+            error.IsDir => errnoConst("EISDIR", c.EINVAL),
+            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+            error.LinkQuotaExceeded => errnoConst("EMLINK", c.EINVAL),
+            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+            error.FileNotFound => c.ENOENT,
+            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+            error.SystemResources => c.ENOMEM,
+            error.NoSpaceLeft => errnoConst("ENOSPC", c.ENOMEM),
+            error.PathAlreadyExists => c.EEXIST,
+            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+            error.RenameAcrossMountPoints => errnoConst("EXDEV", c.EINVAL),
+            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
+            error.NoDevice => errnoConst("ENODEV", c.EINVAL),
+            error.SharingViolation, error.PipeBusy => errnoConst("EBUSY", c.EINVAL),
+            error.NetworkNotFound => c.ENOENT,
+            error.AntivirusInterference => c.EACCES,
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        return -1;
+    };
+    return 0;
 }
 
 export fn getchar() callconv(.c) c_int {
@@ -899,41 +958,56 @@ export fn fclose(stream: *c.FILE) callconv(.c) c_int {
 
 export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_int {
     trace.log("fseek {*} offset={} whence={}", .{ stream, offset, whence });
-
-    if (builtin.os.tag == .windows) {
-        @panic("fseek not implemented on Windows");
-    }
-
-    // woraround error in std/os/linux.zig: error: destination type 'usize' has size 4 but source type 'i64' has size 8
-    // return syscall3(.lseek, @bitCast(usize, @as(isize, fd)), @bitCast(usize, offset), whence);
-    //                                                                   ^
-    if (@sizeOf(usize) == 4) @panic("not implemented");
-    if (whence != c.SEEK_SET and whence != c.SEEK_CUR and whence != c.SEEK_END) {
-        errno = c.EINVAL;
-        stream.errno = errno;
-        return -1;
-    }
-    const rc = if (builtin.os.tag == .linux)
-        std.posix.system.lseek(stream.fd, @as(i64, @intCast(offset)), @as(usize, @intCast(whence)))
-    else
-        std.posix.system.lseek(stream.fd, @as(i64, @intCast(offset)), @as(c_int, @intCast(whence)));
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => {
-            stream.eof = 0;
-            stream.errno = 0;
-            return 0;
+    const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
+    const seek_result = switch (whence) {
+        c.SEEK_SET => blk: {
+            if (offset < 0) {
+                errno = c.EINVAL;
+                stream.errno = errno;
+                return -1;
+            }
+            break :blk std.posix.lseek_SET(fd, @as(u64, @intCast(offset)));
         },
-        else => |e| {
-            errno = @intFromEnum(e);
+        c.SEEK_CUR => std.posix.lseek_CUR(fd, @as(i64, @intCast(offset))),
+        c.SEEK_END => std.posix.lseek_END(fd, @as(i64, @intCast(offset))),
+        else => {
+            errno = c.EINVAL;
             stream.errno = errno;
             return -1;
         },
-    }
+    };
+    seek_result catch |e| {
+        errno = switch (e) {
+            error.Unseekable => errnoConst("ESPIPE", c.EINVAL),
+            error.AccessDenied => c.EACCES,
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        stream.errno = errno;
+        return -1;
+    };
+    stream.eof = 0;
+    stream.errno = 0;
+    return 0;
 }
 
 export fn ftell(stream: *c.FILE) callconv(.c) c_long {
-    _ = stream;
-    @panic("ftell not implemented");
+    const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
+    const offset = std.posix.lseek_CUR_get(fd) catch |e| {
+        errno = switch (e) {
+            error.Unseekable => errnoConst("ESPIPE", c.EINVAL),
+            error.AccessDenied => c.EACCES,
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        stream.errno = errno;
+        return -1;
+    };
+    if (offset > std.math.maxInt(c_long)) {
+        errno = errnoConst("EOVERFLOW", c.ERANGE);
+        stream.errno = errno;
+        return -1;
+    }
+    stream.errno = 0;
+    return @as(c_long, @intCast(offset));
 }
 
 export fn rewind(stream: *c.FILE) callconv(.c) void {
@@ -1556,9 +1630,12 @@ export fn clearerr(stream: *c.FILE) callconv(.c) void {
 export fn setvbuf(stream: *c.FILE, buf: ?[*]u8, mode: c_int, size: usize) callconv(.c) c_int {
     _ = stream;
     _ = buf;
-    _ = mode;
     _ = size;
-    @panic("setvbuf not implemented");
+    if (mode != c._IOFBF and mode != c._IOLBF and mode != c._IONBF) {
+        errno = c.EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 export fn ferror(stream: *c.FILE) callconv(.c) c_int {
@@ -1568,7 +1645,14 @@ export fn ferror(stream: *c.FILE) callconv(.c) c_int {
 
 export fn perror(s: [*:0]const u8) callconv(.c) void {
     trace.log("perror {f}", .{trace.fmtStr(s)});
-    @panic("perror not implemented");
+    const prefix_len = std.mem.len(s);
+    if (prefix_len != 0) {
+        _ = _fwrite_buf(s, prefix_len, stderr);
+        _ = _fwrite_buf(": ", 2, stderr);
+    }
+    const message = std.mem.span(strerror(errno));
+    _ = _fwrite_buf(message.ptr, message.len, stderr);
+    _ = _fwrite_buf("\n", 1, stderr);
 }
 
 // NOTE: this is not a libc function, it's exported so it can be used
@@ -1656,10 +1740,16 @@ export fn pow(x: f64, y: f64) callconv(.c) f64 {
 // --------------------------------------------------------------------------------
 // locale
 // --------------------------------------------------------------------------------
-export fn setlocale(category: c_int, locale: [*:0]const u8) callconv(.c) [*:0]u8 {
+export fn setlocale(category: c_int, locale: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     _ = category;
-    _ = locale;
-    @panic("setlocale not implemented");
+    const requested = std.mem.span(locale);
+    if (requested.len == 0 or std.mem.eql(u8, requested, "C") or std.mem.eql(u8, requested, "POSIX")) {
+        global.current_locale[0] = 'C';
+        global.current_locale[1] = 0;
+        return @as([*:0]u8, @ptrCast(&global.current_locale));
+    }
+    errno = c.EINVAL;
+    return null;
 }
 
 export fn localeconv() callconv(.c) *c.lconv {
@@ -1671,18 +1761,46 @@ export fn localeconv() callconv(.c) *c.lconv {
 // time
 // --------------------------------------------------------------------------------
 export fn clock() callconv(.c) c.clock_t {
-    @panic("clock not implemented");
+    const now_ns = std.time.nanoTimestamp();
+    if (!global.clock_started) {
+        global.clock_start_ns = now_ns;
+        global.clock_started = true;
+    }
+    const elapsed_ns = now_ns - global.clock_start_ns;
+    const ticks_per_second: i128 = c.CLOCKS_PER_SEC;
+    const ns_per_tick: i128 = @divFloor(std.time.ns_per_s, ticks_per_second);
+    const ticks = @divFloor(elapsed_ns, ns_per_tick);
+    if (ticks < 0 or ticks > std.math.maxInt(c.clock_t)) {
+        errno = errnoConst("EOVERFLOW", c.ERANGE);
+        return -1;
+    }
+    return @as(c.clock_t, @intCast(ticks));
 }
 
 export fn difftime(time1: c.time_t, time0: c.time_t) callconv(.c) f64 {
-    _ = time1;
-    _ = time0;
-    @panic("difftime not implemented");
+    return @as(f64, @floatFromInt(time1)) - @as(f64, @floatFromInt(time0));
 }
 
 export fn mktime(timeptr: *c.tm) callconv(.c) c.time_t {
-    _ = timeptr;
-    @panic("mktime not implemented");
+    const input_year = @as(i64, @intCast(timeptr.tm_year)) + 1900;
+    const input_month = @as(i64, @intCast(timeptr.tm_mon));
+    const year_adjust = @divFloor(input_month, 12);
+    const month_zero = @mod(input_month, 12);
+    const normalized_year = input_year + year_adjust;
+    const normalized_month: usize = @intCast(month_zero + 1);
+
+    const days = daysFromCivil(normalized_year, normalized_month, 1) + (@as(i128, @intCast(timeptr.tm_mday)) - 1);
+    const sod = @as(i128, @intCast(timeptr.tm_hour)) * 3600 +
+        @as(i128, @intCast(timeptr.tm_min)) * 60 +
+        @as(i128, @intCast(timeptr.tm_sec));
+    const total = days * 86400 + sod;
+
+    const result = std.math.cast(c.time_t, total) orelse {
+        errno = c.ERANGE;
+        return -1;
+    };
+    fillTmFromUnixSeconds(timeptr, total);
+    return result;
 }
 
 export fn time(timer: ?*c.time_t) callconv(.c) c.time_t {
@@ -1696,14 +1814,14 @@ export fn time(timer: ?*c.time_t) callconv(.c) c.time_t {
     return now;
 }
 
-export fn gmtime(timer: *c.time_t) callconv(.c) *c.tm {
-    _ = timer;
-    @panic("gmtime not implemented");
+export fn gmtime(timer: *const c.time_t) callconv(.c) ?*c.tm {
+    fillTmFromUnixSeconds(&global.gmtime_tm, timer.*);
+    return &global.gmtime_tm;
 }
 
-export fn localtime(timer: *const c.time_t) callconv(.c) *c.tm {
-    _ = timer;
-    @panic("localtime not implemented");
+export fn localtime(timer: *const c.time_t) callconv(.c) ?*c.tm {
+    fillTmFromUnixSeconds(&global.localtime_tm, timer.*);
+    return &global.localtime_tm;
 }
 
 const weekday_abbrev = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
@@ -1750,6 +1868,47 @@ fn tmYear(tm: *const c.tm) i64 {
 
 fn isLeapYear(year: i64) bool {
     return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+}
+
+fn civilFromDays(days: i128) struct { year: i64, month: usize, day: usize } {
+    const z = days + 719468;
+    const era = if (z >= 0)
+        @divFloor(z, 146097)
+    else
+        @divFloor(z - 146096, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    var year = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const month_adjust: i128 = if (mp < 10) 3 else -9;
+    const month = mp + month_adjust;
+    if (month <= 2) year += 1;
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
+}
+
+fn fillTmFromUnixSeconds(out: *c.tm, unix_seconds: anytype) void {
+    const total: i128 = @intCast(unix_seconds);
+    const days = @divFloor(total, 86400);
+    const rem = @mod(total, 86400);
+    const civil = civilFromDays(days);
+    const yday = days - daysFromCivil(civil.year, 1, 1);
+    const wday = @mod(days + 4, 7);
+
+    out.tm_sec = @as(c_int, @intCast(@mod(rem, 60)));
+    out.tm_min = @as(c_int, @intCast(@divFloor(@mod(rem, 3600), 60)));
+    out.tm_hour = @as(c_int, @intCast(@divFloor(rem, 3600)));
+    out.tm_mday = @as(c_int, @intCast(civil.day));
+    out.tm_mon = @as(c_int, @intCast(civil.month - 1));
+    out.tm_year = @as(c_int, @intCast(civil.year - 1900));
+    out.tm_wday = @as(c_int, @intCast(wday));
+    out.tm_yday = @as(c_int, @intCast(yday));
+    out.tm_isdst = 0;
 }
 
 fn daysFromCivil(year: i64, month: usize, day: usize) i128 {
@@ -2123,7 +2282,7 @@ const has_aarch64_setjmp_asm = builtin.cpu.arch == .aarch64;
 fn setjmp_x86_64() callconv(.naked) c_int {
     if (builtin.os.tag == .windows) {
         asm volatile (
-            // Win64: env in rcx
+        // Win64: env in rcx
             \\movq %%rbx,(%%rcx)
             \\movq %%rbp,8(%%rcx)
             \\movq %%r12,16(%%rcx)
@@ -2141,7 +2300,7 @@ fn setjmp_x86_64() callconv(.naked) c_int {
         );
     } else {
         asm volatile (
-            // SysV: env in rdi
+        // SysV: env in rdi
             \\movq %%rbx,(%%rdi)
             \\movq %%rbp,8(%%rdi)
             \\movq %%r12,16(%%rdi)
@@ -2161,7 +2320,7 @@ fn setjmp_x86_64() callconv(.naked) c_int {
 fn longjmp_x86_64() callconv(.naked) noreturn {
     if (builtin.os.tag == .windows) {
         asm volatile (
-            // Win64: env in rcx, val in edx
+        // Win64: env in rcx, val in edx
             \\xorl %%eax,%%eax
             \\cmpl $1,%%edx
             \\adcl %%edx,%%eax
@@ -2178,7 +2337,7 @@ fn longjmp_x86_64() callconv(.naked) noreturn {
         );
     } else {
         asm volatile (
-            // SysV: env in rdi, val in esi
+        // SysV: env in rdi, val in esi
             \\xorl %%eax,%%eax
             \\cmpl $1,%%esi
             \\adcl %%esi,%%eax
