@@ -64,6 +64,7 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
         else => false,
     });
     const index = relpath(builder, "src" ++ std.fs.path.sep_str ++ "lib.zig");
+    const force_llvm_lld = opt.link == .shared and opt.target.result.os.tag == .linux;
     const lib = switch (opt.link) {
         .static => addStaticLibraryCompat(builder, .{
             .name = name,
@@ -78,6 +79,8 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
             .target = opt.target,
             .optimize = opt.optimize,
             .pic = true,
+            .use_llvm = if (force_llvm_lld) true else null,
+            .use_lld = if (force_llvm_lld) true else null,
             .version = switch (opt.variant) {
                 .full => .{ .major = 6, .minor = 0, .patch = 0 },
                 else => null,
@@ -157,6 +160,8 @@ fn addSharedLibraryCompat(
         optimize: ?std.builtin.OptimizeMode = null,
         version: ?std.SemanticVersion = null,
         pic: ?bool = null,
+        use_llvm: ?bool = null,
+        use_lld: ?bool = null,
     },
 ) *CompileStep {
     return b.addLibrary(.{
@@ -168,6 +173,8 @@ fn addSharedLibraryCompat(
             .optimize = opt.optimize orelse .Debug,
             .pic = opt.pic,
         }),
+        .use_llvm = opt.use_llvm,
+        .use_lld = opt.use_lld,
         .version = opt.version,
     });
 }

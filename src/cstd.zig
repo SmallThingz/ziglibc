@@ -1045,6 +1045,11 @@ fn isFormatFlag(ch: u8) bool {
     return ch == '-' or ch == '+' or ch == ' ' or ch == '#' or ch == '0';
 }
 
+const VaListParam = if (@typeInfo(std.builtin.VaList) == .pointer)
+    std.builtin.VaList
+else
+    *std.builtin.VaList;
+
 fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) bool {
     out_written.* = 0;
     const fmt_slice = std.mem.span(fmt);
@@ -1158,10 +1163,14 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
     return true;
 }
 
-export fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     var writer = FormatWriter{ .stream = stream };
     var written: usize = 0;
-    if (vformat(&written, &writer, format, arg)) {
+    const ok = if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
+        var va = arg;
+        break :blk vformat(&written, &writer, format, &va);
+    } else vformat(&written, &writer, format, arg);
+    if (ok) {
         return @intCast(written);
     } else {
         stream.errno = c.errno;
@@ -1169,27 +1178,35 @@ export fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *std.builtin.VaL
     }
 }
 
-export fn vprintf(format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+fn vprintf(format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     return vfprintf(stdout, format, arg);
 }
 
-export fn vsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+fn vsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     var writer = FormatWriter{ .bounded = .{
         .buf = s,
         .len = n,
     } };
     var written: usize = 0;
-    std.debug.assert(vformat(&written, &writer, format, arg));
+    const ok = if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
+        var va = arg;
+        break :blk vformat(&written, &writer, format, &va);
+    } else vformat(&written, &writer, format, arg);
+    std.debug.assert(ok);
     if (written < n) s[written] = 0;
     return @intCast(written);
 }
 
-export fn vsprintf(s: [*]u8, format: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+fn vsprintf(s: [*]u8, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     var writer = FormatWriter{ .unbounded = .{
         .buf = s,
     } };
     var written: usize = 0;
-    std.debug.assert(vformat(&written, &writer, format, arg));
+    const ok = if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
+        var va = arg;
+        break :blk vformat(&written, &writer, format, &va);
+    } else vformat(&written, &writer, format, arg);
+    std.debug.assert(ok);
     s[written] = 0;
     return @intCast(written);
 }
@@ -1391,9 +1408,24 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: *std.builtin.VaList) ca
     }
 }
 
-export fn vsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: *std.builtin.VaList) callconv(.c) c_int {
+fn vsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
     var reader = FixedReader{ .buf = s };
-    return vscan(&reader, fmt, arg);
+    if (comptime @typeInfo(std.builtin.VaList) == .pointer) {
+        var va = arg;
+        return vscan(&reader, fmt, &va);
+    } else {
+        return vscan(&reader, fmt, arg);
+    }
+}
+
+comptime {
+    if (builtin.os.tag != .windows) {
+        @export(&vfprintf, .{ .name = "vfprintf" });
+        @export(&vprintf, .{ .name = "vprintf" });
+        @export(&vsnprintf, .{ .name = "vsnprintf" });
+        @export(&vsprintf, .{ .name = "vsprintf" });
+        @export(&vsscanf, .{ .name = "vsscanf" });
+    }
 }
 
 // TODO: can ptr be NULL?
