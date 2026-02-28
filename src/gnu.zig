@@ -4,7 +4,7 @@ const c = @cImport({
 
 export fn argp_usage(state: *const c.argp_state) callconv(.c) void {
     _ = state;
-    @panic("argp_usage not implemented");
+    // No-op fallback for now.
 }
 
 export fn argp_parse(
@@ -19,7 +19,7 @@ export fn argp_parse(
     _ = argc;
     _ = argv;
     _ = flags;
-    _ = arg_index;
     _ = input;
-    @panic("argp_parse not impl");
+    arg_index.* = 0;
+    return c.ARGP_ERR_UNKNOWN;
 }

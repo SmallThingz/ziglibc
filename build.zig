@@ -116,6 +116,20 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
+        const exe = addTest("signal_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = b.addRunArtifact(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addTest("gnu_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
+        exe.linkLibrary(libc_only_gnu);
+        const run_step = b.addRunArtifact(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
         const exe = addTest("fs", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = b.addRunArtifact(test_env_exe);
         run_step.addArtifactArg(exe);
@@ -212,6 +226,14 @@ pub fn build(b: *std.Build) void {
 
     if (supportsSetjmp(target.result)) {
         const exe = addTest("jmp", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = b.addRunArtifact(exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    if (target.result.os.tag == .linux) {
+        const exe = addTest("alloca_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "linux"));
+        exe.linkLibrary(libc_only_linux);
         const run_step = b.addRunArtifact(exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);

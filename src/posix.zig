@@ -53,6 +53,16 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const gettimeofday: c_long = 116;
 } else struct {};
 
+fn windowsStdHandleFromFd(fd: c_int) ?std.os.windows.HANDLE {
+    const process_params = std.os.windows.peb().ProcessParameters;
+    return switch (fd) {
+        0 => process_params.hStdInput,
+        1 => process_params.hStdOutput,
+        2 => process_params.hStdError,
+        else => null,
+    };
+}
+
 // C ABI globals: `extern char *optarg; extern int opterr, optind, optopt;`
 export var optarg: [*c]u8 = null;
 export var opterr: c_int = 1;
@@ -160,7 +170,27 @@ fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
         return if (rc == -1) -1 else @as(isize, @intCast(rc));
     }
     if (builtin.os.tag == .windows) {
-        @panic("write not implemented on windows");
+        const handle = windowsStdHandleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return -1;
+        };
+        var total_written: usize = 0;
+        while (total_written < nbyte) {
+            const remaining = nbyte - total_written;
+            const next_len: u32 = @intCast(@min(remaining, @as(usize, std.math.maxInt(u32))));
+            var did_write: u32 = 0;
+            if (std.os.windows.kernel32.WriteFile(handle, buf + total_written, next_len, &did_write, null) == 0) {
+                c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+                    .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
+                    .ACCESS_DENIED => c.EACCES,
+                    else => errnoConst("EIO", c.EINVAL),
+                };
+                return -1;
+            }
+            total_written += did_write;
+            if (did_write == 0) break;
+        }
+        return @as(isize, @intCast(total_written));
     }
     const rc = os.system.write(fd, buf, nbyte);
     switch (os.errno(rc)) {
@@ -179,7 +209,21 @@ fn zreadRaw(fd: c_int, buf: [*]u8, len: usize) isize {
     }
     trace.log("read fd={} buf={*} len={}", .{ fd, buf, len });
     if (builtin.os.tag == .windows) {
-        @panic("read not implemented on windows");
+        const handle = windowsStdHandleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return -1;
+        };
+        const next_len: u32 = @intCast(@min(len, @as(usize, std.math.maxInt(u32))));
+        var did_read: u32 = 0;
+        if (std.os.windows.kernel32.ReadFile(handle, buf, next_len, &did_read, null) == 0) {
+            c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+                .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
+                .BROKEN_PIPE, .HANDLE_EOF => 0,
+                else => errnoConst("EIO", c.EINVAL),
+            };
+            return if (c.errno == 0) 0 else -1;
+        }
+        return @as(isize, @intCast(did_read));
     }
     const rc = os.system.read(fd, buf, len);
     switch (os.errno(rc)) {
@@ -197,7 +241,8 @@ fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
         return if (rc == -1) -1 else @as(c_int, @intCast(rc));
     }
     if (builtin.os.tag == .windows) {
-        @panic("open not implemented on windows");
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
     }
     const flags_bits: u32 = @bitCast(oflag);
     const flags: os.O = @bitCast(flags_bits);
@@ -250,7 +295,8 @@ export fn mkstemp(template: [*:0]u8) callconv(.c) c_int {
 export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.c) c_int {
     trace.log("mkstemp '{f}'", .{trace.fmtStr(template)});
     if (builtin.os.tag == .windows) {
-        @panic("mkostemp not implemented in Windows");
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
     }
 
     const rand_part: *[6]u8 = blk: {
@@ -323,24 +369,32 @@ export fn fileno(stream: *c.FILE) callconv(.c) c_int {
     return stream.fd;
 }
 
-export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) *c.FILE {
+export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
     trace.log("popen '{f}' mode='{s}'", .{ trace.fmtStr(command), mode });
-    @panic("popen not implemented");
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return null;
 }
 export fn pclose(stream: *c.FILE) callconv(.c) c_int {
     _ = stream;
-    @panic("pclose not implemented");
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
 }
 
 export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
     trace.log("fdopen {d} mode={s}", .{ fd, mode });
-    if (builtin.os.tag == .windows) @panic("not impl");
-
     const file = cstd.__zreserveFile() orelse {
         c.errno = c.ENOMEM;
         return null;
     };
-    file.fd = fd;
+    if (builtin.os.tag == .windows) {
+        const handle = windowsStdHandleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return null;
+        };
+        file.fd = handle;
+    } else {
+        file.fd = fd;
+    }
     file.eof = 0;
     return file;
 }
@@ -422,8 +476,19 @@ export fn _exit(status: c_int) callconv(.c) noreturn {
 }
 
 export fn isatty(fd: c_int) callconv(.c) c_int {
-    if (builtin.os.tag == .windows)
-        @panic("isatty not supported on windows (yet?)");
+    if (builtin.os.tag == .windows) {
+        const handle = windowsStdHandleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return 0;
+        };
+        var mode: u32 = 0;
+        if (std.os.windows.kernel32.GetConsoleMode(handle, &mode) != 0) return 1;
+        c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+            .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
+            else => errnoConst("ENOTTY", c.EINVAL),
+        };
+        return 0;
+    }
 
     var size: c.winsize = undefined;
     switch (os.errno(os.system.ioctl(fd, c.TIOCGWINSZ, @intFromPtr(&size)))) {
@@ -530,7 +595,8 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
     trace.log("setitimer which={}", .{which});
     _ = value;
     _ = avalue;
-    @panic("setitimer not implemented");
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
 }
 
 // --------------------------------------------------------------------------------
@@ -540,7 +606,8 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
     trace.log("sigaction sig={}", .{sig});
     _ = act;
     _ = oact;
-    @panic("sigaction not implemented");
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
 }
 
 // --------------------------------------------------------------------------------
@@ -548,22 +615,84 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 // --------------------------------------------------------------------------------
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
-    @panic("chmod not implemented");
+    if (builtin.os.tag == .windows) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+    const rc = os.system.fchmodat(
+        os.AT.FDCWD,
+        path,
+        @as(std.posix.mode_t, @intCast(mode)),
+        0,
+    );
+    switch (os.errno(rc)) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
+}
+
+fn timespecSeconds(ts: anytype) i64 {
+    const ts_ty = @TypeOf(ts);
+    if (@hasField(ts_ty, "tv_sec")) {
+        return @as(i64, @intCast(ts.tv_sec));
+    }
+    return @as(i64, @intCast(ts.sec));
 }
 
 export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
-    _ = fd;
-    _ = buf;
-    @panic("fstat not implemented");
+    if (builtin.os.tag == .windows) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+    var stat_buf: os.Stat = undefined;
+    switch (os.errno(os.system.fstat(fd, &stat_buf))) {
+        .SUCCESS => {},
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
+
+    const stat_ty = @TypeOf(stat_buf);
+    const atime = if (@hasField(stat_ty, "atim"))
+        timespecSeconds(stat_buf.atim)
+    else
+        timespecSeconds(stat_buf.atimespec);
+    const mtime = if (@hasField(stat_ty, "mtim"))
+        timespecSeconds(stat_buf.mtim)
+    else
+        timespecSeconds(stat_buf.mtimespec);
+    const ctime = if (@hasField(stat_ty, "ctim"))
+        timespecSeconds(stat_buf.ctim)
+    else
+        timespecSeconds(stat_buf.ctimespec);
+
+    buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(stat_buf.dev));
+    buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(stat_buf.ino));
+    buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(stat_buf.mode));
+    buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(stat_buf.nlink));
+    buf.st_uid = @as(@TypeOf(buf.st_uid), @intCast(stat_buf.uid));
+    buf.st_gid = @as(@TypeOf(buf.st_gid), @intCast(stat_buf.gid));
+    buf.st_rdev = @as(@TypeOf(buf.st_rdev), @intCast(stat_buf.rdev));
+    buf.st_size = @as(@TypeOf(buf.st_size), @intCast(stat_buf.size));
+    buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(atime));
+    buf.st_mtime = @as(@TypeOf(buf.st_mtime), @intCast(mtime));
+    buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(ctime));
+    buf.st_blksize = @as(@TypeOf(buf.st_blksize), @intCast(stat_buf.blksize));
+    buf.st_blocks = @as(@TypeOf(buf.st_blocks), @intCast(stat_buf.blocks));
+    return 0;
 }
 
 export fn umask(mode: c.mode_t) callconv(.c) c.mode_t {
     trace.log("umask 0x{x}", .{mode});
-    const old_mode = std.os.linux.syscall1(.umask, @as(usize, @intCast(mode)));
-    switch (os.errno(old_mode)) {
-        .SUCCESS => {},
-        else => |e| std.debug.panic("umask syscall should never fail but got '{s}'", .{@tagName(e)}),
+    if (builtin.os.tag != .linux) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return mode;
     }
+    const old_mode = std.os.linux.syscall1(.umask, @as(usize, @intCast(mode)));
     return @as(c.mode_t, @intCast(old_mode));
 }
 
@@ -662,7 +791,8 @@ export fn select(
     _ = writefds;
     _ = errorfds;
     _ = timeout;
-    @panic("TODO: implement select");
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
 }
 
 // --------------------------------------------------------------------------------

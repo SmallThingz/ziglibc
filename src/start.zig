@@ -26,18 +26,16 @@ pub fn main() u8 {
 
 // TODO: I'm pretty sure this could be more memory efficient
 fn windowsArgsAlloc() [:null]?[*:0]u8 {
-    const out_of_memory_msg = "Out Of Memory while decoding command line";
-
     var argv_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     var tmp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer tmp_arena.deinit();
 
     var argv = std.ArrayListUnmanaged(?[*:0]u8){};
-    var it = std.process.argsWithAllocator(tmp_arena.allocator()) catch @panic(out_of_memory_msg);
+    var it = std.process.argsWithAllocator(tmp_arena.allocator()) catch std.posix.abort();
     defer it.deinit();
     while (it.next()) |tmp_arg| {
-        const arg = argv_arena.allocator().dupeZ(u8, tmp_arg) catch @panic(out_of_memory_msg);
-        argv.append(argv_arena.allocator(), arg) catch @panic(out_of_memory_msg);
+        const arg = argv_arena.allocator().dupeZ(u8, tmp_arg) catch std.posix.abort();
+        argv.append(argv_arena.allocator(), arg) catch std.posix.abort();
     }
-    return argv.toOwnedSliceSentinel(argv_arena.allocator(), null) catch @panic(out_of_memory_msg);
+    return argv.toOwnedSliceSentinel(argv_arena.allocator(), null) catch std.posix.abort();
 }

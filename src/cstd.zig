@@ -114,7 +114,7 @@ export fn atexit(func: ExitFunc) c_int {
 
 export fn abort() callconv(.c) noreturn {
     trace.log("abort", .{});
-    @panic("abort");
+    std.posix.abort();
 }
 
 // TODO: can name be null?
@@ -276,9 +276,8 @@ export fn strncmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c) c_i
 }
 
 export fn strcoll(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) c_int {
-    _ = s1;
-    _ = s2;
-    @panic("strcoll not implemented");
+    // Locale-aware collation is not implemented yet; match "C" locale behavior.
+    return strcmp(s1, s2);
 }
 
 export fn strchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
@@ -521,13 +520,51 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
 
 export fn strtod(nptr: [*:0]const u8, endptr: ?*[*:0]const u8) callconv(.c) f64 {
     trace.log("strtod {f}", .{trace.fmtStr(nptr)});
-    const str_len: usize = if (endptr) |e| @intFromPtr(e.*) - @intFromPtr(nptr) else std.mem.len(nptr);
-    if (str_len == 0) {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        switch (nptr[i]) {
+            ' ', '\t', '\n', '\r', '\x0b', '\x0c' => {},
+            else => break,
+        }
+    }
+    const token_start = i;
+    if (nptr[i] == '+' or nptr[i] == '-') i += 1;
+
+    var saw_digit = false;
+    while (std.ascii.isDigit(nptr[i])) : (i += 1) {
+        saw_digit = true;
+    }
+    if (nptr[i] == '.') {
+        i += 1;
+        while (std.ascii.isDigit(nptr[i])) : (i += 1) {
+            saw_digit = true;
+        }
+    }
+
+    if (saw_digit and (nptr[i] == 'e' or nptr[i] == 'E')) {
+        const exp_start = i;
+        i += 1;
+        if (nptr[i] == '+' or nptr[i] == '-') i += 1;
+        var exp_digits: usize = 0;
+        while (std.ascii.isDigit(nptr[i])) : (i += 1) {
+            exp_digits += 1;
+        }
+        if (exp_digits == 0) i = exp_start;
+    }
+
+    if (!saw_digit or token_start == i) {
+        if (endptr) |ep| ep.* = nptr;
+        errno = c.EINVAL;
         return 0;
     }
-    const result = std.fmt.parseFloat(f64, nptr[0..str_len]) catch |err| switch (err) {
+
+    if (endptr) |ep| ep.* = nptr + i;
+
+    const result = std.fmt.parseFloat(f64, nptr[token_start..i]) catch |err| switch (err) {
         error.InvalidCharacter => {
-            std.debug.panic("todo: strtod handle InvalidCharacter for '{s}'", .{nptr[0..str_len]});
+            if (endptr) |ep| ep.* = nptr;
+            errno = c.EINVAL;
+            return 0;
         },
     };
     return result;
@@ -553,10 +590,53 @@ export fn strtoull(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) callconv
     return strto(c_ulonglong, nptr, @ptrCast(endptr), base);
 }
 
+fn errnoMessage(errnum: c_int, comptime name: []const u8, comptime msg: []const u8) ?[*:0]const u8 {
+    if (@hasDecl(c, name) and errnum == @field(c, name)) {
+        return @as([*:0]const u8, @ptrCast(msg));
+    }
+    return null;
+}
+
 export fn strerror(errnum: c_int) callconv(.c) [*:0]const u8 {
-    std.log.warn("sterror (num={}) not implemented", .{errnum});
+    if (errnum == 0) return @as([*:0]const u8, @ptrCast("Success"));
+    if (errnoMessage(errnum, "EPERM", "Operation not permitted")) |msg| return msg;
+    if (errnoMessage(errnum, "ENOENT", "No such file or directory")) |msg| return msg;
+    if (errnoMessage(errnum, "ESRCH", "No such process")) |msg| return msg;
+    if (errnoMessage(errnum, "EINTR", "Interrupted function call")) |msg| return msg;
+    if (errnoMessage(errnum, "EIO", "Input/output error")) |msg| return msg;
+    if (errnoMessage(errnum, "ENXIO", "No such device or address")) |msg| return msg;
+    if (errnoMessage(errnum, "E2BIG", "Argument list too long")) |msg| return msg;
+    if (errnoMessage(errnum, "ENOEXEC", "Exec format error")) |msg| return msg;
+    if (errnoMessage(errnum, "EBADF", "Bad file descriptor")) |msg| return msg;
+    if (errnoMessage(errnum, "ECHILD", "No child processes")) |msg| return msg;
+    if (errnoMessage(errnum, "EAGAIN", "Resource temporarily unavailable")) |msg| return msg;
+    if (errnoMessage(errnum, "ENOMEM", "Not enough space")) |msg| return msg;
+    if (errnoMessage(errnum, "EACCES", "Permission denied")) |msg| return msg;
+    if (errnoMessage(errnum, "EFAULT", "Bad address")) |msg| return msg;
+    if (errnoMessage(errnum, "EBUSY", "Device or resource busy")) |msg| return msg;
+    if (errnoMessage(errnum, "EEXIST", "File exists")) |msg| return msg;
+    if (errnoMessage(errnum, "ENODEV", "No such device")) |msg| return msg;
+    if (errnoMessage(errnum, "ENOTDIR", "Not a directory")) |msg| return msg;
+    if (errnoMessage(errnum, "EISDIR", "Is a directory")) |msg| return msg;
+    if (errnoMessage(errnum, "EINVAL", "Invalid argument")) |msg| return msg;
+    if (errnoMessage(errnum, "ENFILE", "Too many files open in system")) |msg| return msg;
+    if (errnoMessage(errnum, "EMFILE", "Too many open files")) |msg| return msg;
+    if (errnoMessage(errnum, "ENOTTY", "Inappropriate I/O control operation")) |msg| return msg;
+    if (errnoMessage(errnum, "EFBIG", "File too large")) |msg| return msg;
+    if (errnoMessage(errnum, "ENOSPC", "No space left on device")) |msg| return msg;
+    if (errnoMessage(errnum, "ESPIPE", "Invalid seek")) |msg| return msg;
+    if (errnoMessage(errnum, "EROFS", "Read-only file system")) |msg| return msg;
+    if (errnoMessage(errnum, "EMLINK", "Too many links")) |msg| return msg;
+    if (errnoMessage(errnum, "EPIPE", "Broken pipe")) |msg| return msg;
+    if (errnoMessage(errnum, "EDOM", "Domain error")) |msg| return msg;
+    if (errnoMessage(errnum, "ERANGE", "Result too large")) |msg| return msg;
+
     @memset(&global.tmp_strerror_buffer, 0);
-    const out = std.fmt.bufPrint(&global.tmp_strerror_buffer, "{}", .{errnum}) catch @panic("BUG");
+    const out = std.fmt.bufPrint(&global.tmp_strerror_buffer, "{}", .{errnum}) catch {
+        global.tmp_strerror_buffer[0] = '?';
+        global.tmp_strerror_buffer[1] = 0;
+        return @as([*:0]const u8, @ptrCast(&global.tmp_strerror_buffer));
+    };
     if (out.len < global.tmp_strerror_buffer.len) {
         global.tmp_strerror_buffer[out.len] = 0;
     }
@@ -568,36 +648,38 @@ export fn strerror(errnum: c_int) callconv(.c) [*:0]const u8 {
 // --------------------------------------------------------------------------------
 const SignalFn = switch (builtin.zig_backend) {
     .stage1 => fn (c_int) callconv(.c) void,
-    else => *const fn (c_int) callconv(.c) void,
+    // `SIG_ERR` is represented as `(void (*)(int))-1`, which is intentionally
+    // not guaranteed to satisfy function-pointer alignment.
+    else => *align(1) const fn (c_int) callconv(.c) void,
 };
 export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
+    const sig_err = @as(?SignalFn, @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))));
     if (builtin.os.tag == .windows) {
         // TODO: maybe we can emulate/handle some signals?
         trace.log("ignoring the 'signal' function (sig={}) on windows", .{sig});
         return null;
     }
-    if (builtin.os.tag == .linux) {
-        var action = std.posix.Sigaction{
-            .handler = .{ .handler = func },
-            .mask = std.mem.zeroes(std.posix.sigset_t),
-            .flags = std.posix.SA.RESTART,
-        };
-        var old_action: std.posix.Sigaction = undefined;
-        switch (std.posix.errno(std.posix.system.sigaction(
-            @as(u6, @intCast(sig)),
-            &action,
-            &old_action,
-        ))) {
-            .SUCCESS => return old_action.handler.handler,
-            else => |e| {
-                errno = @intFromEnum(e);
-                // translate-c having a hard time with this one
-                //return c.SIG_ERR;
-                return @as(?SignalFn, @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))));
-            },
-        }
+    if (sig < 0 or sig > std.math.maxInt(u6)) {
+        errno = c.EINVAL;
+        return sig_err;
     }
-    @panic("signal not implemented");
+    var action = std.posix.Sigaction{
+        .handler = .{ .handler = func },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = std.posix.SA.RESTART,
+    };
+    var old_action: std.posix.Sigaction = undefined;
+    switch (std.posix.errno(std.posix.system.sigaction(
+        @as(u6, @intCast(sig)),
+        &action,
+        &old_action,
+    ))) {
+        .SUCCESS => return old_action.handler.handler,
+        else => |e| {
+            errno = @intFromEnum(e);
+            return sig_err;
+        },
+    }
 }
 
 // --------------------------------------------------------------------------------
@@ -630,7 +712,7 @@ const global = struct {
     var tmpnam_counter: u32 = 0;
     var tmpfile_counter: u32 = 0;
 
-    fn reserveFile() *c.FILE {
+    fn reserveFile() ?*c.FILE {
         var i: usize = 0;
         while (i < files_reserved.len) : (i += 1) {
             if (!@atomicRmw(bool, &files_reserved[i], .Xchg, true, .seq_cst)) {
@@ -640,13 +722,12 @@ const global = struct {
                 return &files[i];
             }
         }
-        @panic("out of file handles");
+        return null;
     }
     fn releaseFile(file: *c.FILE) void {
         const i = (@intFromPtr(file) - @intFromPtr(&files[0])) / @sizeOf(c.FILE);
-        if (!@atomicRmw(bool, &files_reserved[i], .Xchg, false, .seq_cst)) {
-            std.debug.panic("released FILE (i={} ptr={*}) that was not reserved", .{ i, file });
-        }
+        if (i >= files_reserved.len) return;
+        if (!@atomicRmw(bool, &files_reserved[i], .Xchg, false, .seq_cst)) return;
         unread_valid[i] = false;
     }
 
@@ -854,7 +935,11 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
                     .OPERATION_ABORTED => continue,
                     .BROKEN_PIPE => return prefilled,
                     .HANDLE_EOF => return prefilled,
-                    else => |err| std.debug.panic("ReadFile unexpected error {}", .{err}),
+                    else => |err| {
+                        stream.errno = @intFromEnum(err);
+                        errno = stream.errno;
+                        return prefilled;
+                    },
                 }
             }
             if (amt_read == 0) stream.eof = 1;
@@ -989,7 +1074,11 @@ fn fopenImpl(
                 return null;
             };
         }
-        const file = global.reserveFile();
+        const file = global.reserveFile() orelse {
+            _ = windows.CloseHandle(fd.?);
+            errno = c.ENOMEM;
+            return null;
+        };
         file.fd = fd;
         file.eof = 0;
         return file;
@@ -1016,7 +1105,11 @@ fn fopenImpl(
             return null;
         },
     }
-    const file = global.reserveFile();
+    const file = global.reserveFile() orelse {
+        _ = std.posix.system.close(@as(c_int, @intCast(fd)));
+        errno = c.ENOMEM;
+        return null;
+    };
     file.fd = @as(c_int, @intCast(fd));
     file.eof = 0;
     return file;
@@ -1729,7 +1822,11 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
         switch (std.posix.errno(fd)) {
             .SUCCESS => {
                 _ = std.posix.system.unlink(&name_buf);
-                const file = global.reserveFile();
+                const file = global.reserveFile() orelse {
+                    _ = std.posix.system.close(@as(c_int, @intCast(fd)));
+                    errno = c.ENOMEM;
+                    return null;
+                };
                 file.fd = @as(c_int, @intCast(fd));
                 file.eof = 0;
                 file.errno = 0;
@@ -1825,32 +1922,26 @@ fn formatIntCompat(buf: []u8, value: anytype, base: u8) usize {
 // math
 // --------------------------------------------------------------------------------
 export fn acos(x: f64) callconv(.c) f64 {
-    _ = x;
-    @panic("acos not implemented");
+    return std.math.acos(x);
 }
 
 export fn asin(x: f64) callconv(.c) f64 {
-    _ = x;
-    @panic("asin not implemented");
+    return std.math.asin(x);
 }
 
 export fn atan(x: f64) callconv(.c) f64 {
-    _ = x;
-    @panic("atan not implemented");
+    return std.math.atan(x);
 }
 
 export fn atan2(y: f64, x: f64) callconv(.c) f64 {
-    _ = y;
-    _ = x;
-    @panic("atan2 not implemented");
+    return std.math.atan2(y, x);
 }
 
 // cos/sin are already defined somewhere in the libraries Zig includes
 // on linux, not sure what library though or how
 
 export fn tan(x: f64) callconv(.c) f64 {
-    _ = x;
-    @panic("tan not implemented");
+    return std.math.sin(x) / std.math.cos(x);
 }
 
 export fn frexp(value: f32, exp: *c_int) callconv(.c) f64 {
@@ -2528,12 +2619,13 @@ fn longjmp_aarch64() callconv(.naked) noreturn {
 
 fn setjmp_fallback(env: c.jmp_buf) callconv(.c) c_int {
     _ = env;
-    @panic("setjmp not implemented on this platform yet");
+    errno = errnoConst("ENOSYS", c.EINVAL);
+    return 0;
 }
 fn longjmp_fallback(env: c.jmp_buf, val: c_int) callconv(.c) noreturn {
     _ = env;
     _ = val;
-    @panic("longjmp not implemented on this platform yet");
+    std.posix.abort();
 }
 comptime {
     if (has_x86_64_setjmp_asm) {

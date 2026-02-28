@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <locale.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -19,6 +20,20 @@ int main(int argc, char *argv[])
   }
 
   expect(7.0 == difftime((time_t)10, (time_t)3));
+
+  {
+    double v;
+    v = acos(1.0);
+    expect(v > -1e-12 && v < 1e-12);
+    v = asin(0.0);
+    expect(v > -1e-12 && v < 1e-12);
+    v = atan(0.0);
+    expect(v > -1e-12 && v < 1e-12);
+    v = atan2(0.0, 1.0);
+    expect(v > -1e-12 && v < 1e-12);
+    v = tan(atan(1.0));
+    expect(v > 0.999999 && v < 1.000001);
+  }
 
   expect(NULL != setlocale(LC_ALL, "C"));
   expect(0 == strcmp("C", setlocale(LC_ALL, "")));
@@ -73,6 +88,28 @@ int main(int argc, char *argv[])
     expect(0 == remove(renamed));
     expect(-1 == remove(renamed));
   }
+
+#ifndef _WIN32
+  {
+    FILE *files[128];
+    size_t count = 0;
+    while (count < (sizeof(files) / sizeof(files[0]))) {
+      FILE *f = fopen("/dev/null", "r");
+      if (f == NULL) {
+        break;
+      }
+      files[count++] = f;
+    }
+    expect(count > 0);
+    errno = 0;
+    expect(NULL == fopen("/dev/null", "r"));
+    expect(ENOMEM == errno);
+    while (count > 0) {
+      --count;
+      expect(0 == fclose(files[count]));
+    }
+  }
+#endif
 
   errno = ENOENT;
   perror("panic_replacements");

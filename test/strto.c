@@ -22,6 +22,18 @@ static void test_ul(const char *str, int base, int expected_errno, size_t parse_
   expect(errno == expected_errno);
   expect(endptr == str + parse_len);
 }
+static void test_d(const char *str, int expected_errno, size_t parse_len, double expected_min, double expected_max)
+{
+  char *endptr;
+  errno = 0;
+  {
+    const double value = strtod(str, &endptr);
+    expect(value >= expected_min);
+    expect(value <= expected_max);
+  }
+  expect(errno == expected_errno);
+  expect(endptr == str + parse_len);
+}
 
 int main(int argc, char *argv[])
 {
@@ -40,6 +52,11 @@ int main(int argc, char *argv[])
 
   test_l("  15437", 8, 0, 7, 015437);
   test_l("  1", 0, 0, 3, 1);
+
+  test_d("12.5xyz", 0, 4, 12.499, 12.501);
+  test_d("  -1.25e2x", 0, 9, -125.001, -124.999);
+  test_d("1e+", 0, 1, 0.999, 1.001);
+  test_d("abc", EINVAL, 0, -0.001, 0.001);
 
   puts("Success!");
   return 0;

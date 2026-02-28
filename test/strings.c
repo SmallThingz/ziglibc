@@ -12,6 +12,9 @@ int main(int argc, char *argv[])
   expect(0 == strcmp("abc", "abc"));
   expect(0 > strcmp("abc", "abd"));
   expect(0 < strcmp("abd", "abc"));
+  expect(0 == strcoll("abc", "abc"));
+  expect(0 > strcoll("abc", "abd"));
+  expect(0 < strcoll("abd", "abc"));
 
   expect(0 == strncmp("abc", "abc", 3));
   expect(0 == strncmp("abc", "abc", 2));

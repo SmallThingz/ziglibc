@@ -51,5 +51,6 @@ export fn __libc_start_main(
 }
 
 export fn __tls_get_addr(ptr: *usize) callconv(.c) *anyopaque {
-    std.debug.panic("__tls_get_addr (ptr={*}) is not implemented", .{ptr});
+    std.log.err("__tls_get_addr (ptr={*}) is not implemented", .{ptr});
+    std.posix.abort();
 }
