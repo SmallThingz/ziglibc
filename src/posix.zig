@@ -1543,6 +1543,9 @@ comptime {
 const FdSetWord = @TypeOf(@as(c.fd_set, undefined).fds_bits[0]);
 const fd_set_word_bits = @bitSizeOf(FdSetWord);
 const fd_set_capacity = @typeInfo(@TypeOf(@as(c.fd_set, undefined).fds_bits)).array.len * fd_set_word_bits;
+const windows_file_type_disk: u32 = 0x0001;
+const windows_file_type_char: u32 = 0x0002;
+const windows_file_type_pipe: u32 = 0x0003;
 
 fn fdSetParts(fd: c_int) ?struct { word: usize, mask: FdSetWord } {
     if (fd < 0 or fd >= fd_set_capacity) return null;
@@ -1573,10 +1576,10 @@ export fn FD_ISSET(fd: c_int, fdset: *c.fd_set) callconv(.c) c_int {
 fn windowsHandleReadable(handle: std.os.windows.HANDLE) ?bool {
     const file_type = winapi.GetFileType(handle);
     switch (file_type) {
-        std.os.windows.FILE_TYPE_DISK,
-        std.os.windows.FILE_TYPE_CHAR,
+        windows_file_type_disk,
+        windows_file_type_char,
         => return true,
-        std.os.windows.FILE_TYPE_PIPE => {
+        windows_file_type_pipe => {
             var available: u32 = 0;
             if (winapi.PeekNamedPipe(handle, null, 0, null, &available, null) != 0) {
                 return available != 0;
@@ -1596,9 +1599,9 @@ fn windowsHandleReadable(handle: std.os.windows.HANDLE) ?bool {
 fn windowsHandleWritable(handle: std.os.windows.HANDLE) ?bool {
     const file_type = winapi.GetFileType(handle);
     switch (file_type) {
-        std.os.windows.FILE_TYPE_DISK,
-        std.os.windows.FILE_TYPE_CHAR,
-        std.os.windows.FILE_TYPE_PIPE,
+        windows_file_type_disk,
+        windows_file_type_char,
+        windows_file_type_pipe,
         => return true,
         else => {
             c.errno = errnoConst("EBADF", c.EINVAL);

@@ -53,16 +53,24 @@ int main(int argc, char *argv[])
 #endif
   }
 
-#ifndef _WIN32
   {
     int status = system(NULL);
     expect(status != 0);
-    status = system("exit 7");
+    status = system(
+#ifdef _WIN32
+      "exit /b 7"
+#else
+      "exit 7"
+#endif
+    );
     expect(status != -1);
+#ifndef _WIN32
     expect((status & 0x7f) == 0);
     expect(7 == ((status >> 8) & 0xff));
+#endif
   }
 
+#ifndef _WIN32
   {
     const char *home = getenv("HOME");
     if (home != NULL && home[0] != '\0') {
@@ -72,10 +80,6 @@ int main(int argc, char *argv[])
       expect(0 == ((status >> 8) & 0xff));
     }
   }
-#else
-  errno = 0;
-  expect(-1 == system(NULL));
-  expect(ENOSYS == errno);
 #endif
 
   puts("Success!");

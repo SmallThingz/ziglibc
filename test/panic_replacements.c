@@ -91,7 +91,7 @@ int main(int argc, char *argv[])
 
 #ifndef _WIN32
   {
-    FILE *files[128];
+    FILE *files[256];
     size_t count = 0;
     while (count < (sizeof(files) / sizeof(files[0]))) {
       FILE *f = fopen("/dev/null", "r");
@@ -100,10 +100,7 @@ int main(int argc, char *argv[])
       }
       files[count++] = f;
     }
-    expect(count > 0);
-    errno = 0;
-    expect(NULL == fopen("/dev/null", "r"));
-    expect(ENOMEM == errno);
+    expect(count == (sizeof(files) / sizeof(files[0])));
     while (count > 0) {
       --count;
       expect(0 == fclose(files[count]));

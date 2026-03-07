@@ -87,7 +87,7 @@ pub fn spawnShell(
         return null;
     }
 
-    _ = windows.kernel32.CloseHandle(process_info.hThread);
+    windows.CloseHandle(process_info.hThread);
     return process_info.hProcess;
 }
 
@@ -96,17 +96,17 @@ pub fn waitProcessStatus(process_handle: windows.HANDLE) c_int {
 
     windows.WaitForSingleObject(process_handle, windows.INFINITE) catch {
         c.errno = winfd.errnoFromWin32(windows.kernel32.GetLastError());
-        _ = windows.kernel32.CloseHandle(process_handle);
+        windows.CloseHandle(process_handle);
         return -1;
     };
 
     var exit_code: windows.DWORD = 0;
     if (windows.kernel32.GetExitCodeProcess(process_handle, &exit_code) == 0) {
         c.errno = winfd.errnoFromWin32(windows.kernel32.GetLastError());
-        _ = windows.kernel32.CloseHandle(process_handle);
+        windows.CloseHandle(process_handle);
         return -1;
     }
 
-    _ = windows.kernel32.CloseHandle(process_handle);
+    windows.CloseHandle(process_handle);
     return @as(c_int, @intCast(exit_code)) << 8;
 }

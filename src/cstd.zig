@@ -960,39 +960,85 @@ const global = struct {
 
     var strtok_ptr: ?[*:0]u8 = undefined;
 
-    // TODO: remove this global limit on file handles
-    //       probably do an array of pages holding the file objects.
-    //       the address to any file can be done in O(1) by decoding
-    //       the page index and file offset
-    const max_file_count = 100;
-    var files_reserved: [max_file_count]bool = [_]bool{ true, true, true } ++ ([_]bool{false} ** (max_file_count - 3));
-    var unread_valid: [max_file_count]bool = [_]bool{false} ** max_file_count;
-    var unread_char: [max_file_count]u8 = [_]u8{0} ** max_file_count;
-    var files: [max_file_count]c.FILE = [_]c.FILE{
-        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDIN_FILENO, .eof = 0, .errno = 0 },
-        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDOUT_FILENO, .eof = 0, .errno = 0 },
-        .{ .fd = if (builtin.os.tag == .windows) undefined else std.posix.STDERR_FILENO, .eof = 0, .errno = 0 },
-    } ++ ([_]c.FILE{.{ .fd = if (builtin.os.tag == .windows) undefined else -1, .eof = 0, .errno = 0 }} ** (max_file_count - 3));
+    const FileEntry = struct {
+        reserved: bool = false,
+        unread_valid: bool = false,
+        unread_char: u8 = 0,
+        file: c.FILE = .{
+            .fd = if (builtin.os.tag == .windows) undefined else -1,
+            .eof = 0,
+            .errno = 0,
+        },
+    };
+    const file_page_len = 64;
+    const FilePage = [file_page_len]FileEntry;
+
+    fn initStaticFilePage() FilePage {
+        var page = [_]FileEntry{FileEntry{}} ** file_page_len;
+        page[0].reserved = true;
+        page[1].reserved = true;
+        page[2].reserved = true;
+        if (builtin.os.tag != .windows) {
+            page[0].file.fd = std.posix.STDIN_FILENO;
+            page[1].file.fd = std.posix.STDOUT_FILENO;
+            page[2].file.fd = std.posix.STDERR_FILENO;
+        }
+        return page;
+    }
+
+    var static_file_page: FilePage = initStaticFilePage();
+    var dynamic_file_pages: std.ArrayListUnmanaged(*FilePage) = .{};
+    var file_pages_mutex = std.Thread.Mutex{};
     var tmpnam_counter: u32 = 0;
     var tmpfile_counter: u32 = 0;
 
-    fn reserveFile() ?*c.FILE {
-        var i: usize = 0;
-        while (i < files_reserved.len) : (i += 1) {
-            if (!@atomicRmw(bool, &files_reserved[i], .Xchg, true, .seq_cst)) {
-                files[i].eof = 0;
-                files[i].errno = 0;
-                unread_valid[i] = false;
-                return &files[i];
-            }
+    fn resetReservedEntry(entry: *FileEntry) *c.FILE {
+        entry.file.eof = 0;
+        entry.file.errno = 0;
+        entry.unread_valid = false;
+        entry.unread_char = 0;
+        return &entry.file;
+    }
+
+    fn reserveInPage(page: *FilePage) ?*c.FILE {
+        for (page) |*entry| {
+            if (entry.reserved) continue;
+            entry.reserved = true;
+            return resetReservedEntry(entry);
         }
         return null;
     }
+
+    fn allocFilePage() ?*FilePage {
+        const page = gpa.allocator().create(FilePage) catch return null;
+        page.* = [_]FileEntry{FileEntry{}} ** file_page_len;
+        return page;
+    }
+
+    fn reserveFile() ?*c.FILE {
+        file_pages_mutex.lock();
+        defer file_pages_mutex.unlock();
+
+        if (reserveInPage(&static_file_page)) |file| return file;
+        for (dynamic_file_pages.items) |page| {
+            if (reserveInPage(page)) |file| return file;
+        }
+
+        const new_page = allocFilePage() orelse return null;
+        dynamic_file_pages.append(gpa.allocator(), new_page) catch {
+            gpa.allocator().destroy(new_page);
+            return null;
+        };
+        return reserveInPage(new_page);
+    }
+
     fn releaseFile(file: *c.FILE) void {
-        const i = (@intFromPtr(file) - @intFromPtr(&files[0])) / @sizeOf(c.FILE);
-        if (i >= files_reserved.len) return;
-        if (!@atomicRmw(bool, &files_reserved[i], .Xchg, false, .seq_cst)) return;
-        unread_valid[i] = false;
+        const entry: *FileEntry = @fieldParentPtr("file", file);
+        file_pages_mutex.lock();
+        defer file_pages_mutex.unlock();
+        entry.unread_valid = false;
+        entry.unread_char = 0;
+        entry.reserved = false;
     }
 
     // TODO: remove this.  Just using it to return error numbers as strings for now
@@ -1040,18 +1086,12 @@ const global = struct {
     };
 };
 
-export const stdin: *c.FILE = &global.files[0];
-export const stdout: *c.FILE = &global.files[1];
-export const stderr: *c.FILE = &global.files[2];
+export const stdin: *c.FILE = &global.static_file_page[0].file;
+export const stdout: *c.FILE = &global.static_file_page[1].file;
+export const stderr: *c.FILE = &global.static_file_page[2].file;
 
-fn fileSlot(stream: *c.FILE) ?usize {
-    const start = @intFromPtr(&global.files[0]);
-    const end = start + @sizeOf(c.FILE) * global.max_file_count;
-    const ptr = @intFromPtr(stream);
-    if (ptr < start or ptr >= end) return null;
-    const off = ptr - start;
-    if (off % @sizeOf(c.FILE) != 0) return null;
-    return off / @sizeOf(c.FILE);
+fn entryFromFile(stream: *c.FILE) *global.FileEntry {
+    return @fieldParentPtr("file", stream);
 }
 
 // used by posix.zig
@@ -1136,11 +1176,10 @@ export fn getchar() callconv(.c) c_int {
 
 export fn getc(stream: *c.FILE) callconv(.c) c_int {
     trace.log("getc {*}", .{stream});
-    if (fileSlot(stream)) |slot| {
-        if (global.unread_valid[slot]) {
-            global.unread_valid[slot] = false;
-            return global.unread_char[slot];
-        }
+    const entry = entryFromFile(stream);
+    if (entry.unread_valid) {
+        entry.unread_valid = false;
+        return entry.unread_char;
     }
     if (stream.eof != 0) return c.EOF;
 
@@ -1174,18 +1213,14 @@ export fn fgetc(stream: *c.FILE) callconv(.c) c_int {
 
 export fn ungetc(char: c_int, stream: *c.FILE) callconv(.c) c_int {
     if (char == c.EOF) return c.EOF;
-    const slot = fileSlot(stream) orelse {
-        errno = c.EINVAL;
-        stream.errno = errno;
-        return c.EOF;
-    };
-    if (global.unread_valid[slot]) {
+    const entry = entryFromFile(stream);
+    if (entry.unread_valid) {
         errno = c.EINVAL;
         stream.errno = errno;
         return c.EOF;
     }
-    global.unread_valid[slot] = true;
-    global.unread_char[slot] = @as(u8, @intCast(char & 0xff));
+    entry.unread_valid = true;
+    entry.unread_char = @as(u8, @intCast(char & 0xff));
     stream.eof = 0;
     stream.errno = 0;
     return char & 0xff;
@@ -1195,13 +1230,12 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
     // TODO: should I check stream.eof here?
     if (size == 0) return 0;
     var prefilled: usize = 0;
-    if (fileSlot(stream)) |slot| {
-        if (global.unread_valid[slot]) {
-            ptr[0] = global.unread_char[slot];
-            global.unread_valid[slot] = false;
-            prefilled = 1;
-            if (size == 1) return 1;
-        }
+    const entry = entryFromFile(stream);
+    if (entry.unread_valid) {
+        ptr[0] = entry.unread_char;
+        entry.unread_valid = false;
+        prefilled = 1;
+        if (size == 1) return 1;
     }
     const remaining = size - prefilled;
     const dest = ptr + prefilled;
@@ -1250,12 +1284,8 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
 }
 
 export fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
-    if (stream.eof != 0) {
-        if (fileSlot(stream)) |slot| {
-            if (!global.unread_valid[slot]) return 0;
-        } else {
-            return 0;
-        }
+    if (stream.eof != 0 and !entryFromFile(stream).unread_valid) {
+        return 0;
     }
     const total = size * nmemb;
     const result = _fread_buf(ptr, total, stream);
@@ -1425,8 +1455,8 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
     stream.fd = new_stream.fd;
     stream.eof = 0;
     stream.errno = 0;
-    if (fileSlot(stream)) |slot| global.unread_valid[slot] = false;
-    if (fileSlot(new_stream)) |slot| global.unread_valid[slot] = false;
+    entryFromFile(stream).unread_valid = false;
+    entryFromFile(new_stream).unread_valid = false;
     if (new_stream != stream) global.releaseFile(new_stream);
     return stream;
 }
@@ -1482,7 +1512,7 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
     };
     stream.eof = 0;
     stream.errno = 0;
-    if (fileSlot(stream)) |slot| global.unread_valid[slot] = false;
+    entryFromFile(stream).unread_valid = false;
     return 0;
 }
 
