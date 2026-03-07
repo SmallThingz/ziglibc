@@ -6,6 +6,7 @@ const c = @cImport({
     // problem with LONG_MIN/LONG_MAX, they are currently assuming 64 bit
     //@cInclude("limits.h");
     @cInclude("errno.h");
+    @cInclude("fcntl.h");
     @cInclude("stdarg.h");
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
@@ -13,14 +14,96 @@ const c = @cImport({
     @cInclude("locale.h");
     @cInclude("time.h");
     @cInclude("signal.h");
+    @cInclude("unistd.h");
     @cInclude("limits.h");
 });
 
 const trace = @import("trace.zig");
 
+extern "c" fn __error() *c_int;
+extern "c" fn syscall(number: c_long, ...) c_long;
+extern "c" fn @"open$NOCANCEL"(path: [*:0]const u8, oflag: c_int, ...) c_int;
+
+const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
+    const unlink: c_long = 10;
+    const rename: c_long = 128;
+} else struct {};
+
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
     if (@hasDecl(c, name)) return @field(c, name);
     return fallback;
+}
+
+fn translateDarwinOpenFlags(oflag: c_int) c_int {
+    if (comptime !builtin.os.tag.isDarwin()) return oflag;
+
+    var flags: std.c.O = .{};
+    switch (oflag & 0x3) {
+        c.O_RDONLY => flags.ACCMODE = .RDONLY,
+        c.O_WRONLY => flags.ACCMODE = .WRONLY,
+        c.O_RDWR => flags.ACCMODE = .RDWR,
+        else => {
+            errno = c.EINVAL;
+            return -1;
+        },
+    }
+    if ((oflag & c.O_APPEND) != 0) flags.APPEND = true;
+    if ((oflag & c.O_CREAT) != 0) flags.CREAT = true;
+    if ((oflag & c.O_EXCL) != 0) flags.EXCL = true;
+    if ((oflag & c.O_TRUNC) != 0) flags.TRUNC = true;
+    if ((oflag & c.O_NONBLOCK) != 0) flags.NONBLOCK = true;
+    if (@hasDecl(c, "O_CLOEXEC") and (oflag & c.O_CLOEXEC) != 0) flags.CLOEXEC = true;
+    return @as(c_int, @bitCast(@as(u32, @bitCast(flags))));
+}
+
+fn zopenCompat(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
+    if (builtin.os.tag.isDarwin()) {
+        const darwin_flags = translateDarwinOpenFlags(oflag);
+        if (darwin_flags == -1) return -1;
+        const rc = @"open$NOCANCEL"(path, darwin_flags, mode);
+        if (rc == -1) errno = __error().*;
+        return rc;
+    }
+
+    const flags_bits: u32 = @bitCast(oflag);
+    const flags: std.posix.O = @bitCast(flags_bits);
+    const rc = std.posix.system.open(path, flags, @as(std.posix.mode_t, @intCast(mode)));
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return @as(c_int, @intCast(rc)),
+        else => |e| {
+            errno = @intFromEnum(e);
+            return -1;
+        },
+    }
+}
+
+fn zunlinkCompat(path: [*:0]const u8) c_int {
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.unlink, path);
+        if (rc == -1) errno = __error().*;
+        return @as(c_int, @intCast(rc));
+    }
+
+    std.posix.unlinkZ(path) catch |err| {
+        errno = switch (err) {
+            error.AccessDenied => c.EACCES,
+            error.PermissionDenied => c.EPERM,
+            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+            error.FileSystem => errnoConst("EIO", c.EINVAL),
+            error.IsDir => errnoConst("EISDIR", c.EINVAL),
+            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+            error.FileNotFound => c.ENOENT,
+            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+            error.SystemResources => c.ENOMEM,
+            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
+            error.NetworkNotFound => c.ENOENT,
+            else => errnoConst("EIO", c.EINVAL),
+        };
+        return -1;
+    };
+    return 0;
 }
 
 // __main appears to be a design inherited by LLVM from gcc.
@@ -766,18 +849,28 @@ export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
         errno = c.EINVAL;
         return sig_err;
     }
-    var action = std.posix.Sigaction{
-        .handler = .{ .handler = func },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
-        .flags = std.posix.SA.RESTART,
-    };
+    if (builtin.os.tag.isDarwin()) {
+        var action = std.mem.zeroes(c.struct_sigaction);
+        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrCast(func));
+        action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
+
+        var old_action = std.mem.zeroes(c.struct_sigaction);
+        if (c.sigaction(sig, &action, &old_action) != 0) {
+            return sig_err;
+        }
+        return @as(?SignalFn, @ptrCast(old_action.sa_handler));
+    }
+    var action = std.mem.zeroes(c.struct_sigaction);
+    action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrCast(func));
+    action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
+
     var old_action: std.posix.Sigaction = undefined;
     switch (std.posix.errno(std.posix.system.sigaction(
         @as(u6, @intCast(sig)),
-        &action,
+        @ptrCast(&action),
         &old_action,
     ))) {
-        .SUCCESS => return old_action.handler.handler,
+        .SUCCESS => return @as(?SignalFn, @ptrCast(old_action.handler.handler)),
         else => |e| {
             errno = @intFromEnum(e);
             return sig_err;
@@ -900,6 +993,14 @@ export fn __zreserveFile() callconv(.c) ?*c.FILE {
 
 export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
     trace.log("remove {f}", .{trace.fmtStr(filename)});
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.unlink, filename);
+        if (rc == -1) {
+            errno = __error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.unlinkZ(filename) catch |err| {
         errno = switch (err) {
             error.AccessDenied => c.EACCES,
@@ -924,6 +1025,14 @@ export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
 
 export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
     trace.log("rename {f} {f}", .{ trace.fmtStr(old), trace.fmtStr(new) });
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.rename, old, new);
+        if (rc == -1) {
+            errno = __error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.renameZ(old, new) catch |err| {
         errno = switch (err) {
             error.AccessDenied => c.EACCES,
@@ -1193,33 +1302,28 @@ fn fopenImpl(
         return file;
     }
 
-    var flags = std.posix.O{};
-    flags.ACCMODE = switch (parsed.kind) {
-        .read => if (parsed.plus) .RDWR else .RDONLY,
-        .write, .append => if (parsed.plus) .RDWR else .WRONLY,
+    var flags: c_int = switch (parsed.kind) {
+        .read => if (parsed.plus) c.O_RDWR else c.O_RDONLY,
+        .write, .append => if (parsed.plus) c.O_RDWR else c.O_WRONLY,
     };
-    flags.CREAT = parsed.kind != .read;
-    flags.TRUNC = parsed.kind == .write;
-    flags.APPEND = parsed.kind == .append;
-    flags.EXCL = parsed.excl;
-    if (force_largefile and @hasField(@TypeOf(flags), "LARGEFILE")) {
-        flags.LARGEFILE = true;
+    if (parsed.kind != .read) flags |= c.O_CREAT;
+    if (parsed.kind == .write) flags |= c.O_TRUNC;
+    if (parsed.kind == .append) flags |= c.O_APPEND;
+    if (parsed.excl) flags |= c.O_EXCL;
+    if (force_largefile and @hasDecl(c, "O_LARGEFILE")) {
+        flags |= c.O_LARGEFILE;
     }
-    const fd = std.posix.system.open(filename, @bitCast(flags), @as(std.posix.mode_t, 0o666));
-    switch (std.posix.errno(fd)) {
-        .SUCCESS => {},
-        else => |e| {
-            errno = @intFromEnum(e);
-            trace.log("{s} return null (errno={})", .{ func_name, errno });
-            return null;
-        },
+    const fd = zopenCompat(filename, flags, 0o666);
+    if (fd < 0) {
+        trace.log("{s} return null (errno={})", .{ func_name, errno });
+        return null;
     }
     const file = global.reserveFile() orelse {
-        _ = std.posix.system.close(@as(c_int, @intCast(fd)));
+        _ = std.posix.system.close(fd);
         errno = c.ENOMEM;
         return null;
     };
-    file.fd = @as(c_int, @intCast(fd));
+    file.fd = fd;
     file.eof = 0;
     return file;
 }
@@ -1988,33 +2092,24 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
         const name = std.fmt.bufPrint(name_buf[0 .. name_buf.len - 1], "tmpfile-{x:0>8}", .{id}) catch unreachable;
         name_buf[name.len] = 0;
 
-        var flags = std.posix.O{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-            .EXCL = true,
-        };
-        if (@hasField(@TypeOf(flags), "LARGEFILE")) flags.LARGEFILE = true;
+        var flags: c_int = c.O_RDWR | c.O_CREAT | c.O_EXCL;
+        if (@hasDecl(c, "O_LARGEFILE")) flags |= c.O_LARGEFILE;
 
-        const fd = std.posix.system.open(&name_buf, @bitCast(flags), @as(std.posix.mode_t, 0o600));
-        switch (std.posix.errno(fd)) {
-            .SUCCESS => {
-                _ = std.posix.system.unlink(&name_buf);
-                const file = global.reserveFile() orelse {
-                    _ = std.posix.system.close(@as(c_int, @intCast(fd)));
-                    errno = c.ENOMEM;
-                    return null;
-                };
-                file.fd = @as(c_int, @intCast(fd));
-                file.eof = 0;
-                file.errno = 0;
-                return file;
-            },
-            .EXIST => continue,
-            else => |e| {
-                errno = @intFromEnum(e);
+        const fd = zopenCompat(&name_buf, flags, 0o600);
+        if (fd >= 0) {
+            _ = zunlinkCompat(&name_buf);
+            const file = global.reserveFile() orelse {
+                _ = std.posix.system.close(fd);
+                errno = c.ENOMEM;
                 return null;
-            },
+            };
+            file.fd = fd;
+            file.eof = 0;
+            file.errno = 0;
+            return file;
         }
+        if (errno == c.EEXIST) continue;
+        return null;
     }
     errno = c.EEXIST;
     return null;

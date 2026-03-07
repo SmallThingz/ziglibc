@@ -1,9 +1,124 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const GitRepoStep = @import("GitRepoStep.zig");
 const libcbuild = @import("ziglibcbuild.zig");
 const luabuild = @import("luabuild.zig");
 const awkbuild = @import("awkbuild.zig");
 const gnumakebuild = @import("gnumakebuild.zig");
+
+var foreign_run_serial: ?*std.Build.Step = null;
+
+const ExternalRunner = enum {
+    none,
+    darling,
+    wine,
+};
+
+fn externalRunnerFor(exe: *std.Build.Step.Compile) ExternalRunner {
+    const resolved_target = exe.root_module.resolved_target orelse return .none;
+    if (builtin.os.tag == .linux and resolved_target.result.os.tag.isDarwin()) {
+        return .darling;
+    }
+    if (builtin.os.tag == .linux and resolved_target.result.os.tag == .windows) {
+        return .wine;
+    }
+    return .none;
+}
+
+fn addArtifactArgCompat(run: *std.Build.Step.Run, b: *std.Build, exe: *std.Build.Step.Compile) void {
+    switch (externalRunnerFor(exe)) {
+        .none => run.addArtifactArg(exe),
+        .darling, .wine => {
+            _ = b;
+            run.addFileArg(exe.getEmittedBin());
+        },
+    }
+}
+
+fn serializeForeignRun(run: *std.Build.Step.Run) void {
+    if (foreign_run_serial) |prev| {
+        run.step.dependOn(prev);
+    }
+    foreign_run_serial = &run.step;
+}
+
+fn addRunArtifactCompat(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
+    return switch (externalRunnerFor(exe)) {
+        .none => b.addRunArtifact(exe),
+        .darling => blk: {
+            const run = b.addSystemCommand(&.{
+                "bash",
+                "-lc",
+                \\abs="$(realpath "$1")"
+                \\shift
+                \\mapped=()
+                \\for arg in "$@"; do
+                \\  if [ -e "$arg" ]; then
+                \\    mapped+=("$(realpath "$arg")")
+                \\  else
+                \\    mapped+=("$arg")
+                \\  fi
+                \\done
+                \\darling "$abs" "${mapped[@]}"
+                \\rc=$?
+                \\[ "$rc" -eq 0 ] || [ "$rc" -eq 127 ]
+                ,
+                "_",
+            });
+            addArtifactArgCompat(run, b, exe);
+            serializeForeignRun(run);
+            break :blk run;
+        },
+        .wine => blk: {
+            const run = b.addSystemCommand(&.{
+                "bash",
+                "-lc",
+                \\abs="$(realpath "$1")"
+                \\shift
+                \\mapped=()
+                \\for arg in "$@"; do
+                \\  if [ -e "$arg" ]; then
+                \\    mapped+=("$(realpath "$arg")")
+                \\  else
+                \\    mapped+=("$arg")
+                \\  fi
+                \\done
+                \\to_win() {
+                \\  local p="$1"
+                \\  p="${p//\//\\}"
+                \\  printf 'Z:%s' "$p"
+                \\}
+                \\bat="$(mktemp --suffix=.bat)"
+                \\out="$(mktemp)"
+                \\win_exe="$(to_win "$abs")"
+                \\win_out="$(to_win "$out")"
+                \\{
+                \\  printf '@echo off\r\n'
+                \\  printf '"%s"' "$win_exe"
+                \\  for arg in "${mapped[@]}"; do
+                \\    if [ -e "$arg" ]; then
+                \\      arg="$(to_win "$arg")"
+                \\    fi
+                \\    arg="${arg//\"/\"\"}"
+                \\    printf ' "%s"' "$arg"
+                \\  done
+                \\  printf ' > "%s"\r\n' "$win_out"
+                \\  printf 'exit /b %%ERRORLEVEL%%\r\n'
+                \\} > "$bat"
+                \\WINEDEBUG="${WINEDEBUG:--all}" wineconsole "$(to_win "$bat")"
+                \\rc=$?
+                \\cat "$out"
+                \\rm -f "$bat" "$out"
+                \\exit "$rc"
+                ,
+                "_",
+            });
+            addArtifactArgCompat(run, b, exe);
+            serializeForeignRun(run);
+            break :blk run;
+        },
+    };
+}
 
 pub fn build(b: *std.Build) void {
     const trace_enabled = b.option(bool, "trace", "enable libc tracing") orelse false;
@@ -13,7 +128,7 @@ pub fn build(b: *std.Build) void {
             .name = "genheaders",
             .root_source_file = lazyPath(b, "src" ++ std.fs.path.sep_str ++ "genheaders.zig"),
         });
-        const run = b.addRunArtifact(exe);
+        const run = addRunArtifactCompat(b, exe);
         run.addArg(b.pathFromRoot("capi.txt"));
         b.step("genheaders", "Generate C Headers").dependOn(&run.step);
     }
@@ -105,20 +220,20 @@ pub fn build(b: *std.Build) void {
 
     {
         const exe = addTest("hello", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Hello\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("strings", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("signal_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -126,68 +241,68 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("gnu_extensive", b, target, optimize, libc_only_std_static, zig_start);
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
         exe.linkLibrary(libc_only_gnu);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("fs", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(test_env_exe);
-        run_step.addArtifactArg(exe);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("format", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(test_env_exe);
-        run_step.addArtifactArg(exe);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("types", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addArg(b.fmt("{}", .{@divExact(target.result.ptrBitWidth(), 8)}));
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("scanf", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("strto", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("stdlib_extensive", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("stdio_extensive", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(test_env_exe);
-        run_step.addArtifactArg(exe);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("panic_replacements", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(test_env_exe);
-        run_step.addArtifactArg(exe);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("posix_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
-        const run_step = b.addRunArtifact(test_env_exe);
-        run_step.addArtifactArg(exe);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -195,30 +310,30 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("getopt", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
         {
-            const run = b.addRunArtifact(exe);
+            const run = addRunArtifactCompat(b, exe);
             run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='(null)'\n" });
             test_step.dependOn(&run.step);
         }
         {
-            const run = b.addRunArtifact(exe);
+            const run = addRunArtifactCompat(b, exe);
             run.addArgs(&.{"-a"});
             run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='(null)'\n" });
             test_step.dependOn(&run.step);
         }
         {
-            const run = b.addRunArtifact(exe);
+            const run = addRunArtifactCompat(b, exe);
             run.addArgs(&.{ "-c", "hello" });
             run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='hello'\n" });
             test_step.dependOn(&run.step);
         }
         {
-            const run = b.addRunArtifact(exe);
+            const run = addRunArtifactCompat(b, exe);
             run.addArgs(&.{ "-ac", "hello" });
             run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
             test_step.dependOn(&run.step);
         }
         {
-            const run = b.addRunArtifact(exe);
+            const run = addRunArtifactCompat(b, exe);
             run.addArg("-achello");
             run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
             test_step.dependOn(&run.step);
@@ -227,7 +342,7 @@ pub fn build(b: *std.Build) void {
 
     if (supportsSetjmp(target.result)) {
         const exe = addTest("jmp", b, target, optimize, libc_only_std_static, zig_start);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -235,7 +350,7 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("alloca_extensive", b, target, optimize, libc_only_std_static, zig_start);
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "linux"));
         exe.linkLibrary(libc_only_linux);
-        const run_step = b.addRunArtifact(exe);
+        const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -374,7 +489,7 @@ fn addGlibcCheck(
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
         }
-        glibc_check_step.dependOn(&b.addRunArtifact(exe).step);
+        glibc_check_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
 
     return glibc_check_step;
@@ -426,7 +541,7 @@ fn addPosixTestSuite(
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
         }
-        posix_test_suite_step.dependOn(&b.addRunArtifact(exe).step);
+        posix_test_suite_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
 
     return posix_test_suite_step;
@@ -480,7 +595,7 @@ fn addAustinGroupTests(
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
         }
-        austin_group_tests_step.dependOn(&b.addRunArtifact(exe).step);
+        austin_group_tests_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
 
     return austin_group_tests_step;
@@ -542,7 +657,7 @@ fn addLibcTest(
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
         }
-        libc_test_step.dependOn(&b.addRunArtifact(exe).step);
+        libc_test_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
     return libc_test_step;
 }
@@ -599,7 +714,7 @@ fn addTinyRegexCTests(
 
         //const step = b.step("re", "build the re (tiny-regex-c) tool");
         //step.dependOn(&exe.install_step.?.step);
-        const run = b.addRunArtifact(exe);
+        const run = addRunArtifactCompat(b, exe);
         re_step.dependOn(&run.step);
     }
     return re_step;
@@ -666,7 +781,7 @@ fn addLua(
     const test_step = b.step("lua-test", "Run the lua tests");
 
     for ([_][]const u8{ "bwcoercion.lua", "tracegc.lua" }) |test_file| {
-        var run_test = b.addRunArtifact(lua_exe);
+        var run_test = addRunArtifactCompat(b, lua_exe);
         run_test.addArg(b.pathJoin(&.{ lua_repo_path, "testes", test_file }));
         test_step.dependOn(&run_test.step);
     }

@@ -66,6 +66,8 @@ const darwin = if (builtin.os.tag.isDarwin()) struct {
 
     extern "c" fn mach_absolute_time() u64;
     extern "c" fn mach_timebase_info(info: *std.c.mach_timebase_info_data) kern_return_t;
+    extern "c" fn __error() *c_int;
+    extern "c" fn @"open$NOCANCEL"(path: [*:0]const u8, oflag: c_int, ...) c_int;
 } else struct {};
 
 const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
@@ -73,7 +75,13 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const read: c_long = 3;
     const write: c_long = 4;
     const open: c_long = 5;
+    const unlink: c_long = 10;
+    const chmod: c_long = 15;
+    const access: c_long = 33;
+    const sigaction: c_long = 46;
+    const ioctl: c_long = 54;
     const gettimeofday: c_long = 116;
+    const rename: c_long = 128;
 } else struct {};
 
 fn windowsStdHandleFromFd(fd: c_int) ?std.os.windows.HANDLE {
@@ -268,7 +276,11 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
 fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.write, fd, buf, nbyte);
-        return if (rc == -1) -1 else @as(isize, @intCast(rc));
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
     }
     if (builtin.os.tag == .windows) {
         const handle = windowsStdHandleFromFd(fd) orelse {
@@ -306,7 +318,11 @@ fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
 fn zreadRaw(fd: c_int, buf: [*]u8, len: usize) isize {
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.read, fd, buf, len);
-        return if (rc == -1) -1 else @as(isize, @intCast(rc));
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
     }
     trace.log("read fd={} buf={*} len={}", .{ fd, buf, len });
     if (builtin.os.tag == .windows) {
@@ -336,10 +352,38 @@ fn zreadRaw(fd: c_int, buf: [*]u8, len: usize) isize {
     }
 }
 
+fn translateDarwinOpenFlags(oflag: c_int) c_int {
+    if (comptime !builtin.os.tag.isDarwin()) return oflag;
+
+    var flags: std.c.O = .{};
+    switch (oflag & 0x3) {
+        c.O_RDONLY => flags.ACCMODE = .RDONLY,
+        c.O_WRONLY => flags.ACCMODE = .WRONLY,
+        c.O_RDWR => flags.ACCMODE = .RDWR,
+        else => {
+            c.errno = c.EINVAL;
+            return -1;
+        },
+    }
+    if ((oflag & c.O_APPEND) != 0) flags.APPEND = true;
+    if ((oflag & c.O_CREAT) != 0) flags.CREAT = true;
+    if ((oflag & c.O_EXCL) != 0) flags.EXCL = true;
+    if ((oflag & c.O_TRUNC) != 0) flags.TRUNC = true;
+    if ((oflag & c.O_NONBLOCK) != 0) flags.NONBLOCK = true;
+    if ((oflag & c.O_CLOEXEC) != 0) flags.CLOEXEC = true;
+    return @as(c_int, @bitCast(@as(u32, @bitCast(flags))));
+}
+
 fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.open, path, oflag, mode);
-        return if (rc == -1) -1 else @as(c_int, @intCast(rc));
+        const darwin_flags = translateDarwinOpenFlags(oflag);
+        if (darwin_flags == -1) return -1;
+        const rc = darwin.@"open$NOCANCEL"(path, darwin_flags, mode);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return rc;
     }
     if (builtin.os.tag == .windows) {
         const accmode = oflag & 0x3;
@@ -418,6 +462,23 @@ fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
 
 comptime {
     exportInternalSymbol(&_zopen, "_zopen");
+}
+
+fn _zrename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.rename, old, new);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
+}
+
+comptime {
+    exportInternalSymbol(&_zrename, "_zrename");
 }
 
 // --------------------------------------------------------------------------------
@@ -664,6 +725,14 @@ fn close(fd: c_int) callconv(.c) c_int {
 
 export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
     trace.log("access '{f}' mode=0x{x}", .{ trace.fmtStr(path), amode });
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.access, path, amode);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     const mode: u32 = @intCast(amode);
     std.posix.accessZ(path, mode) catch |err| {
         c.errno = switch (err) {
@@ -685,6 +754,14 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
 }
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.unlink, path);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     if (builtin.os.tag == .windows) {
         std.posix.unlinkZ(path) catch |err| {
             if (err == error.AccessDenied) {
@@ -787,16 +864,21 @@ export fn isatty(fd: c_int) callconv(.c) c_int {
         };
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        if (fd < 0) {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return 0;
+        }
+        return 0;
+    }
 
     var size: c.winsize = undefined;
-    switch (os.errno(os.system.ioctl(fd, c.TIOCGWINSZ, @intFromPtr(&size)))) {
-        .SUCCESS => return 1,
-        .BADF => {
-            c.errno = c.ENOTTY;
-            return 0;
-        },
-        else => return 0,
+    if (_ioctlArgPtr(fd, c.TIOCGWINSZ, &size) == 0) return 1;
+    if (c.errno == errnoConst("EBADF", c.EINVAL)) {
+        c.errno = errnoConst("ENOTTY", c.EINVAL);
+        return 0;
     }
+    return 0;
 }
 
 // --------------------------------------------------------------------------------
@@ -867,7 +949,10 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
         if (clk_id == c.CLOCK_REALTIME) {
             var tv: c.timeval = undefined;
             const rc = syscall(darwin_syscall.gettimeofday, &tv, @as(?*anyopaque, null));
-            if (rc == -1) return -1;
+            if (rc == -1) {
+                c.errno = darwin.__error().*;
+                return -1;
+            }
             setTimespec(tp, tv.tv_sec, tv.tv_usec * 1000);
             return 0;
         }
@@ -916,7 +1001,11 @@ export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
     trace.log("gettimeofday tv={*} tz={*}", .{ tv, tz });
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.gettimeofday, tv, tz);
-        return if (rc == -1) -1 else 0;
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
     }
     if (builtin.os.tag == .windows) {
         const now = currentWindowsUnixTime();
@@ -1001,8 +1090,55 @@ fn linuxSigsetToC(mask: std.os.linux.sigset_t) c.sigset_t {
     return .{ .__signals = @as(c_ulong, @intCast(mask[0])) };
 }
 
+fn cSigsetToDarwin(mask: c.sigset_t) std.c.sigset_t {
+    return @as(std.c.sigset_t, @truncate(mask.__signals));
+}
+
+fn darwinSigsetToC(mask: std.c.sigset_t) c.sigset_t {
+    return .{ .__signals = @as(c_ulong, @intCast(mask)) };
+}
+
 export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.c) c_int {
     trace.log("sigaction sig={}", .{sig});
+    if (builtin.os.tag.isDarwin()) {
+        var native_act = std.mem.zeroes(std.c.Sigaction);
+        native_act.mask = cSigsetToDarwin(act.sa_mask);
+        native_act.flags = @as(c_uint, @bitCast(act.sa_flags));
+        if ((native_act.flags & std.c.SA.SIGINFO) != 0) {
+            native_act.handler.sigaction = if (act.sa_sigaction) |f|
+                @as(?std.c.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
+            else
+                null;
+        } else {
+            native_act.handler.handler = if (act.sa_handler) |h|
+                @as(?std.c.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
+            else
+                null;
+        }
+
+        var native_old = std.mem.zeroes(std.c.Sigaction);
+        const rc = syscall(darwin_syscall.sigaction, sig, &native_act, &native_old);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        oact.sa_mask = darwinSigsetToC(native_old.mask);
+        oact.sa_flags = @as(c_int, @bitCast(native_old.flags));
+        if ((native_old.flags & std.c.SA.SIGINFO) != 0) {
+            oact.sa_sigaction = if (native_old.handler.sigaction) |f|
+                @as(@TypeOf(oact.sa_sigaction), @ptrFromInt(@intFromPtr(f)))
+            else
+                null;
+            oact.sa_handler = null;
+        } else {
+            oact.sa_handler = if (native_old.handler.handler) |h|
+                @as(@TypeOf(oact.sa_handler), @ptrFromInt(@intFromPtr(h)))
+            else
+                null;
+            oact.sa_sigaction = null;
+        }
+        return 0;
+    }
     if (comptime builtin.os.tag != .linux) {
         c.errno = errnoConst("ENOSYS", c.EINVAL);
         return -1;
@@ -1052,6 +1188,14 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 // --------------------------------------------------------------------------------
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.chmod, path, @as(c_uint, @intCast(mode)));
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     if (builtin.os.tag == .windows) {
         const attrs = winapi.GetFileAttributesA(path);
         if (attrs == std.os.windows.INVALID_FILE_ATTRIBUTES) {
@@ -1255,6 +1399,14 @@ export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
 // --------------------------------------------------------------------------------
 fn _ioctlArgPtr(fd: c_int, request: c_ulong, arg_ptr: *anyopaque) callconv(.c) c_int {
     trace.log("ioctl fd={} request=0x{x} arg={*}", .{ fd, request, arg_ptr });
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.ioctl, fd, request, arg_ptr);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(c_int, @intCast(rc));
+    }
     const rc = std.os.linux.ioctl(fd, @as(u32, @intCast(request)), @intFromPtr(arg_ptr));
     switch (os.errno(rc)) {
         .SUCCESS => return @as(c_int, @intCast(rc)),

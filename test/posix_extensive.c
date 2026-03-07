@@ -96,6 +96,7 @@ int main(int argc, char *argv[])
       expect(0 == pclose(p));
     }
   }
+
 #else
   {
     const char *name = "posix-win-chmod.tmp";
