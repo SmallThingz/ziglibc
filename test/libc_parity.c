@@ -6,6 +6,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if LIBC_PARITY_HAVE_POSIX_IO
+#include <fcntl.h>
+#include <sys/uio.h>
+#endif
+
 #if LIBC_PARITY_HAVE_SETITIMER
 #include <sys/time.h>
 #endif
@@ -224,6 +229,95 @@ int main(void)
   }
 #else
   printf("utimes-basic:skip|");
+#endif
+
+#if LIBC_PARITY_HAVE_POSIX_IO
+  {
+    char host[256];
+    memset(host, 0, sizeof(host));
+    if (gethostname(host, sizeof(host)) == 0) {
+      printf("gethostname:%s|", host);
+    } else {
+      printf("gethostname:err:%d|", errno);
+    }
+  }
+
+  {
+    const char *path = "libc-parity-openat.tmp";
+    int fd = openat(AT_FDCWD, path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    struct stat st;
+    if (fd >= 0) {
+      write(fd, "xy", 2);
+      close(fd);
+      if (stat(path, &st) == 0) {
+        printf("openat-size:%ld|", (long)st.st_size);
+      } else {
+        printf("openat-size:stat-failed|");
+      }
+      unlink(path);
+    } else {
+      printf("openat-size:open-failed:%d|", errno);
+    }
+  }
+
+  {
+    const char *src = "libc-parity-link-src.tmp";
+    const char *dst = "libc-parity-link-dst.tmp";
+    FILE *f = fopen(src, "w");
+    if (f != NULL) {
+      fclose(f);
+      errno = 0;
+      printf("link-basic:%d:%d|", link(src, dst), errno);
+      unlink(dst);
+      unlink(src);
+    } else {
+      printf("link-basic:open-failed|");
+    }
+  }
+
+  {
+    const char *path = "libc-parity-uio.tmp";
+    struct iovec out[2];
+    struct iovec in[2];
+    char left[3];
+    char right[3];
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    out[0].iov_base = (void *)"ab";
+    out[0].iov_len = 2;
+    out[1].iov_base = (void *)"cd";
+    out[1].iov_len = 2;
+    memset(left, 0, sizeof(left));
+    memset(right, 0, sizeof(right));
+    if (fd >= 0) {
+      printf("writev-basic:%ld:", (long)writev(fd, out, 2));
+      close(fd);
+      fd = open(path, O_RDONLY);
+      in[0].iov_base = left;
+      in[0].iov_len = 2;
+      in[1].iov_base = right;
+      in[1].iov_len = 2;
+      printf("%ld:%s%s|", fd >= 0 ? (long)readv(fd, in, 2) : -1L, left, right);
+      if (fd >= 0) close(fd);
+      unlink(path);
+    } else {
+      printf("writev-basic:open-failed|");
+    }
+  }
+
+  {
+    FILE *f = fopen("libc-parity-pathconf.tmp", "w");
+    if (f != NULL) {
+      long pc = pathconf(".", _PC_LINK_MAX);
+      long fpc = fpathconf(fileno(f), _PC_LINK_MAX);
+      printf("pathconf-basic:%d:%d|", pc > 0, fpc > 0);
+      fclose(f);
+      unlink("libc-parity-pathconf.tmp");
+    } else {
+      printf("pathconf-basic:open-failed|");
+    }
+  }
+#else
+  printf("gethostname:skip|openat-size:skip|link-basic:skip|writev-basic:skip|pathconf-basic:skip|");
 #endif
 
   return 0;

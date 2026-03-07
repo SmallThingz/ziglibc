@@ -1,6 +1,8 @@
 #ifndef _GLOB_H
 #define _GLOB_H
 
+#include "../libc/private/size_t.h"
+
 typedef struct {
     size_t gl_pathc;
     char **gl_pathv;

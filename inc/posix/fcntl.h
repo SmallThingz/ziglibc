@@ -11,6 +11,11 @@
 #define O_NONBLOCK    04000
 #define O_CLOEXEC  02000000
 #define O_EXEC    010000000
+#ifdef __APPLE__
+#define AT_FDCWD (-2)
+#else
+#define AT_FDCWD (-100)
+#endif
 
 int open(const char *path, int oflag, ...);
 int openat(int fd, const char *path, int oflag, ...);

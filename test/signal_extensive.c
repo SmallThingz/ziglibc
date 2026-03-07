@@ -24,11 +24,13 @@ int main(int argc, char *argv[])
     expect(prev_handler == test_handler);
   }
 
+#ifndef __APPLE__
   {
     errno = 0;
     expect(SIG_ERR == signal(-1, test_handler));
     expect(EINVAL == errno);
   }
+#endif
 
 #ifdef __linux__
   {

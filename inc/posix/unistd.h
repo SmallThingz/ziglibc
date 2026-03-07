@@ -6,6 +6,7 @@
 #include "private/ssize_t.h"
 #include "private/off_t.h"
 
+#define F_OK 0
 #define X_OK 1
 #define R_OK 4
 int access(const char *path, int amode);

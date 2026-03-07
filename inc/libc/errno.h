@@ -18,6 +18,7 @@ extern int errno;
     #define EPERM 1
     #define ENOENT 2
     #define EINTR 4
+    #define EBADF 9
     #ifdef __APPLE__
         #define EAGAIN 35
     #else

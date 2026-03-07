@@ -1,0 +1,41 @@
+const std = @import("std");
+
+const c = @cImport({
+    @cInclude("pthread.h");
+});
+
+const State = struct {
+    mutex: c.pthread_mutex_t = c.PTHREAD_MUTEX_INITIALIZER,
+    cond: c.pthread_cond_t = c.PTHREAD_COND_INITIALIZER,
+    ready: bool = false,
+};
+
+fn worker(state: *State) void {
+    _ = c.pthread_mutex_lock(&state.mutex);
+    state.ready = true;
+    _ = c.pthread_cond_signal(&state.cond);
+    _ = c.pthread_mutex_unlock(&state.mutex);
+}
+
+pub fn main() !u8 {
+    var state = State{};
+    if (c.pthread_mutex_init(&state.mutex, null) != 0) return 1;
+    defer _ = c.pthread_mutex_destroy(&state.mutex);
+    if (c.pthread_cond_init(&state.cond, null) != 0) return 1;
+    defer _ = c.pthread_cond_destroy(&state.cond);
+
+    if (c.pthread_mutex_lock(&state.mutex) != 0) return 1;
+    var thread = try std.Thread.spawn(.{}, worker, .{&state});
+    while (!state.ready) {
+        if (c.pthread_cond_wait(&state.cond, &state.mutex) != 0) return 1;
+    }
+    if (c.pthread_mutex_unlock(&state.mutex) != 0) return 1;
+    thread.join();
+
+    if (c.pthread_mutex_lock(&state.mutex) != 0) return 1;
+    if (c.pthread_cond_broadcast(&state.cond) != 0) return 1;
+    if (c.pthread_mutex_unlock(&state.mutex) != 0) return 1;
+
+    try std.fs.File.stdout().writeAll("Success!\n");
+    return 0;
+}

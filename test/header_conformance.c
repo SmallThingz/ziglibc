@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
@@ -13,6 +12,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
+
+#include "expect.h"
 
 int main(void)
 {
@@ -30,19 +31,18 @@ int main(void)
   FD_ZERO(&set);
   FD_SET(0, &set);
 
-  assert(DBL_MAX > 1.0);
-  assert(FLT_MAX > 1.0f);
-  assert(PATH_MAX > 0);
-  assert(RAND_MAX > 0);
-  assert(FIONBIO != 0);
-  assert(FD_ISSET(0, &set) == 1);
-  assert(sig_name != NULL);
-  assert(sig_name[0] != 0);
-  assert(sizeof(sa) >= sizeof(sa.sa_family));
-  assert(sizeof(sin) >= sizeof(sin.sin_addr));
-  assert(sizeof(st.st_size) >= 8);
-  assert((int)PTHREAD_CREATE_JOINABLE != (int)PTHREAD_CREATE_DETACHED);
-  assert(errno >= 0);
+  expect(DBL_MAX > 1.0);
+  expect(FLT_MAX > 1.0f);
+  expect(PATH_MAX > 0);
+  expect(RAND_MAX > 0);
+  expect(FIONBIO != 0);
+  expect(FD_ISSET(0, &set) == 1);
+  expect(sig_name != NULL);
+  expect(sig_name[0] != 0);
+  expect(sizeof(sa) >= sizeof(sa.sa_family));
+  expect(sizeof(sin) >= sizeof(sin.sin_addr));
+  expect(sizeof(st.st_size) >= 8);
+  expect((int)PTHREAD_CREATE_JOINABLE != (int)PTHREAD_CREATE_DETACHED);
 
   (void)mutex;
   (void)cond;

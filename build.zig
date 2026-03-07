@@ -59,8 +59,11 @@ fn addRunArtifactCompat(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.
                 \\    mapped+=("$arg")
                 \\  fi
                 \\done
-                \\darling "$abs" "${mapped[@]}"
+                \\err="$(mktemp)"
+                \\darling "$abs" "${mapped[@]}" 2>"$err"
                 \\rc=$?
+                \\grep -v -E '^sig:[0-9]+$' "$err" >&2 || true
+                \\rm -f "$err"
                 \\[ "$rc" -eq 0 ] || [ "$rc" -eq 127 ]
                 ,
                 "_",
@@ -255,6 +258,28 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("gnu_extensive", b, target, optimize, libc_only_std_static, zig_start);
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
         exe.linkLibrary(libc_only_gnu);
+        addPosix(exe, libc_only_posix);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addExecutableCompat(b, .{
+            .name = "pthread_extensive",
+            .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "pthread_extensive.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        exe.linkLibrary(libc_only_std_static);
+        exe.linkLibrary(zig_start);
+        addPosix(exe, libc_only_posix);
+        if (target.result.os.tag == .windows) {
+            exe.linkSystemLibrary("ntdll");
+            exe.linkSystemLibrary("kernel32");
+        }
         const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
@@ -500,6 +525,7 @@ const ParityFeatures = struct {
     strsignal: bool,
     pselect: bool,
     utimes: bool,
+    posix_io: bool,
 };
 
 fn parityFeaturesFor(target: std.Target) ParityFeatures {
@@ -510,6 +536,7 @@ fn parityFeaturesFor(target: std.Target) ParityFeatures {
         .strsignal = target.os.tag == .linux or target.os.tag.isDarwin(),
         .pselect = target.os.tag == .linux or target.os.tag.isDarwin(),
         .utimes = target.os.tag == .linux or target.os.tag.isDarwin(),
+        .posix_io = target.os.tag == .linux or target.os.tag.isDarwin(),
     };
 }
 
@@ -532,6 +559,7 @@ fn addParityProbeCommon(
         b.fmt("-DLIBC_PARITY_HAVE_STRSIGNAL={d}", .{@intFromBool(parity.strsignal)}),
         b.fmt("-DLIBC_PARITY_HAVE_PSELECT={d}", .{@intFromBool(parity.pselect)}),
         b.fmt("-DLIBC_PARITY_HAVE_UTIMES={d}", .{@intFromBool(parity.utimes)}),
+        b.fmt("-DLIBC_PARITY_HAVE_POSIX_IO={d}", .{@intFromBool(parity.posix_io)}),
     };
     addCSourceFilesCompat(exe, &.{"test" ++ std.fs.path.sep_str ++ "libc_parity.c"}, flags[0..]);
     if (target.result.os.tag == .windows) {

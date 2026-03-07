@@ -102,7 +102,7 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
         lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "scanf.c"), .flags = &c_flags });
     }
     const include_posix = switch (opt.variant) {
-        .only_posix, .full => true,
+        .only_posix, .only_gnu, .full => true,
         else => false,
     };
     modules_options.addOption(bool, "posix", include_posix);

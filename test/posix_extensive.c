@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -53,6 +55,36 @@ int main(int argc, char *argv[])
     expect(0 != errno);
   }
 
+  {
+    const char *needle = "posix-dirent.tmp";
+    FILE *f = fopen(needle, "w");
+    DIR *dir;
+    struct dirent *ent;
+    int saw = 0;
+    expect(f != NULL);
+    expect(0 == fclose(f));
+    dir = opendir(".");
+    expect(dir != NULL);
+    while ((ent = readdir(dir)) != NULL) {
+      if (0 == strcmp(ent->d_name, needle)) {
+        saw = 1;
+        break;
+      }
+    }
+    expect(1 == saw);
+    expect(0 == closedir(dir));
+    expect(0 == unlink(needle));
+  }
+
+  {
+    char host[256];
+    expect(0 == gethostname(host, sizeof(host)));
+    expect(host[0] != '\0');
+    errno = 0;
+    expect(-1 == gethostname(host, 0));
+    expect(EINVAL == errno);
+  }
+
 #ifndef _WIN32
   {
     const char *name = "posix-stat.tmp";
@@ -71,6 +103,31 @@ int main(int argc, char *argv[])
     mode_t old = umask(022);
     mode_t prev = umask(old);
     expect(022 == prev);
+  }
+
+  {
+    const char *name = "posix-openat.tmp";
+    int fd = openat(AT_FDCWD, name, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    struct stat st;
+    expect(fd >= 0);
+    expect(4 == write(fd, "open", 4));
+    expect(0 == close(fd));
+    expect(0 == stat(name, &st));
+    expect(4 == st.st_size);
+    expect(0 == unlink(name));
+  }
+
+  {
+    mode_t old = umask(077);
+    const char *name = "posix-umask.tmp";
+    int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0666);
+    struct stat st;
+    expect(fd >= 0);
+    expect(0 == close(fd));
+    expect(0 == stat(name, &st));
+    expect((st.st_mode & 0777) == 0600);
+    expect(0 == unlink(name));
+    (void)umask(old);
   }
 
   {
@@ -105,6 +162,94 @@ int main(int argc, char *argv[])
       expect(0 == strcmp(buf, home));
       expect(0 == pclose(p));
     }
+  }
+
+  {
+    const char *name = "posix-link-src.tmp";
+    const char *alias = "posix-link-dst.tmp";
+    struct stat st_src;
+    struct stat st_alias;
+    int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    expect(fd >= 0);
+    expect(4 == write(fd, "link", 4));
+    expect(0 == close(fd));
+    expect(0 == link(name, alias));
+    expect(0 == stat(name, &st_src));
+    expect(0 == stat(alias, &st_alias));
+    expect(st_src.st_size == st_alias.st_size);
+    expect(0 == unlink(alias));
+    expect(0 == unlink(name));
+  }
+
+  {
+    const char *name = "posix-writev.tmp";
+    int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    struct iovec outv[2];
+    char a[4];
+    char b[4];
+    struct iovec inv[2];
+    expect(fd >= 0);
+    outv[0].iov_base = (void *)"ab";
+    outv[0].iov_len = 2;
+    outv[1].iov_base = (void *)"cd";
+    outv[1].iov_len = 2;
+    expect(4 == writev(fd, outv, 2));
+    expect(0 == close(fd));
+
+    fd = open(name, O_RDONLY);
+    expect(fd >= 0);
+    memset(a, 0, sizeof(a));
+    memset(b, 0, sizeof(b));
+    inv[0].iov_base = a;
+    inv[0].iov_len = 2;
+    inv[1].iov_base = b;
+    inv[1].iov_len = 2;
+    expect(4 == readv(fd, inv, 2));
+    expect(0 == memcmp(a, "ab", 2));
+    expect(0 == memcmp(b, "cd", 2));
+    expect(0 == close(fd));
+    expect(0 == unlink(name));
+  }
+
+  {
+    FILE *fa = fopen("posix-dirent-a.tmp", "w");
+    FILE *fb = fopen("posix-dirent-b.tmp", "w");
+    DIR *dir;
+    struct dirent *ent;
+    int saw_a = 0;
+    int saw_b = 0;
+    expect(fa != NULL);
+    expect(fb != NULL);
+    expect(0 == fclose(fa));
+    expect(0 == fclose(fb));
+    dir = opendir(".");
+    expect(dir != NULL);
+    while ((ent = readdir(dir)) != NULL) {
+      if (0 == strcmp(ent->d_name, "posix-dirent-a.tmp")) saw_a = 1;
+      if (0 == strcmp(ent->d_name, "posix-dirent-b.tmp")) saw_b = 1;
+    }
+    expect(0 == closedir(dir));
+    expect(saw_a);
+    expect(saw_b);
+    expect(0 == unlink("posix-dirent-a.tmp"));
+    expect(0 == unlink("posix-dirent-b.tmp"));
+  }
+
+  {
+    FILE *f = fopen("posix-pathconf.tmp", "w");
+    int fd;
+    expect(pathconf(".", _PC_LINK_MAX) > 0);
+    errno = 0;
+    expect(-1 == pathconf(".", -1));
+    expect(EINVAL == errno);
+    expect(f != NULL);
+    fd = fileno(f);
+    expect(fpathconf(fd, _PC_LINK_MAX) > 0);
+    errno = 0;
+    expect(-1 == fpathconf(-1, _PC_LINK_MAX));
+    expect(errno != 0);
+    expect(0 == fclose(f));
+    expect(0 == unlink("posix-pathconf.tmp"));
   }
 
 #else
@@ -160,6 +305,46 @@ int main(int argc, char *argv[])
     errno = 0;
     expect(-1 == select(-1, NULL, NULL, NULL, &tv));
     expect(EINVAL == errno);
+  }
+
+  {
+    const char *name = "posix-openat-win.tmp";
+    const char *alias = "posix-link-win.tmp";
+    int fd = openat(AT_FDCWD, name, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    struct stat st;
+    struct iovec outv[2];
+    char a[4];
+    char b[4];
+    struct iovec inv[2];
+    char host[256];
+    expect(fd >= 0);
+    outv[0].iov_base = (void *)"ab";
+    outv[0].iov_len = 2;
+    outv[1].iov_base = (void *)"cd";
+    outv[1].iov_len = 2;
+    expect(4 == writev(fd, outv, 2));
+    expect(0 == close(fd));
+    expect(0 == link(name, alias));
+    expect(0 == stat(alias, &st));
+    expect(4 == st.st_size);
+
+    fd = open(name, O_RDONLY);
+    expect(fd >= 0);
+    memset(a, 0, sizeof(a));
+    memset(b, 0, sizeof(b));
+    inv[0].iov_base = a;
+    inv[0].iov_len = 2;
+    inv[1].iov_base = b;
+    inv[1].iov_len = 2;
+    expect(4 == readv(fd, inv, 2));
+    expect(0 == memcmp(a, "ab", 2));
+    expect(0 == memcmp(b, "cd", 2));
+    expect(0 == close(fd));
+
+    expect(0 == gethostname(host, sizeof(host)));
+    expect(host[0] != '\0');
+    expect(0 == unlink(alias));
+    expect(0 == unlink(name));
   }
 #endif
 

@@ -13,10 +13,14 @@ const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("time.h");
     @cInclude("signal.h");
+    @cInclude("pthread.h");
+    @cInclude("dirent.h");
     @cInclude("termios.h");
     @cInclude("sys/time.h");
     @cInclude("sys/stat.h");
     @cInclude("sys/select.h");
+    @cInclude("sys/uio.h");
+    @cInclude("dirent.h");
 });
 
 const cstd = struct {
@@ -53,6 +57,12 @@ const winapi = if (builtin.os.tag == .windows) struct {
         lpFileInformation: *std.os.windows.BY_HANDLE_FILE_INFORMATION,
     ) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+    pub extern "kernel32" fn GetComputerNameA(lpBuffer: [*]u8, nSize: *u32) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn CreateHardLinkA(
+        lpFileName: [*:0]const u8,
+        lpExistingFileName: [*:0]const u8,
+        lpSecurityAttributes: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn PeekNamedPipe(
         hNamedPipe: std.os.windows.HANDLE,
         lpBuffer: ?*anyopaque,
@@ -120,6 +130,12 @@ var fallback_umask: c.mode_t = 0o022;
 var fallback_umask_mutex: std.Thread.Mutex = .{};
 
 const PopenPid = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) usize else os.pid_t;
+const LongOption = extern struct {
+    name: ?[*:0]const u8,
+    has_arg: c_int,
+    flag: ?*c_int,
+    val: c_int,
+};
 
 const PopenEntry = struct {
     stream: ?*c.FILE = null,
@@ -298,6 +314,135 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
     return @as(c_int, opt_ch);
 }
 
+fn longOptionNameLen(name: [*:0]const u8) usize {
+    var i: usize = 0;
+    while (name[i] != 0 and name[i] != '=') : (i += 1) {}
+    return i;
+}
+
+fn getoptLongCommon(
+    argc: c_int,
+    argv: [*][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*c]const LongOption,
+    longindex: ?*c_int,
+    long_only: bool,
+) c_int {
+    const dbg = struct {
+        fn mark(msg: []const u8) void {
+            if (!builtin.os.tag.isDarwin()) return;
+            _ = zwriteRaw(2, msg.ptr, msg.len);
+            _ = zwriteRaw(2, "\n".ptr, 1);
+        }
+    };
+    optarg = null;
+    if (optind < 1) {
+        optind = 1;
+        optchar_index = 1;
+    }
+    if (optind >= argc) return -1;
+
+    const arg = argv[@as(usize, @intCast(optind))];
+    var long_name: [*:0]const u8 = undefined;
+    var single_dash_long = false;
+    if (arg[0] == '-' and arg[1] == '-') {
+        if (arg[2] == 0) {
+            optind += 1;
+            optchar_index = 1;
+            return -1;
+        }
+        long_name = @ptrCast(arg + 2);
+    } else if (long_only and arg[0] == '-' and arg[1] != 0 and arg[1] != '-') {
+        long_name = @ptrCast(arg + 1);
+        single_dash_long = true;
+    } else {
+        return getopt(argc, argv, optstring);
+    }
+
+    const name_len = longOptionNameLen(long_name);
+    const inline_value: ?[*:0]u8 = if (long_name[name_len] == '=') @ptrCast(@constCast(long_name + name_len + 1)) else null;
+
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const opt = longopts[i];
+        const opt_name = opt.name orelse break;
+        if (std.mem.eql(u8, std.mem.span(opt_name), long_name[0..name_len]) and opt_name[name_len] == 0) {
+            dbg.mark("gl:match");
+            if (longindex) |idx| idx.* = @as(c_int, @intCast(i));
+
+            switch (opt.has_arg) {
+                0 => {
+                    if (inline_value != null) {
+                        optind += 1;
+                        optchar_index = 1;
+                        return '?';
+                    }
+                    optarg = null;
+                },
+                1 => {
+                    if (inline_value) |value| {
+                        optarg = value;
+                    } else if (optind + 1 < argc) {
+                        optind += 1;
+                        optarg = @ptrCast(argv[@as(usize, @intCast(optind))]);
+                    } else {
+                        optind += 1;
+                        optchar_index = 1;
+                        return if (optstring[0] == ':') ':' else '?';
+                    }
+                },
+                2 => {
+                    optarg = inline_value;
+                },
+                else => {
+                    optind += 1;
+                    optchar_index = 1;
+                    c.errno = c.EINVAL;
+                    return '?';
+                },
+            }
+
+            optind += 1;
+            optchar_index = 1;
+            if (opt.flag) |flag| {
+                dbg.mark("gl:flag-before");
+                flag.* = opt.val;
+                dbg.mark("gl:flag-after");
+                return 0;
+            }
+            dbg.mark("gl:return-val");
+            return opt.val;
+        }
+    }
+
+    if (single_dash_long) {
+        return getopt(argc, argv, optstring);
+    }
+    optind += 1;
+    optchar_index = 1;
+    return '?';
+}
+
+export fn getopt_long(
+    argc: c_int,
+    argv: [*][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*c]const LongOption,
+    longindex: ?*c_int,
+) callconv(.c) c_int {
+    return getoptLongCommon(argc, argv, optstring, longopts, longindex, false);
+}
+
+export fn getopt_long_only(
+    argc: c_int,
+    argv: [*][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*c]const LongOption,
+    longindex: ?*c_int,
+) callconv(.c) c_int {
+    return getoptLongCommon(argc, argv, optstring, longopts, longindex, true);
+}
+
 fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.write, fd, buf, nbyte);
@@ -399,11 +544,23 @@ fn translateDarwinOpenFlags(oflag: c_int) c_int {
     return @as(c_int, @bitCast(@as(u32, @bitCast(flags))));
 }
 
+fn currentFallbackUmask() c.mode_t {
+    fallback_umask_mutex.lock();
+    defer fallback_umask_mutex.unlock();
+    return fallback_umask;
+}
+
+fn applyCreateModeUmask(mode: c_uint) c_uint {
+    if (builtin.os.tag == .linux) return mode;
+    return mode & ~@as(c_uint, currentFallbackUmask());
+}
+
 fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
+    const create_mode = applyCreateModeUmask(mode);
     if (builtin.os.tag.isDarwin()) {
         const darwin_flags = translateDarwinOpenFlags(oflag);
         if (darwin_flags == -1) return -1;
-        const rc = darwin.@"open$NOCANCEL"(path, darwin_flags, mode);
+        const rc = darwin.@"open$NOCANCEL"(path, darwin_flags, create_mode);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -434,7 +591,7 @@ fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
             break :blk std.os.windows.OPEN_EXISTING;
         };
 
-        const attributes: u32 = if ((oflag & c.O_CREAT) != 0 and (mode & 0o222) == 0)
+        const attributes: u32 = if ((oflag & c.O_CREAT) != 0 and (create_mode & 0o222) == 0)
             std.os.windows.FILE_ATTRIBUTE_READONLY
         else
             std.os.windows.FILE_ATTRIBUTE_NORMAL;
@@ -463,7 +620,46 @@ fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
     }
     const flags_bits: u32 = @bitCast(oflag);
     const flags: os.O = @bitCast(flags_bits);
-    const rc = os.system.open(path, flags, @as(std.posix.mode_t, @intCast(mode)));
+    const rc = os.system.open(path, flags, @as(std.posix.mode_t, @intCast(create_mode)));
+    switch (os.errno(rc)) {
+        .SUCCESS => return @as(c_int, @intCast(rc)),
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
+}
+
+fn isWindowsAbsolutePath(path: [*:0]const u8) bool {
+    if (path[0] == '/') return true;
+    return std.ascii.isAlphabetic(path[0]) and path[1] == ':';
+}
+
+fn zopenAtRaw(dirfd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
+    const create_mode = applyCreateModeUmask(mode);
+    if (builtin.os.tag == .windows) {
+        if (dirfd == c.AT_FDCWD or isWindowsAbsolutePath(path)) {
+            return zopenRaw(path, oflag, create_mode);
+        }
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+    if (builtin.os.tag.isDarwin()) {
+        if (dirfd == c.AT_FDCWD) return zopenRaw(path, oflag, create_mode);
+        // Do not call the public `openat` symbol from inside our own libc; that
+        // recurses through the C shim and crashed under Darling. A real dirfd-
+        // relative Darwin implementation still needs a private entry point.
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+
+    const flags_bits: u32 = @bitCast(oflag);
+    const flags: os.O = @bitCast(flags_bits);
+    const openat_sym = if (builtin.os.tag == .linux and @hasDecl(os.system, "openat64"))
+        os.system.openat64
+    else
+        os.system.openat;
+    const rc = openat_sym(dirfd, path, flags, @as(std.posix.mode_t, @intCast(create_mode)));
     switch (os.errno(rc)) {
         .SUCCESS => return @as(c_int, @intCast(rc)),
         else => |e| {
@@ -487,6 +683,60 @@ fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
 
 comptime {
     exportInternalSymbol(&_zopen, "_zopen");
+}
+
+fn _zopenat(dirfd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
+    return zopenAtRaw(dirfd, path, oflag, mode);
+}
+
+comptime {
+    exportInternalSymbol(&_zopenat, "_zopenat");
+}
+
+export fn readv(fd: c_int, iov: [*]const c.struct_iovec, iovcnt: c_int) callconv(.c) isize {
+    if (iovcnt < 0) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+    var total: usize = 0;
+    var index: usize = 0;
+    const count: usize = @intCast(iovcnt);
+    while (index < count) : (index += 1) {
+        const part = iov[index];
+        if (part.iov_len == 0) continue;
+        const rc = zreadRaw(fd, @ptrCast(part.iov_base), part.iov_len);
+        if (rc < 0) {
+            if (total != 0) return @as(isize, @intCast(total));
+            return -1;
+        }
+        const got: usize = @intCast(rc);
+        total += got;
+        if (got < part.iov_len) break;
+    }
+    return @as(isize, @intCast(total));
+}
+
+export fn writev(fd: c_int, iov: [*]const c.struct_iovec, iovcnt: c_int) callconv(.c) isize {
+    if (iovcnt < 0) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+    var total: usize = 0;
+    var index: usize = 0;
+    const count: usize = @intCast(iovcnt);
+    while (index < count) : (index += 1) {
+        const part = iov[index];
+        if (part.iov_len == 0) continue;
+        const rc = zwriteRaw(fd, @ptrCast(part.iov_base), part.iov_len);
+        if (rc < 0) {
+            if (total != 0) return @as(isize, @intCast(total));
+            return -1;
+        }
+        const wrote: usize = @intCast(rc);
+        total += wrote;
+        if (wrote < part.iov_len) break;
+    }
+    return @as(isize, @intCast(total));
 }
 
 // --------------------------------------------------------------------------------
@@ -818,6 +1068,82 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
         return -1;
     };
     return 0;
+}
+
+fn pathconfLinkMax() c_long {
+    // Keep this limited to the one `_PC_*` selector exposed by our public header.
+    // Callers only need a stable positive bound here; exact filesystem-dependent
+    // values can vary widely even within the same OS.
+    return if (builtin.os.tag == .windows) 1024 else 127;
+}
+
+export fn fpathconf(fileds: c_int, name: c_int) callconv(.c) c_long {
+    if (fileds < 0) {
+        c.errno = errnoConst("EBADF", c.EINVAL);
+        return -1;
+    }
+    switch (name) {
+        c._PC_LINK_MAX => return pathconfLinkMax(),
+        else => {
+            c.errno = c.EINVAL;
+            return -1;
+        },
+    }
+}
+
+export fn pathconf(path: [*:0]const u8, name: c_int) callconv(.c) c_long {
+    switch (name) {
+        c._PC_LINK_MAX => {},
+        else => {
+            c.errno = c.EINVAL;
+            return -1;
+        },
+    }
+    if (access(path, 0) != 0) return -1;
+    return pathconfLinkMax();
+}
+
+export fn gethostname(name: [*]u8, namelen: usize) callconv(.c) c_int {
+    if (namelen == 0) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+    if (builtin.os.tag == .windows) {
+        var size: u32 = @intCast(@min(namelen, @as(usize, std.math.maxInt(u32))));
+        if (winapi.GetComputerNameA(name, &size) == 0) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
+        }
+        if (@as(usize, size) < namelen) name[@intCast(size)] = 0;
+        return 0;
+    }
+    const uts = std.posix.uname();
+    const host = std.mem.sliceTo(&uts.nodename, 0);
+    const copy_len = @min(host.len, namelen - 1);
+    @memcpy(name[0..copy_len], host[0..copy_len]);
+    name[copy_len] = 0;
+    if (copy_len != host.len) {
+        c.errno = errnoConst("ENAMETOOLONG", c.EINVAL);
+        return -1;
+    }
+    return 0;
+}
+
+export fn link(path1: [*:0]const u8, path2: [*:0]const u8) callconv(.c) c_int {
+    if (builtin.os.tag == .windows) {
+        if (winapi.CreateHardLinkA(path2, path1, null) == 0) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
+        }
+        return 0;
+    }
+    switch (os.errno(os.system.linkat(os.AT.FDCWD, path1, os.AT.FDCWD, path2, 0))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
@@ -1629,11 +1955,252 @@ export fn umask(mode: c.mode_t) callconv(.c) c.mode_t {
         return @as(c.mode_t, @intCast(old_mode));
     }
 
+    // Non-Linux targets in this libc route file creation through our own `open` /
+    // `openat` / temp-file helpers, so keep the process-local mask here and apply
+    // it when we pass creation modes to the OS. Relying on the host libc's global
+    // umask state would break the "independent libc" constraint and regressed
+    // platform parity in earlier sweeps.
     fallback_umask_mutex.lock();
     defer fallback_umask_mutex.unlock();
     const old = fallback_umask;
     fallback_umask = mode & 0o777;
     return old;
+}
+
+// --------------------------------------------------------------------------------
+// dirent
+// --------------------------------------------------------------------------------
+const dirent_name_cap = 1024;
+const DirentStorage = extern struct {
+    d_ino: c.ino_t,
+    d_name: [dirent_name_cap]u8,
+};
+
+const DirImpl = struct {
+    dir: std.fs.Dir,
+    iter: std.fs.Dir.Iterator,
+    entry: DirentStorage = std.mem.zeroes(DirentStorage),
+};
+
+fn fsErrno(err: anyerror) c_int {
+    return switch (err) {
+        error.AccessDenied => c.EACCES,
+        error.PermissionDenied => c.EPERM,
+        error.FileNotFound => c.ENOENT,
+        error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+        error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+        error.SystemResources => c.ENOMEM,
+        else => errnoConst("EIO", c.EINVAL),
+    };
+}
+
+fn dirImplFromOpaque(dirp: *c.DIR) *DirImpl {
+    return @ptrCast(@alignCast(dirp));
+}
+
+fn openDirPath(dirname: [*:0]const u8) !std.fs.Dir {
+    const path = std.mem.span(dirname);
+    const opts = std.fs.Dir.OpenOptions{ .iterate = true };
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.openDirAbsolute(path, opts);
+    }
+    return std.fs.cwd().openDir(path, opts);
+}
+
+export fn opendir(dirname: [*:0]const u8) callconv(.c) ?*c.DIR {
+    var dir = openDirPath(dirname) catch |err| {
+        c.errno = fsErrno(err);
+        return null;
+    };
+    const impl = std.heap.page_allocator.create(DirImpl) catch {
+        dir.close();
+        c.errno = c.ENOMEM;
+        return null;
+    };
+    impl.* = .{
+        .dir = dir,
+        .iter = dir.iterate(),
+    };
+    return @ptrCast(impl);
+}
+
+export fn fdopendir(fd: c_int) callconv(.c) ?*c.DIR {
+    if (fd < 0) {
+        c.errno = errnoConst("EBADF", c.EINVAL);
+        return null;
+    }
+    const handle = if (builtin.os.tag == .windows)
+        winfd.handleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return null;
+        }
+    else
+        @as(std.fs.Dir.Handle, @intCast(fd));
+    const impl = std.heap.page_allocator.create(DirImpl) catch {
+        c.errno = c.ENOMEM;
+        return null;
+    };
+    var dir: std.fs.Dir = .{ .fd = handle };
+    impl.* = .{
+        .dir = dir,
+        .iter = dir.iterate(),
+    };
+    return @ptrCast(impl);
+}
+
+export fn closedir(dirp: *c.DIR) callconv(.c) c_int {
+    const impl = dirImplFromOpaque(dirp);
+    impl.dir.close();
+    std.heap.page_allocator.destroy(impl);
+    return 0;
+}
+
+export fn readdir(dirp: *c.DIR) callconv(.c) ?*DirentStorage {
+    const impl = dirImplFromOpaque(dirp);
+    const next = impl.iter.next() catch |err| {
+        c.errno = fsErrno(err);
+        return null;
+    };
+    const entry = next orelse return null;
+    const name_len = @min(entry.name.len, dirent_name_cap - 1);
+    @memcpy(impl.entry.d_name[0..name_len], entry.name[0..name_len]);
+    impl.entry.d_name[name_len] = 0;
+    if (name_len + 1 < impl.entry.d_name.len) {
+        @memset(impl.entry.d_name[name_len + 1 ..], 0);
+    }
+
+    impl.entry.d_ino = 0;
+    if (builtin.os.tag != .windows) {
+        const stat_info = std.posix.fstatat(impl.dir.fd, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch null;
+        if (stat_info) |st| {
+            impl.entry.d_ino = @as(c.ino_t, @intCast(st.ino));
+        }
+    }
+    return &impl.entry;
+}
+
+// --------------------------------------------------------------------------------
+// pthread
+// --------------------------------------------------------------------------------
+const pthread_slot_count = 64;
+const PthreadMutexEntry = struct {
+    used: bool = false,
+    mutex: std.Thread.Mutex = .{},
+};
+const PthreadCondEntry = struct {
+    used: bool = false,
+    cond: std.Thread.Condition = .{},
+};
+
+var pthread_table_mutex: std.Thread.Mutex = .{};
+var pthread_mutex_entries: [pthread_slot_count]PthreadMutexEntry = [_]PthreadMutexEntry{.{}} ** pthread_slot_count;
+var pthread_cond_entries: [pthread_slot_count]PthreadCondEntry = [_]PthreadCondEntry{.{}} ** pthread_slot_count;
+
+fn allocPthreadSlot(comptime T: type, entries: *[pthread_slot_count]T) ?usize {
+    for (entries, 0..) |*entry, i| {
+        if (!entry.used) {
+            entry.used = true;
+            return i;
+        }
+    }
+    return null;
+}
+
+fn mutexEntryFor(mutex: *c.pthread_mutex_t, create: bool) ?*PthreadMutexEntry {
+    pthread_table_mutex.lock();
+    defer pthread_table_mutex.unlock();
+    const id = mutex.*;
+    if (id == 0) {
+        if (!create) return null;
+        const index = allocPthreadSlot(PthreadMutexEntry, &pthread_mutex_entries) orelse return null;
+        pthread_mutex_entries[index].mutex = .{};
+        mutex.* = @as(c.pthread_mutex_t, @intCast(index + 1));
+        return &pthread_mutex_entries[index];
+    }
+    if (id < 0 or id > pthread_slot_count) return null;
+    const entry = &pthread_mutex_entries[@as(usize, @intCast(id - 1))];
+    if (!entry.used) return null;
+    return entry;
+}
+
+fn condEntryFor(cond: *c.pthread_cond_t, create: bool) ?*PthreadCondEntry {
+    pthread_table_mutex.lock();
+    defer pthread_table_mutex.unlock();
+    const id = cond.*;
+    if (id == 0) {
+        if (!create) return null;
+        const index = allocPthreadSlot(PthreadCondEntry, &pthread_cond_entries) orelse return null;
+        pthread_cond_entries[index].cond = .{};
+        cond.* = @as(c.pthread_cond_t, @intCast(index + 1));
+        return &pthread_cond_entries[index];
+    }
+    if (id < 0 or id > pthread_slot_count) return null;
+    const entry = &pthread_cond_entries[@as(usize, @intCast(id - 1))];
+    if (!entry.used) return null;
+    return entry;
+}
+
+export fn pthread_mutex_init(mutex: *c.pthread_mutex_t, attr: ?*const c.pthread_mutexattr_t) callconv(.c) c_int {
+    _ = attr;
+    if (mutexEntryFor(mutex, true) == null) return errnoConst("ENOMEM", c.EINVAL);
+    return 0;
+}
+
+export fn pthread_mutex_destroy(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    pthread_table_mutex.lock();
+    defer pthread_table_mutex.unlock();
+    if (mutex.* == 0) return 0;
+    if (mutex.* < 0 or mutex.* > pthread_slot_count) return c.EINVAL;
+    pthread_mutex_entries[@as(usize, @intCast(mutex.* - 1))] = .{};
+    mutex.* = 0;
+    return 0;
+}
+
+export fn pthread_mutex_lock(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    const entry = mutexEntryFor(mutex, true) orelse return errnoConst("ENOMEM", c.EINVAL);
+    entry.mutex.lock();
+    return 0;
+}
+
+export fn pthread_mutex_unlock(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    const entry = mutexEntryFor(mutex, false) orelse return c.EINVAL;
+    entry.mutex.unlock();
+    return 0;
+}
+
+export fn pthread_cond_init(cond: *c.pthread_cond_t, attr: ?*const c.pthread_condattr_t) callconv(.c) c_int {
+    _ = attr;
+    if (condEntryFor(cond, true) == null) return errnoConst("ENOMEM", c.EINVAL);
+    return 0;
+}
+
+export fn pthread_cond_destroy(cond: *c.pthread_cond_t) callconv(.c) c_int {
+    pthread_table_mutex.lock();
+    defer pthread_table_mutex.unlock();
+    if (cond.* == 0) return 0;
+    if (cond.* < 0 or cond.* > pthread_slot_count) return c.EINVAL;
+    pthread_cond_entries[@as(usize, @intCast(cond.* - 1))] = .{};
+    cond.* = 0;
+    return 0;
+}
+
+export fn pthread_cond_wait(cond: *c.pthread_cond_t, mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    const cond_entry = condEntryFor(cond, true) orelse return errnoConst("ENOMEM", c.EINVAL);
+    const mutex_entry = mutexEntryFor(mutex, true) orelse return errnoConst("ENOMEM", c.EINVAL);
+    cond_entry.cond.wait(&mutex_entry.mutex);
+    return 0;
+}
+
+export fn pthread_cond_broadcast(cond: *c.pthread_cond_t) callconv(.c) c_int {
+    const cond_entry = condEntryFor(cond, false) orelse return c.EINVAL;
+    cond_entry.cond.broadcast();
+    return 0;
+}
+
+export fn pthread_cond_signal(cond: *c.pthread_cond_t) callconv(.c) c_int {
+    const cond_entry = condEntryFor(cond, false) orelse return c.EINVAL;
+    cond_entry.cond.signal();
+    return 0;
 }
 
 // --------------------------------------------------------------------------------
@@ -1993,15 +2560,44 @@ export fn pselect(
         return -1;
     }
     if (builtin.os.tag.isDarwin()) {
-        var darwin_timeout: c.timeval = undefined;
-        const darwin_timeout_ptr: ?*c.timeval = if (timeout) |ts| blk: {
-            darwin_timeout = cTimespecToTimeval(ts.*) orelse {
+        if (sigmask == null) {
+            // Native Darwin callers that do not need the atomic signal-mask swap are
+            // compatible with select(). Keep this path because Darling's pselect
+            // emulation is less reliable than native macOS for the timeout-only case
+            // we exercise in CI.
+            var darwin_timeout: c.timeval = undefined;
+            const darwin_timeout_ptr: ?*c.timeval = if (timeout) |ts| blk: {
+                darwin_timeout = cTimespecToTimeval(ts.*) orelse {
+                    c.errno = c.EINVAL;
+                    return -1;
+                };
+                break :blk &darwin_timeout;
+            } else null;
+            return select(nfds, readfds, writefds, errorfds, darwin_timeout_ptr);
+        }
+        if (timeout) |ts| {
+            if (!cTimespecIsValid(ts.*)) {
                 c.errno = c.EINVAL;
                 return -1;
-            };
-            break :blk &darwin_timeout;
-        } else null;
-        return select(nfds, readfds, writefds, errorfds, darwin_timeout_ptr);
+            }
+        }
+        // Darwin has a real pselect(2). Falling back to select() loses the signal
+        // mask argument and the atomic mask swap, which is observably wrong even
+        // when timeout-only tests appear to pass under emulation.
+        const rc = syscall(
+            darwin_syscall.pselect,
+            nfds,
+            readfds,
+            writefds,
+            errorfds,
+            timeout,
+            sigmask,
+        );
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(c_int, @intCast(rc));
     }
     if (builtin.os.tag == .linux) {
         const LinuxPselectSigmask = extern struct {
