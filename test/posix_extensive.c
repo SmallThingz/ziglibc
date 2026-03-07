@@ -57,6 +57,12 @@ int main(int argc, char *argv[])
   }
 
   {
+    mode_t old = umask(022);
+    mode_t prev = umask(old);
+    expect(022 == prev);
+  }
+
+  {
     FILE *p = popen("printf popen-ok", "r");
     char buf[64];
     expect(p != NULL);
@@ -75,6 +81,57 @@ int main(int argc, char *argv[])
   {
     errno = 0;
     expect(NULL == popen("echo invalid", "x"));
+    expect(EINVAL == errno);
+  }
+#else
+  {
+    const char *name = "posix-win-chmod.tmp";
+    struct stat st;
+    FILE *f = fopen(name, "w");
+    expect(f != NULL);
+    expect(0 == fclose(f));
+    expect(0 == fstat(STDOUT_FILENO, &st));
+    expect(0 == chmod(name, 0600));
+    expect(0 == chmod(name, 0400));
+    expect(0 == unlink(name));
+    errno = 0;
+    expect(-1 == chmod(name, 0600));
+    expect(errno == ENOENT || errno == EACCES || errno == EINVAL);
+  }
+#endif
+
+#ifdef __linux__
+  {
+    struct itimerval val;
+    struct itimerval old;
+    memset(&val, 0, sizeof(val));
+    memset(&old, 0, sizeof(old));
+    expect(0 == setitimer(ITIMER_REAL, &val, &old));
+  }
+
+  {
+    struct itimerval val;
+    struct itimerval old;
+    memset(&val, 0, sizeof(val));
+    memset(&old, 0, sizeof(old));
+    errno = 0;
+    expect(-1 == setitimer(-1, &val, &old));
+    expect(EINVAL == errno);
+  }
+
+  {
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    expect(0 == select(0, NULL, NULL, NULL, &tv));
+  }
+
+  {
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    errno = 0;
+    expect(-1 == select(-1, NULL, NULL, NULL, &tv));
     expect(EINVAL == errno);
   }
 #endif

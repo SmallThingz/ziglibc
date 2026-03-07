@@ -1872,7 +1872,42 @@ export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
 
 export fn tmpfile() callconv(.c) ?*c.FILE {
     if (builtin.os.tag == .windows) {
-        errno = c.ENOSYS;
+        var attempt_windows: usize = 0;
+        while (attempt_windows < 1024) : (attempt_windows += 1) {
+            const id = @atomicRmw(u32, &global.tmpfile_counter, .Add, 1, .seq_cst);
+            var name_buf: [48:0]u8 = undefined;
+            const name = std.fmt.bufPrint(name_buf[0 .. name_buf.len - 1], "tmpfile-{x:0>8}.tmp", .{id}) catch unreachable;
+            name_buf[name.len] = 0;
+
+            const fd = windows.CreateFileA(
+                &name_buf,
+                std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
+                std.os.windows.FILE_SHARE_DELETE |
+                    std.os.windows.FILE_SHARE_READ |
+                    std.os.windows.FILE_SHARE_WRITE,
+                null,
+                std.os.windows.CREATE_NEW,
+                std.os.windows.FILE_ATTRIBUTE_TEMPORARY |
+                    std.os.windows.FILE_FLAG_DELETE_ON_CLOSE,
+                null,
+            );
+            if (fd != std.os.windows.INVALID_HANDLE_VALUE) {
+                const file = global.reserveFile() orelse {
+                    _ = windows.CloseHandle(fd.?);
+                    errno = c.ENOMEM;
+                    return null;
+                };
+                file.fd = fd;
+                file.eof = 0;
+                file.errno = 0;
+                return file;
+            }
+            const win_err = std.os.windows.kernel32.GetLastError();
+            if (win_err == .FILE_EXISTS or win_err == .ALREADY_EXISTS) continue;
+            errno = @intFromEnum(win_err);
+            return null;
+        }
+        errno = c.EEXIST;
         return null;
     }
     var attempt: usize = 0;

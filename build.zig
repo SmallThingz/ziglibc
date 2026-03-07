@@ -117,6 +117,7 @@ pub fn build(b: *std.Build) void {
     }
     {
         const exe = addTest("signal_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        addPosix(exe, libc_only_posix);
         const run_step = b.addRunArtifact(exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);

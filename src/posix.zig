@@ -24,6 +24,11 @@ extern "c" fn syscall(number: c_long, ...) c_long;
 
 const trace = @import("trace.zig");
 
+const winapi = if (builtin.os.tag == .windows) struct {
+    pub extern "kernel32" fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(.winapi) u32;
+    pub extern "kernel32" fn SetFileAttributesA(lpFileName: ?[*:0]const u8, dwFileAttributes: u32) callconv(.winapi) std.os.windows.BOOL;
+} else struct {};
+
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
     if (@hasDecl(c, name)) return @field(c, name);
     return fallback;
@@ -69,6 +74,8 @@ export var opterr: c_int = 1;
 export var optind: c_int = 1;
 export var optopt: c_int = 0;
 var optchar_index: c_int = 1;
+var fallback_umask: c.mode_t = 0o022;
+var fallback_umask_mutex: std.Thread.Mutex = .{};
 
 const PopenPid = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) usize else os.pid_t;
 
@@ -663,6 +670,30 @@ fn setTimespec(tp: *os.timespec, sec: anytype, nsec: anytype) void {
     }
 }
 
+const LinuxTimeval = extern struct {
+    tv_sec: isize,
+    tv_usec: isize,
+};
+
+const LinuxItimerval = extern struct {
+    it_interval: LinuxTimeval,
+    it_value: LinuxTimeval,
+};
+
+fn cTimevalToLinux(tv: c.timeval) LinuxTimeval {
+    return .{
+        .tv_sec = @as(isize, @intCast(tv.tv_sec)),
+        .tv_usec = @as(isize, @intCast(tv.tv_usec)),
+    };
+}
+
+fn linuxTimevalToC(tv: LinuxTimeval) c.timeval {
+    var out: c.timeval = undefined;
+    out.tv_sec = @as(@TypeOf(out.tv_sec), @intCast(tv.tv_sec));
+    out.tv_usec = @as(@TypeOf(out.tv_usec), @intCast(tv.tv_usec));
+    return out;
+}
+
 export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
     if (builtin.os.tag.isDarwin()) {
         if (clk_id == c.CLOCK_REALTIME) {
@@ -735,21 +766,119 @@ export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
 
 export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
     trace.log("setitimer which={}", .{which});
-    _ = value;
-    _ = avalue;
-    c.errno = errnoConst("ENOSYS", c.EINVAL);
-    return -1;
+    if (comptime builtin.os.tag != .linux) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+    var linux_new = LinuxItimerval{
+        .it_interval = cTimevalToLinux(value.it_interval),
+        .it_value = cTimevalToLinux(value.it_value),
+    };
+    var linux_old: LinuxItimerval = undefined;
+    const rc = std.os.linux.syscall3(
+        .setitimer,
+        @as(usize, @bitCast(@as(isize, which))),
+        @intFromPtr(&linux_new),
+        @intFromPtr(&linux_old),
+    );
+    switch (os.errno(rc)) {
+        .SUCCESS => {
+            avalue.it_interval = linuxTimevalToC(linux_old.it_interval);
+            avalue.it_value = linuxTimevalToC(linux_old.it_value);
+            return 0;
+        },
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 // --------------------------------------------------------------------------------
 // signal
 // --------------------------------------------------------------------------------
+fn cHandlerToLinux(handler: @TypeOf(@as(c.struct_sigaction, undefined).sa_handler)) ?std.os.linux.Sigaction.handler_fn {
+    return if (handler) |h|
+        @as(?std.os.linux.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
+    else
+        null;
+}
+
+fn cSigactionToLinux(sigaction_fn: @TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction)) ?std.os.linux.Sigaction.sigaction_fn {
+    return if (sigaction_fn) |f|
+        @as(?std.os.linux.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
+    else
+        null;
+}
+
+fn linuxHandlerToC(handler: ?std.os.linux.Sigaction.handler_fn) @TypeOf(@as(c.struct_sigaction, undefined).sa_handler) {
+    return if (handler) |h|
+        @as(@TypeOf(@as(c.struct_sigaction, undefined).sa_handler), @ptrFromInt(@intFromPtr(h)))
+    else
+        null;
+}
+
+fn linuxSigactionToC(sigaction_fn: ?std.os.linux.Sigaction.sigaction_fn) @TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction) {
+    return if (sigaction_fn) |f|
+        @as(@TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction), @ptrFromInt(@intFromPtr(f)))
+    else
+        null;
+}
+
+fn cSigsetToLinux(mask: c.sigset_t) std.os.linux.sigset_t {
+    var out = std.os.linux.sigemptyset();
+    out[0] = @as(@TypeOf(out[0]), @intCast(mask.__signals));
+    return out;
+}
+
+fn linuxSigsetToC(mask: std.os.linux.sigset_t) c.sigset_t {
+    return .{ .__signals = @as(c_ulong, @intCast(mask[0])) };
+}
+
 export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.c) c_int {
     trace.log("sigaction sig={}", .{sig});
-    _ = act;
-    _ = oact;
-    c.errno = errnoConst("ENOSYS", c.EINVAL);
-    return -1;
+    if (comptime builtin.os.tag != .linux) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+    if (sig <= 0 or sig >= std.os.linux.NSIG) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+
+    const flags_bits: c_uint = @bitCast(act.sa_flags);
+    var linux_act = std.os.linux.Sigaction{
+        .handler = undefined,
+        .mask = cSigsetToLinux(act.sa_mask),
+        .flags = @as(@TypeOf(@as(std.os.linux.Sigaction, undefined).flags), @intCast(flags_bits)),
+    };
+    if ((flags_bits & std.os.linux.SA.SIGINFO) != 0) {
+        linux_act.handler = .{ .sigaction = cSigactionToLinux(act.sa_sigaction) };
+    } else {
+        linux_act.handler = .{ .handler = cHandlerToLinux(act.sa_handler) };
+    }
+
+    var linux_old: std.os.linux.Sigaction = undefined;
+    const rc = std.os.linux.sigaction(@as(u8, @intCast(sig)), &linux_act, &linux_old);
+    switch (os.errno(rc)) {
+        .SUCCESS => {
+            const old_flags_bits: c_uint = @truncate(@as(usize, @intCast(linux_old.flags)));
+            oact.sa_flags = @as(c_int, @bitCast(old_flags_bits));
+            oact.sa_mask = linuxSigsetToC(linux_old.mask);
+            if ((old_flags_bits & std.os.linux.SA.SIGINFO) != 0) {
+                oact.sa_sigaction = linuxSigactionToC(linux_old.handler.sigaction);
+                oact.sa_handler = null;
+            } else {
+                oact.sa_handler = linuxHandlerToC(linux_old.handler.handler);
+                oact.sa_sigaction = null;
+            }
+            return 0;
+        },
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 // --------------------------------------------------------------------------------
@@ -758,8 +887,32 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
     if (builtin.os.tag == .windows) {
-        c.errno = errnoConst("ENOSYS", c.EINVAL);
-        return -1;
+        const attrs = winapi.GetFileAttributesA(path);
+        if (attrs == std.os.windows.INVALID_FILE_ATTRIBUTES) {
+            c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+                .FILE_NOT_FOUND, .PATH_NOT_FOUND => c.ENOENT,
+                .ACCESS_DENIED => c.EACCES,
+                else => c.EINVAL,
+            };
+            return -1;
+        }
+
+        const writable = (@as(c_uint, @intCast(mode)) & 0o222) != 0;
+        var new_attrs = attrs;
+        if (writable) {
+            new_attrs &= ~@as(u32, std.os.windows.FILE_ATTRIBUTE_READONLY);
+        } else {
+            new_attrs |= std.os.windows.FILE_ATTRIBUTE_READONLY;
+        }
+        if (winapi.SetFileAttributesA(path, new_attrs) == 0) {
+            c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+                .FILE_NOT_FOUND, .PATH_NOT_FOUND => c.ENOENT,
+                .ACCESS_DENIED => c.EACCES,
+                else => c.EINVAL,
+            };
+            return -1;
+        }
+        return 0;
     }
     const rc = os.system.fchmodat(
         os.AT.FDCWD,
@@ -786,8 +939,18 @@ fn timespecSeconds(ts: anytype) i64 {
 
 export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
     if (builtin.os.tag == .windows) {
-        c.errno = errnoConst("ENOSYS", c.EINVAL);
-        return -1;
+        const handle = windowsStdHandleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return -1;
+        };
+        buf.* = std.mem.zeroes(c.struct_stat);
+        buf.st_nlink = 1;
+        buf.st_mode = c.S_IRUSR | c.S_IWUSR;
+        var size: std.os.windows.LARGE_INTEGER = 0;
+        if (std.os.windows.kernel32.GetFileSizeEx(handle, &size) != 0) {
+            buf.st_size = @as(@TypeOf(buf.st_size), @intCast(size));
+        }
+        return 0;
     }
     var stat_buf: os.Stat = undefined;
     switch (os.errno(os.system.fstat(fd, &stat_buf))) {
@@ -830,12 +993,16 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
 
 export fn umask(mode: c.mode_t) callconv(.c) c.mode_t {
     trace.log("umask 0x{x}", .{mode});
-    if (builtin.os.tag != .linux) {
-        c.errno = errnoConst("ENOSYS", c.EINVAL);
-        return mode;
+    if (builtin.os.tag == .linux) {
+        const old_mode = std.os.linux.syscall1(.umask, @as(usize, @intCast(mode)));
+        return @as(c.mode_t, @intCast(old_mode));
     }
-    const old_mode = std.os.linux.syscall1(.umask, @as(usize, @intCast(mode)));
-    return @as(c.mode_t, @intCast(old_mode));
+
+    fallback_umask_mutex.lock();
+    defer fallback_umask_mutex.unlock();
+    const old = fallback_umask;
+    fallback_umask = mode & 0o777;
+    return old;
 }
 
 // --------------------------------------------------------------------------------
@@ -926,13 +1093,67 @@ export fn select(
     readfds: ?*c.fd_set,
     writefds: ?*c.fd_set,
     errorfds: ?*c.fd_set,
-    timeout: ?*c.timespec,
+    timeout: ?*c.timeval,
 ) c_int {
-    _ = nfds;
-    _ = readfds;
-    _ = writefds;
-    _ = errorfds;
-    _ = timeout;
+    if (nfds < 0) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+    if (builtin.os.tag == .linux) {
+        var linux_timeout: LinuxTimeval = undefined;
+        const timeout_ptr: usize = if (timeout) |to| blk: {
+            linux_timeout = cTimevalToLinux(to.*);
+            break :blk @intFromPtr(&linux_timeout);
+        } else 0;
+        const rc = std.os.linux.syscall5(
+            .select,
+            @as(usize, @bitCast(@as(isize, nfds))),
+            @intFromPtr(readfds),
+            @intFromPtr(writefds),
+            @intFromPtr(errorfds),
+            timeout_ptr,
+        );
+        switch (os.errno(rc)) {
+            .SUCCESS => {
+                if (timeout) |to| to.* = linuxTimevalToC(linux_timeout);
+                return @as(c_int, @intCast(rc));
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+
+    // Portable fallback for "sleep with timeout" mode only.
+    if (nfds == 0 and readfds == null and writefds == null and errorfds == null) {
+        if (timeout) |to| {
+            if (to.tv_sec < 0 or to.tv_usec < 0 or to.tv_usec >= 1000000) {
+                c.errno = c.EINVAL;
+                return -1;
+            }
+            const sec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_sec)), std.time.ns_per_s) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            const usec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_usec)), std.time.ns_per_us) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            const total_ns = std.math.add(u64, sec_ns, usec_ns) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            if (total_ns != 0) std.Thread.sleep(total_ns);
+            to.tv_sec = 0;
+            to.tv_usec = 0;
+            return 0;
+        } else {
+            // No timeout and no fds would block forever; keep behavior explicit.
+            c.errno = errnoConst("ENOSYS", c.EINVAL);
+            return -1;
+        }
+    }
     c.errno = errnoConst("ENOSYS", c.EINVAL);
     return -1;
 }

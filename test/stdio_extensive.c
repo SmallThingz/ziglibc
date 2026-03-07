@@ -71,7 +71,6 @@ int main(int argc, char *argv[])
     expect(tmp_name[0] != 0);
   }
 
-#ifndef _WIN32
   {
     FILE *tf = tmpfile();
     char buf[4];
@@ -83,7 +82,6 @@ int main(int argc, char *argv[])
     expect(0 == strcmp("abc", buf));
     expect(0 == fclose(tf));
   }
-#endif
 
   puts("Success!");
   return 0;
