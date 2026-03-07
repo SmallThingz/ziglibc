@@ -46,6 +46,7 @@ size_t wcstombs(char *s, const wchar_t *pwcs, size_t n);
 //       to live in this header
 #if 1
     int mkstemp(char *template);
+    int mkostemp(char *template, int suffixlen, int flags);
 #endif
 
 // NOTE: this stuff is defined by linux, not libc, but they need

@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const winfd = @import("winfd.zig");
 
 const c = @cImport({
     // problem with LONG_MIN/LONG_MAX, they are currently assuming 64 bit
@@ -63,6 +64,7 @@ const windows = struct {
         hTemplateFile: ?HANDLE,
     ) callconv(.winapi) ?HANDLE;
     pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
 };
 
 // --------------------------------------------------------------------------------
@@ -152,6 +154,30 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     return null;
 }
 
+fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return false;
+    defer file.close();
+    const len = file.readAll(buf) catch return false;
+
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < len) {
+        if (count + 1 >= ptr_cap) return false;
+        const begin = i;
+        while (i < len and buf[i] != 0) : (i += 1) {}
+        if (i == len) {
+            if (len == buf.len) return false;
+            buf[i] = 0;
+        }
+        ptrs[count] = @as([*:0]u8, @ptrCast(buf.ptr + begin));
+        count += 1;
+        i += 1;
+    }
+    ptrs[count] = null;
+    return true;
+}
+
 export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
     trace.log("system {f}", .{trace.fmtStr(string)});
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
@@ -181,8 +207,15 @@ export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
         const shell_path: [*:0]const u8 = "/bin/sh";
         const command = string.?;
         var argv = [_:null]?[*:0]const u8{ shell_path, "-c", command, null };
-        const envp = [_:null]?[*:0]const u8{null};
-        _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&envp));
+        if (builtin.os.tag == .linux) {
+            var env_buf: [32768]u8 = undefined;
+            var env_ptrs = [_:null]?[*:0]u8{null} ** 1024;
+            if (populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
+                _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
+            }
+        }
+        const empty_envp = [_:null]?[*:0]const u8{null};
+        _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&empty_envp));
         std.posix.system.exit(127);
     }
 
@@ -1134,20 +1167,25 @@ fn fopenImpl(
             null,
         );
         if (fd == std.os.windows.INVALID_HANDLE_VALUE) {
-            // TODO: do I need to set errno?
-            errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
             return null;
         }
         if (parsed.kind == .append) {
             std.os.windows.SetFilePointerEx_END(fd.?, 0) catch {
                 _ = windows.CloseHandle(fd.?);
-                errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
+                errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
                 return null;
             };
         }
         const file = global.reserveFile() orelse {
             _ = windows.CloseHandle(fd.?);
             errno = c.ENOMEM;
+            return null;
+        };
+        _ = winfd.allocHandle(fd.?) catch {
+            global.releaseFile(file);
+            _ = windows.CloseHandle(fd.?);
+            errno = errnoConst("EMFILE", c.ENOMEM);
             return null;
         };
         file.fd = fd;
@@ -1197,7 +1235,18 @@ pub export fn fopen64(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c)
 export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE) callconv(.c) ?*c.FILE {
     const new_stream = fopenImpl(filename, mode, false, "freopen") orelse return null;
     if (builtin.os.tag == .windows) {
-        _ = windows.CloseHandle(stream.fd.?);
+        if (winfd.fdFromHandle(stream.fd.?)) |fd| {
+            const close_errno = winfd.closeFd(fd);
+            if (close_errno != 0) {
+                _ = fclose(new_stream);
+                errno = close_errno;
+                return null;
+            }
+        } else if (windows.CloseHandle(stream.fd.?) == 0) {
+            _ = fclose(new_stream);
+            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return null;
+        }
     } else {
         _ = std.posix.system.close(stream.fd);
     }
@@ -1213,8 +1262,14 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
 export fn fclose(stream: *c.FILE) callconv(.c) c_int {
     trace.log("fclose {*}", .{stream});
     if (builtin.os.tag == .windows) {
-        if (windows.CloseHandle(stream.fd.?) == 0) {
-            errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
+        if (winfd.fdFromHandle(stream.fd.?)) |fd| {
+            const close_errno = winfd.closeFd(fd);
+            if (close_errno != 0) {
+                errno = close_errno;
+                return c.EOF;
+            }
+        } else if (windows.CloseHandle(stream.fd.?) == 0) {
+            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
             return c.EOF;
         }
     } else {
@@ -1872,11 +1927,21 @@ export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
 
 export fn tmpfile() callconv(.c) ?*c.FILE {
     if (builtin.os.tag == .windows) {
+        var temp_buf: [std.os.windows.MAX_PATH:0]u8 = undefined;
+        const temp_len = windows.GetTempPathA(temp_buf.len, &temp_buf);
+        if (temp_len == 0 or temp_len >= temp_buf.len) {
+            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return null;
+        }
         var attempt_windows: usize = 0;
         while (attempt_windows < 1024) : (attempt_windows += 1) {
             const id = @atomicRmw(u32, &global.tmpfile_counter, .Add, 1, .seq_cst);
-            var name_buf: [48:0]u8 = undefined;
-            const name = std.fmt.bufPrint(name_buf[0 .. name_buf.len - 1], "tmpfile-{x:0>8}.tmp", .{id}) catch unreachable;
+            var name_buf: [std.os.windows.MAX_PATH:0]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                name_buf[0 .. name_buf.len - 1],
+                "{s}tmpfile-{x:0>8}.tmp",
+                .{ temp_buf[0..temp_len], id },
+            ) catch unreachable;
             name_buf[name.len] = 0;
 
             const fd = windows.CreateFileA(
@@ -1897,6 +1962,12 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
                     errno = c.ENOMEM;
                     return null;
                 };
+                _ = winfd.allocHandle(fd.?) catch {
+                    global.releaseFile(file);
+                    _ = windows.CloseHandle(fd.?);
+                    errno = errnoConst("EMFILE", c.ENOMEM);
+                    return null;
+                };
                 file.fd = fd;
                 file.eof = 0;
                 file.errno = 0;
@@ -1904,7 +1975,7 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
             }
             const win_err = std.os.windows.kernel32.GetLastError();
             if (win_err == .FILE_EXISTS or win_err == .ALREADY_EXISTS) continue;
-            errno = @intFromEnum(win_err);
+            errno = winfd.errnoFromWin32(win_err);
             return null;
         }
         errno = c.EEXIST;
@@ -2741,6 +2812,7 @@ comptime {
 
         @export(&longjmp_x86_64, .{ .name = "longjmp" });
         @export(&longjmp_x86_64, .{ .name = "_longjmp" });
+        @export(&longjmp_x86_64, .{ .name = "__longjmp" });
     } else if (has_aarch64_setjmp_asm) {
         @export(&setjmp_aarch64, .{ .name = "setjmp" });
         @export(&setjmp_aarch64, .{ .name = "_setjmp" });
@@ -2748,6 +2820,7 @@ comptime {
 
         @export(&longjmp_aarch64, .{ .name = "longjmp" });
         @export(&longjmp_aarch64, .{ .name = "_longjmp" });
+        @export(&longjmp_aarch64, .{ .name = "__longjmp" });
     } else {
         @export(&setjmp_fallback, .{ .name = "setjmp" });
         @export(&setjmp_fallback, .{ .name = "_setjmp" });
@@ -2755,5 +2828,6 @@ comptime {
 
         @export(&longjmp_fallback, .{ .name = "longjmp" });
         @export(&longjmp_fallback, .{ .name = "_longjmp" });
+        @export(&longjmp_fallback, .{ .name = "__longjmp" });
     }
 }

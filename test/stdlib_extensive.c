@@ -62,6 +62,16 @@ int main(int argc, char *argv[])
     expect((status & 0x7f) == 0);
     expect(7 == ((status >> 8) & 0xff));
   }
+
+  {
+    const char *home = getenv("HOME");
+    if (home != NULL && home[0] != '\0') {
+      int status = system("test -n \"$HOME\"");
+      expect(status != -1);
+      expect((status & 0x7f) == 0);
+      expect(0 == ((status >> 8) & 0xff));
+    }
+  }
 #else
   errno = 0;
   expect(-1 == system(NULL));

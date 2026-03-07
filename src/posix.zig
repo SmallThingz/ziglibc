@@ -1,9 +1,11 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const os = std.posix;
+const winfd = @import("winfd.zig");
 
 const c = @cImport({
     @cInclude("errno.h");
+    @cInclude("fcntl.h");
     @cInclude("string.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
@@ -25,8 +27,24 @@ extern "c" fn syscall(number: c_long, ...) c_long;
 const trace = @import("trace.zig");
 
 const winapi = if (builtin.os.tag == .windows) struct {
+    pub extern "kernel32" fn CreateFileA(
+        lpFileName: ?[*:0]const u8,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: ?*anyopaque,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: ?std.os.windows.HANDLE,
+    ) callconv(.winapi) ?std.os.windows.HANDLE;
+    pub extern "kernel32" fn CloseHandle(hObject: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(.winapi) u32;
     pub extern "kernel32" fn SetFileAttributesA(lpFileName: ?[*:0]const u8, dwFileAttributes: u32) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn GetFileType(hFile: std.os.windows.HANDLE) callconv(.winapi) u32;
+    pub extern "kernel32" fn GetFileInformationByHandle(
+        hFile: std.os.windows.HANDLE,
+        lpFileInformation: *std.os.windows.BY_HANDLE_FILE_INFORMATION,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
 } else struct {};
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
@@ -59,13 +77,7 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
 } else struct {};
 
 fn windowsStdHandleFromFd(fd: c_int) ?std.os.windows.HANDLE {
-    const process_params = std.os.windows.peb().ProcessParameters;
-    return switch (fd) {
-        0 => process_params.hStdInput,
-        1 => process_params.hStdOutput,
-        2 => process_params.hStdError,
-        else => null,
-    };
+    return winfd.handleFromFd(fd);
 }
 
 // C ABI globals: `extern char *optarg; extern int opterr, optind, optopt;`
@@ -133,6 +145,30 @@ fn waitForPidStatus(pid: PopenPid) c_int {
             },
         }
     }
+}
+
+fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return false;
+    defer file.close();
+    const len = file.readAll(buf) catch return false;
+
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < len) {
+        if (count + 1 >= ptr_cap) return false;
+        const begin = i;
+        while (i < len and buf[i] != 0) : (i += 1) {}
+        if (i == len) {
+            if (len == buf.len) return false;
+            buf[i] = 0;
+        }
+        ptrs[count] = @as([*:0]u8, @ptrCast(buf.ptr + begin));
+        count += 1;
+        i += 1;
+    }
+    ptrs[count] = null;
+    return true;
 }
 
 /// Returns some information through these globals
@@ -306,8 +342,55 @@ fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
         return if (rc == -1) -1 else @as(c_int, @intCast(rc));
     }
     if (builtin.os.tag == .windows) {
-        c.errno = errnoConst("ENOSYS", c.EINVAL);
-        return -1;
+        const accmode = oflag & 0x3;
+        var desired_access: u32 = switch (accmode) {
+            c.O_RDONLY => std.os.windows.GENERIC_READ,
+            c.O_WRONLY => std.os.windows.GENERIC_WRITE,
+            c.O_RDWR => std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
+            else => {
+                c.errno = c.EINVAL;
+                return -1;
+            },
+        };
+        if ((oflag & c.O_APPEND) != 0) desired_access |= std.os.windows.FILE_APPEND_DATA;
+
+        const creation_disposition: u32 = blk: {
+            const creat = (oflag & c.O_CREAT) != 0;
+            const excl = (oflag & c.O_EXCL) != 0;
+            const trunc = (oflag & c.O_TRUNC) != 0;
+            if (creat and excl) break :blk std.os.windows.CREATE_NEW;
+            if (creat and trunc) break :blk std.os.windows.CREATE_ALWAYS;
+            if (creat) break :blk std.os.windows.OPEN_ALWAYS;
+            if (trunc) break :blk std.os.windows.TRUNCATE_EXISTING;
+            break :blk std.os.windows.OPEN_EXISTING;
+        };
+
+        const attributes: u32 = if ((oflag & c.O_CREAT) != 0 and (mode & 0o222) == 0)
+            std.os.windows.FILE_ATTRIBUTE_READONLY
+        else
+            std.os.windows.FILE_ATTRIBUTE_NORMAL;
+
+        const handle = winapi.CreateFileA(
+            path,
+            desired_access,
+            std.os.windows.FILE_SHARE_DELETE |
+                std.os.windows.FILE_SHARE_READ |
+                std.os.windows.FILE_SHARE_WRITE,
+            null,
+            creation_disposition,
+            attributes,
+            null,
+        );
+        if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
+        }
+
+        return winfd.allocHandle(handle.?) catch {
+            _ = winapi.CloseHandle(handle.?);
+            c.errno = errnoConst("EMFILE", c.ENOMEM);
+            return -1;
+        };
     }
     const flags_bits: u32 = @bitCast(oflag);
     const flags: os.O = @bitCast(flags_bits);
@@ -359,11 +442,6 @@ export fn mkstemp(template: [*:0]u8) callconv(.c) c_int {
 
 export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.c) c_int {
     trace.log("mkstemp '{f}'", .{trace.fmtStr(template)});
-    if (builtin.os.tag == .windows) {
-        c.errno = errnoConst("ENOSYS", c.EINVAL);
-        return -1;
-    }
-
     const rand_part: *[6]u8 = blk: {
         const len = c.strlen(template);
         if (6 + suffixlen > len) {
@@ -383,18 +461,22 @@ export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         randomizeTempFilename(rand_part);
-        const extra_flags: u32 = @as(u32, @intCast(flags));
-        const required_flags = os.O{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-            .EXCL = true,
+        const fd = if (builtin.os.tag == .windows)
+            zopenRaw(template, flags | c.O_RDWR | c.O_CREAT | c.O_EXCL, 0o600)
+        else blk: {
+            const extra_flags: u32 = @as(u32, @intCast(flags));
+            const required_flags = os.O{
+                .ACCMODE = .RDWR,
+                .CREAT = true,
+                .EXCL = true,
+            };
+            const merged_flags: os.O = @bitCast(@as(u32, @bitCast(required_flags)) | extra_flags);
+            break :blk zopenRaw(
+                template,
+                @as(c_int, @bitCast(@as(u32, @bitCast(merged_flags)))),
+                0o600,
+            );
         };
-        const merged_flags: os.O = @bitCast(@as(u32, @bitCast(required_flags)) | extra_flags);
-        const fd = zopenRaw(
-            template,
-            @as(c_int, @bitCast(@as(u32, @bitCast(merged_flags)))),
-            0o600,
-        );
         if (fd >= 0) return fd;
         if (attempt >= max_attempts) {
             rand_part.* = [_]u8{ 'X', 'X', 'X', 'X', 'X', 'X' };
@@ -428,8 +510,10 @@ fn randomizeTempFilename(slice: *[6]u8) void {
 // --------------------------------------------------------------------------------
 export fn fileno(stream: *c.FILE) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
-        // this probably isn't right, but might be fine for an initial implementation
-        return @as(c_int, @intCast(@intFromPtr(stream.fd)));
+        return winfd.fdFromHandle(stream.fd.?) orelse blk: {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            break :blk -1;
+        };
     }
     return stream.fd;
 }
@@ -489,8 +573,15 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
 
         const shell_path: [*:0]const u8 = "/bin/sh";
         var argv = [_:null]?[*:0]const u8{ shell_path, "-c", command, null };
-        const envp = [_:null]?[*:0]const u8{null};
-        _ = os.system.execve(shell_path, &argv, @ptrCast(&envp));
+        if (builtin.os.tag == .linux) {
+            var env_buf: [32768]u8 = undefined;
+            var env_ptrs = [_:null]?[*:0]u8{null} ** 1024;
+            if (populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
+                _ = os.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
+            }
+        }
+        const empty_envp = [_:null]?[*:0]const u8{null};
+        _ = os.system.execve(shell_path, &argv, @ptrCast(&empty_envp));
         os.system.exit(127);
     }
 
@@ -536,7 +627,7 @@ export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
         return null;
     };
     if (builtin.os.tag == .windows) {
-        const handle = windowsStdHandleFromFd(fd) orelse {
+        const handle = winfd.handleFromFd(fd) orelse {
             c.errno = errnoConst("EBADF", c.EINVAL);
             return null;
         };
@@ -552,10 +643,16 @@ export fn fdopen(fd: c_int, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
 // unistd
 // --------------------------------------------------------------------------------
 comptime {
-    if (builtin.os.tag != .windows) @export(&close, .{ .name = "close" });
+    @export(&close, .{ .name = "close" });
 }
 fn close(fd: c_int) callconv(.c) c_int {
     trace.log("close {}", .{fd});
+    if (builtin.os.tag == .windows) {
+        const close_errno = winfd.closeFd(fd);
+        if (close_errno == 0) return 0;
+        c.errno = close_errno;
+        return -1;
+    }
     switch (os.errno(os.system.close(fd))) {
         .SUCCESS => return 0,
         else => |e| {
@@ -588,6 +685,58 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
 }
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
+    if (builtin.os.tag == .windows) {
+        std.posix.unlinkZ(path) catch |err| {
+            if (err == error.AccessDenied) {
+                const attrs = winapi.GetFileAttributesA(path);
+                if (attrs != std.os.windows.INVALID_FILE_ATTRIBUTES and
+                    (attrs & std.os.windows.FILE_ATTRIBUTE_READONLY) != 0)
+                {
+                    if (winapi.SetFileAttributesA(path, attrs & ~@as(u32, std.os.windows.FILE_ATTRIBUTE_READONLY)) != 0) {
+                        std.posix.unlinkZ(path) catch |retry_err| {
+                            c.errno = switch (retry_err) {
+                                error.AccessDenied => c.EACCES,
+                                error.PermissionDenied => c.EPERM,
+                                error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+                                error.FileSystem => errnoConst("EIO", c.EINVAL),
+                                error.IsDir => errnoConst("EISDIR", c.EINVAL),
+                                error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+                                error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+                                error.FileNotFound => c.ENOENT,
+                                error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+                                error.SystemResources => c.ENOMEM,
+                                error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+                                error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
+                                error.NetworkNotFound => c.ENOENT,
+                                else => errnoConst("EIO", c.EINVAL),
+                            };
+                            return -1;
+                        };
+                        return 0;
+                    }
+                }
+            }
+            c.errno = switch (err) {
+                error.AccessDenied => c.EACCES,
+                error.PermissionDenied => c.EPERM,
+                error.FileBusy => errnoConst("EBUSY", c.EINVAL),
+                error.FileSystem => errnoConst("EIO", c.EINVAL),
+                error.IsDir => errnoConst("EISDIR", c.EINVAL),
+                error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+                error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+                error.FileNotFound => c.ENOENT,
+                error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+                error.SystemResources => c.ENOMEM,
+                error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
+                error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
+                error.NetworkNotFound => c.ENOENT,
+                else => errnoConst("EIO", c.EINVAL),
+            };
+            return -1;
+        };
+        return 0;
+    }
+
     std.posix.unlinkZ(path) catch |err| {
         c.errno = switch (err) {
             error.AccessDenied => c.EACCES,
@@ -694,6 +843,25 @@ fn linuxTimevalToC(tv: LinuxTimeval) c.timeval {
     return out;
 }
 
+fn windowsFileTimeToUnix100ns(ft: std.os.windows.FILETIME) u64 {
+    return (@as(u64, ft.dwHighDateTime) << 32) | @as(u64, ft.dwLowDateTime);
+}
+
+fn currentWindowsUnixTime() struct { sec: i64, usec: i64, nsec: i64 } {
+    var ft: std.os.windows.FILETIME = undefined;
+    winapi.GetSystemTimeAsFileTime(&ft);
+    const ticks_100ns = windowsFileTimeToUnix100ns(ft);
+    const unix_epoch_100ns: u64 = 11644473600 * 10_000_000;
+    const unix_100ns = if (ticks_100ns > unix_epoch_100ns) ticks_100ns - unix_epoch_100ns else 0;
+    const sec = unix_100ns / 10_000_000;
+    const rem_100ns = unix_100ns % 10_000_000;
+    return .{
+        .sec = @as(i64, @intCast(sec)),
+        .usec = @as(i64, @intCast(rem_100ns / 10)),
+        .nsec = @as(i64, @intCast(rem_100ns * 100)),
+    };
+}
+
 export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
     if (builtin.os.tag.isDarwin()) {
         if (clk_id == c.CLOCK_REALTIME) {
@@ -726,10 +894,8 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
 
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
-            const ns = std.time.nanoTimestamp();
-            const sec = @divFloor(ns, std.time.ns_per_s);
-            const nsec = @mod(ns, std.time.ns_per_s);
-            setTimespec(tp, sec, nsec);
+            const now = currentWindowsUnixTime();
+            setTimespec(tp, now.sec, now.nsec);
             return 0;
         }
         c.errno = c.EINVAL;
@@ -753,9 +919,9 @@ export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
         return if (rc == -1) -1 else 0;
     }
     if (builtin.os.tag == .windows) {
-        const ns = std.time.nanoTimestamp();
-        tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(@divFloor(ns, std.time.ns_per_s)));
-        tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(@divFloor(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)));
+        const now = currentWindowsUnixTime();
+        tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(now.sec));
+        tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(now.usec));
         return 0;
     }
     const ns = std.time.nanoTimestamp();
@@ -889,11 +1055,7 @@ export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         const attrs = winapi.GetFileAttributesA(path);
         if (attrs == std.os.windows.INVALID_FILE_ATTRIBUTES) {
-            c.errno = switch (std.os.windows.kernel32.GetLastError()) {
-                .FILE_NOT_FOUND, .PATH_NOT_FOUND => c.ENOENT,
-                .ACCESS_DENIED => c.EACCES,
-                else => c.EINVAL,
-            };
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
             return -1;
         }
 
@@ -905,11 +1067,7 @@ export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
             new_attrs |= std.os.windows.FILE_ATTRIBUTE_READONLY;
         }
         if (winapi.SetFileAttributesA(path, new_attrs) == 0) {
-            c.errno = switch (std.os.windows.kernel32.GetLastError()) {
-                .FILE_NOT_FOUND, .PATH_NOT_FOUND => c.ENOENT,
-                .ACCESS_DENIED => c.EACCES,
-                else => c.EINVAL,
-            };
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
             return -1;
         }
         return 0;
@@ -939,17 +1097,43 @@ fn timespecSeconds(ts: anytype) i64 {
 
 export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
     if (builtin.os.tag == .windows) {
-        const handle = windowsStdHandleFromFd(fd) orelse {
+        const handle = winfd.handleFromFd(fd) orelse {
             c.errno = errnoConst("EBADF", c.EINVAL);
             return -1;
         };
         buf.* = std.mem.zeroes(c.struct_stat);
-        buf.st_nlink = 1;
-        buf.st_mode = c.S_IRUSR | c.S_IWUSR;
-        var size: std.os.windows.LARGE_INTEGER = 0;
-        if (std.os.windows.kernel32.GetFileSizeEx(handle, &size) != 0) {
-            buf.st_size = @as(@TypeOf(buf.st_size), @intCast(size));
+
+        const file_type = winapi.GetFileType(handle);
+        if (file_type == 0) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
         }
+
+        if (file_type == 0x0002 or file_type == 0x0003) {
+            buf.st_nlink = 1;
+            buf.st_mode = c.S_IRUSR | c.S_IWUSR;
+            return 0;
+        }
+
+        var info: std.os.windows.BY_HANDLE_FILE_INFORMATION = undefined;
+        if (winapi.GetFileInformationByHandle(handle, &info) == 0) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
+        }
+        const readonly = (info.dwFileAttributes & std.os.windows.FILE_ATTRIBUTE_READONLY) != 0;
+        const size: u64 = (@as(u64, info.nFileSizeHigh) << 32) | @as(u64, info.nFileSizeLow);
+        const inode: u64 = (@as(u64, info.nFileIndexHigh) << 32) | @as(u64, info.nFileIndexLow);
+        const now = currentWindowsUnixTime();
+
+        buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(info.dwVolumeSerialNumber));
+        buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(inode));
+        const mode_bits: c_int = c.S_IRUSR | (if (readonly) @as(c_int, 0) else c.S_IWUSR);
+        buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(mode_bits));
+        buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(if (info.nNumberOfLinks == 0) 1 else info.nNumberOfLinks));
+        buf.st_size = @as(@TypeOf(buf.st_size), @intCast(size));
+        buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(now.sec));
+        buf.st_mtime = buf.st_atime;
+        buf.st_ctime = buf.st_atime;
         return 0;
     }
     var stat_buf: os.Stat = undefined;

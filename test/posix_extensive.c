@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -83,6 +84,18 @@ int main(int argc, char *argv[])
     expect(NULL == popen("echo invalid", "x"));
     expect(EINVAL == errno);
   }
+
+  {
+    const char *home = getenv("HOME");
+    if (home != NULL && home[0] != '\0') {
+      FILE *p = popen("printf %s \"$HOME\"", "r");
+      char buf[512];
+      expect(p != NULL);
+      expect(NULL != fgets(buf, sizeof(buf), p));
+      expect(0 == strcmp(buf, home));
+      expect(0 == pclose(p));
+    }
+  }
 #else
   {
     const char *name = "posix-win-chmod.tmp";
@@ -97,6 +110,14 @@ int main(int argc, char *argv[])
     errno = 0;
     expect(-1 == chmod(name, 0600));
     expect(errno == ENOENT || errno == EACCES || errno == EINVAL);
+  }
+
+  {
+    char templ[] = "mkostemp-win-XXXXXX";
+    int fd = mkostemp(templ, 0, 0);
+    expect(fd >= 0);
+    expect(0 == close(fd));
+    expect(0 == unlink(templ));
   }
 #endif
 
