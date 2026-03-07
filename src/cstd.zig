@@ -1586,6 +1586,7 @@ const FormatLength = enum {
     none,
     long,
     long_long,
+    size,
 };
 
 const FormatWriter = union(enum) {
@@ -1721,6 +1722,10 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 i += 1;
             }
             if (i >= fmt_slice.len) return false;
+        } else if (fmt_slice[i] == 'z') {
+            spec_length = .size;
+            i += 1;
+            if (i >= fmt_slice.len) return false;
         }
 
         switch (fmt_slice[i]) {
@@ -1751,6 +1756,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                     .none => formatIntCompat(&buf, vaArgCompat(args, c_int), 10),
                     .long => formatIntCompat(&buf, vaArgCompat(args, c_long), 10),
                     .long_long => formatIntCompat(&buf, vaArgCompat(args, c_longlong), 10),
+                    .size => formatIntCompat(&buf, vaArgCompat(args, isize), 10),
                 };
                 const written = writer.write(buf[0..len]);
                 out_written.* += written;
@@ -1764,6 +1770,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                     .none => formatIntCompat(&buf, vaArgCompat(args, c_uint), base),
                     .long => formatIntCompat(&buf, vaArgCompat(args, c_ulong), base),
                     .long_long => formatIntCompat(&buf, vaArgCompat(args, c_ulonglong), base),
+                    .size => formatIntCompat(&buf, vaArgCompat(args, usize), base),
                 };
                 const written = writer.write(buf[0..len]);
                 out_written.* += written;

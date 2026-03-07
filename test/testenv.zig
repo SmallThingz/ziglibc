@@ -29,6 +29,18 @@ fn darlingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return allocator.dupe(u8, path_no_dot);
 }
 
+fn normalizeDarwinPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
+    if (std.mem.startsWith(u8, path_no_dot, "/Volumes/SystemRoot/")) {
+        return allocator.dupe(u8, path_no_dot);
+    }
+    if (path_no_dot.len > 0 and path_no_dot[0] == '/') {
+        return darlingPathAlloc(allocator, path_no_dot);
+    }
+    const abs = try std.fs.realpathAlloc(allocator, path_no_dot);
+    return darlingPathAlloc(allocator, abs);
+}
+
 pub fn main() !u8 {
     const full_args = try std.process.argsAlloc(arena.allocator());
     if (full_args.len <= 1) {
@@ -42,17 +54,10 @@ pub fn main() !u8 {
         const cwd = try std.process.getCwdAlloc(arena.allocator());
         child_args[0] = try windowsPathAlloc(arena.allocator(), cwd, args[0]);
     } else if (builtin.os.tag.isDarwin()) {
-        if (std.mem.startsWith(u8, args[0], "/Volumes/SystemRoot/")) {
-            child_args[0] = try arena.allocator().dupe(u8, args[0]);
-        } else if (std.mem.startsWith(u8, args[0], "/")) {
-            child_args[0] = try darlingPathAlloc(arena.allocator(), args[0]);
-        } else {
-            const abs = std.fs.realpathAlloc(arena.allocator(), args[0]) catch |err| {
-                std.log.err("realpath(program) failed: {}", .{err});
-                return err;
-            };
-            child_args[0] = try darlingPathAlloc(arena.allocator(), abs);
-        }
+        child_args[0] = normalizeDarwinPathAlloc(arena.allocator(), args[0]) catch |err| {
+            std.log.err("failed to normalize darwin program path: {}", .{err});
+            return err;
+        };
     } else {
         child_args[0] = std.fs.realpathAlloc(arena.allocator(), args[0]) catch |err| {
             std.log.err("realpath(program) failed: {}", .{err});
@@ -73,8 +78,10 @@ pub fn main() !u8 {
         const cwd = try std.process.getCwdAlloc(arena.allocator());
         break :blk try windowsPathAlloc(arena.allocator(), cwd, dirname);
     } else if (builtin.os.tag.isDarwin()) blk: {
-        const cwd = try std.fs.cwd().realpathAlloc(arena.allocator(), dirname);
-        break :blk try darlingPathAlloc(arena.allocator(), cwd);
+        break :blk normalizeDarwinPathAlloc(arena.allocator(), dirname) catch |err| {
+            std.log.err("failed to normalize darwin cwd: {}", .{err});
+            return err;
+        };
     } else std.fs.cwd().realpathAlloc(arena.allocator(), dirname) catch |err| {
         std.log.err("realpath(cwd) failed: {}", .{err});
         return err;

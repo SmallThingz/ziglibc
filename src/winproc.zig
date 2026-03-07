@@ -108,5 +108,5 @@ pub fn waitProcessStatus(process_handle: windows.HANDLE) c_int {
     }
 
     windows.CloseHandle(process_handle);
-    return @as(c_int, @intCast(exit_code)) << 8;
+    return @as(c_int, @intCast(exit_code));
 }

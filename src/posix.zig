@@ -484,23 +484,6 @@ comptime {
     exportInternalSymbol(&_zopen, "_zopen");
 }
 
-fn _zrename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
-    if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.rename, old, new);
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
-            return -1;
-        }
-        return 0;
-    }
-    c.errno = errnoConst("ENOSYS", c.EINVAL);
-    return -1;
-}
-
-comptime {
-    exportInternalSymbol(&_zrename, "_zrename");
-}
-
 // --------------------------------------------------------------------------------
 // string
 // --------------------------------------------------------------------------------

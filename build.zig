@@ -217,6 +217,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const parity_env_exe = addExecutableCompat(b, .{
+        .name = "parityenv",
+        .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "parityenv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     {
         const exe = addTest("hello", b, target, optimize, libc_only_std_static, zig_start);
@@ -338,6 +344,16 @@ pub fn build(b: *std.Build) void {
             run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
             test_step.dependOn(&run.step);
         }
+    }
+
+    {
+        const system_exe = addSystemParityProbe(b, target, optimize);
+        const zig_exe = addZigParityProbe(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
+        const run_step = addRunArtifactCompat(b, parity_env_exe);
+        addArtifactArgCompat(run_step, b, system_exe);
+        addArtifactArgCompat(run_step, b, zig_exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
     }
 
     if (supportsSetjmp(target.result)) {
@@ -463,6 +479,72 @@ fn addTest(
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
     }
+    return exe;
+}
+
+const ParityFeatures = struct {
+    sigaction: bool,
+    setitimer: bool,
+    select: bool,
+};
+
+fn parityFeaturesFor(target: std.Target) ParityFeatures {
+    return .{
+        .sigaction = target.os.tag != .windows and target.os.tag != .wasi,
+        .setitimer = target.os.tag == .linux or target.os.tag.isDarwin(),
+        .select = target.os.tag == .linux or target.os.tag.isDarwin(),
+    };
+}
+
+fn addParityProbeCommon(
+    b: *std.Build,
+    name: []const u8,
+    target: anytype,
+    optimize: anytype,
+) *std.Build.Step.Compile {
+    const exe = addExecutableCompat(b, .{
+        .name = name,
+        .target = target,
+        .optimize = optimize,
+    });
+    const parity = parityFeaturesFor(target.result);
+    const flags = [_][]const u8{
+        b.fmt("-DLIBC_PARITY_HAVE_SIGACTION={d}", .{@intFromBool(parity.sigaction)}),
+        b.fmt("-DLIBC_PARITY_HAVE_SETITIMER={d}", .{@intFromBool(parity.setitimer)}),
+        b.fmt("-DLIBC_PARITY_HAVE_SELECT={d}", .{@intFromBool(parity.select)}),
+    };
+    addCSourceFilesCompat(exe, &.{"test" ++ std.fs.path.sep_str ++ "libc_parity.c"}, flags[0..]);
+    if (target.result.os.tag == .windows) {
+        exe.linkSystemLibrary("ntdll");
+        exe.linkSystemLibrary("kernel32");
+    }
+    return exe;
+}
+
+fn addSystemParityProbe(
+    b: *std.Build,
+    target: anytype,
+    optimize: anytype,
+) *std.Build.Step.Compile {
+    const exe = addParityProbeCommon(b, "libc-parity-system", target, optimize);
+    exe.linkLibC();
+    return exe;
+}
+
+fn addZigParityProbe(
+    b: *std.Build,
+    target: anytype,
+    optimize: anytype,
+    libc_only_std_static: *std.Build.Step.Compile,
+    zig_start: *std.Build.Step.Compile,
+    libc_only_posix: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const exe = addParityProbeCommon(b, "libc-parity-zig", target, optimize);
+    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+    exe.linkLibrary(libc_only_std_static);
+    exe.linkLibrary(zig_start);
+    addPosix(exe, libc_only_posix);
     return exe;
 }
 

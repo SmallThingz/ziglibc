@@ -56,6 +56,19 @@ int main(int argc, char *argv[])
 #endif
 #else
   expect(signal(SIGINT, test_handler) != SIG_ERR);
+
+  {
+    struct sigaction act;
+    struct sigaction old;
+    struct sigaction restore;
+    memset(&act, 0, sizeof(act));
+    memset(&old, 0, sizeof(old));
+    memset(&restore, 0, sizeof(restore));
+    act.sa_handler = test_handler;
+    expect(0 == sigaction(SIGINT, &act, &old));
+    expect(0 == sigaction(SIGINT, &old, &restore));
+    expect(restore.sa_handler == test_handler);
+  }
 #endif
 
   puts("Success!");

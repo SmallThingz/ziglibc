@@ -120,9 +120,40 @@ int main(int argc, char *argv[])
     expect(0 == close(fd));
     expect(0 == unlink(templ));
   }
+
+  {
+    FILE *p = popen("set /p =popen-ok <nul", "r");
+    char buf[64];
+    expect(p != NULL);
+    expect(NULL != fgets(buf, sizeof(buf), p));
+    expect(0 == strncmp(buf, "popen-ok", 8));
+    expect(0 == pclose(p));
+  }
+
+  {
+    FILE *p = popen("exit /b 5", "r");
+    expect(p != NULL);
+    expect(5 == pclose(p));
+  }
+
+  {
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    expect(0 == select(0, NULL, NULL, NULL, &tv));
+  }
+
+  {
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    errno = 0;
+    expect(-1 == select(-1, NULL, NULL, NULL, &tv));
+    expect(EINVAL == errno);
+  }
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
   {
     struct itimerval val;
     struct itimerval old;
