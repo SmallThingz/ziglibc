@@ -1460,10 +1460,30 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 // sys/stat.h
 // --------------------------------------------------------------------------------
 export fn stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int {
-    const fd = zopenRaw(path, c.O_RDONLY, 0);
-    if (fd < 0) return -1;
-    defer _ = close(fd);
-    return fstat(fd, buf);
+    if (builtin.os.tag == .windows) {
+        const fd = zopenRaw(path, c.O_RDONLY, 0);
+        if (fd < 0) return -1;
+        defer _ = close(fd);
+        return fstat(fd, buf);
+    }
+
+    // `stat()` is a pathname query, not `open()+fstat()`. The shortcut happened to
+    // pass under Darling, but native macOS diverged in CI and truncated the
+    // `utimes` parity test because pathname lookup semantics and openability are
+    // not equivalent. Keep POSIX targets on a real pathname stat so Darwin and
+    // Linux both observe the same file metadata that the system libc does.
+    var stat_buf: os.Stat = undefined;
+    const fstatat_sym = if (@hasDecl(os.system, "fstatat64")) os.system.fstatat64 else os.system.fstatat;
+    switch (os.errno(fstatat_sym(os.AT.FDCWD, path, &stat_buf, 0))) {
+        .SUCCESS => {
+            copyPosixStatToC(buf, stat_buf);
+            return 0;
+        },
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
@@ -1519,6 +1539,36 @@ fn timespecSeconds(ts: anytype) i64 {
     return @as(i64, @intCast(ts.sec));
 }
 
+fn copyPosixStatToC(buf: *c.struct_stat, stat_buf: os.Stat) void {
+    const stat_ty = @TypeOf(stat_buf);
+    const atime = if (@hasField(stat_ty, "atim"))
+        timespecSeconds(stat_buf.atim)
+    else
+        timespecSeconds(stat_buf.atimespec);
+    const mtime = if (@hasField(stat_ty, "mtim"))
+        timespecSeconds(stat_buf.mtim)
+    else
+        timespecSeconds(stat_buf.mtimespec);
+    const ctime = if (@hasField(stat_ty, "ctim"))
+        timespecSeconds(stat_buf.ctim)
+    else
+        timespecSeconds(stat_buf.ctimespec);
+
+    buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(stat_buf.dev));
+    buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(stat_buf.ino));
+    buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(stat_buf.mode));
+    buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(stat_buf.nlink));
+    buf.st_uid = @as(@TypeOf(buf.st_uid), @intCast(stat_buf.uid));
+    buf.st_gid = @as(@TypeOf(buf.st_gid), @intCast(stat_buf.gid));
+    buf.st_rdev = @as(@TypeOf(buf.st_rdev), @intCast(stat_buf.rdev));
+    buf.st_size = @as(@TypeOf(buf.st_size), @intCast(stat_buf.size));
+    buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(atime));
+    buf.st_mtime = @as(@TypeOf(buf.st_mtime), @intCast(mtime));
+    buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(ctime));
+    buf.st_blksize = @as(@TypeOf(buf.st_blksize), @intCast(stat_buf.blksize));
+    buf.st_blocks = @as(@TypeOf(buf.st_blocks), @intCast(stat_buf.blocks));
+}
+
 export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
     if (builtin.os.tag == .windows) {
         const handle = winfd.handleFromFd(fd) orelse {
@@ -1568,33 +1618,7 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
         },
     }
 
-    const stat_ty = @TypeOf(stat_buf);
-    const atime = if (@hasField(stat_ty, "atim"))
-        timespecSeconds(stat_buf.atim)
-    else
-        timespecSeconds(stat_buf.atimespec);
-    const mtime = if (@hasField(stat_ty, "mtim"))
-        timespecSeconds(stat_buf.mtim)
-    else
-        timespecSeconds(stat_buf.mtimespec);
-    const ctime = if (@hasField(stat_ty, "ctim"))
-        timespecSeconds(stat_buf.ctim)
-    else
-        timespecSeconds(stat_buf.ctimespec);
-
-    buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(stat_buf.dev));
-    buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(stat_buf.ino));
-    buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(stat_buf.mode));
-    buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(stat_buf.nlink));
-    buf.st_uid = @as(@TypeOf(buf.st_uid), @intCast(stat_buf.uid));
-    buf.st_gid = @as(@TypeOf(buf.st_gid), @intCast(stat_buf.gid));
-    buf.st_rdev = @as(@TypeOf(buf.st_rdev), @intCast(stat_buf.rdev));
-    buf.st_size = @as(@TypeOf(buf.st_size), @intCast(stat_buf.size));
-    buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(atime));
-    buf.st_mtime = @as(@TypeOf(buf.st_mtime), @intCast(mtime));
-    buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(ctime));
-    buf.st_blksize = @as(@TypeOf(buf.st_blksize), @intCast(stat_buf.blksize));
-    buf.st_blocks = @as(@TypeOf(buf.st_blocks), @intCast(stat_buf.blocks));
+    copyPosixStatToC(buf, stat_buf);
     return 0;
 }
 

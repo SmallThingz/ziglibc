@@ -30,16 +30,36 @@ fn darlingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return allocator.dupe(u8, path_no_dot);
 }
 
+fn pathExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
 fn normalizeDarwinPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
     if (std.mem.startsWith(u8, path_no_dot, "/Volumes/SystemRoot/")) {
         return allocator.dupe(u8, path_no_dot);
     }
     if (path_no_dot.len > 0 and path_no_dot[0] == '/') {
+        // Darling exposes the Linux host filesystem under /Volumes/SystemRoot, but a
+        // native macOS run needs the real absolute path untouched. Rewriting every
+        // absolute path here regresses native CI with FileNotFound as soon as the
+        // child executable or cwd lives outside Darling.
+        if (pathExistsAbsolute(path_no_dot)) {
+            return allocator.dupe(u8, path_no_dot);
+        }
         return darlingPathAlloc(allocator, path_no_dot);
     }
-    const abs = try std.fs.realpathAlloc(allocator, path_no_dot);
-    return darlingPathAlloc(allocator, abs);
+    const abs = std.fs.realpathAlloc(allocator, path_no_dot) catch |err| {
+        const mapped = try darlingPathAlloc(allocator, path_no_dot);
+        if (pathExistsAbsolute(mapped)) return mapped;
+        return err;
+    };
+    if (pathExistsAbsolute(abs)) return abs;
+
+    const mapped_abs = try darlingPathAlloc(allocator, abs);
+    if (pathExistsAbsolute(mapped_abs)) return mapped_abs;
+    return abs;
 }
 
 pub fn main() !u8 {
