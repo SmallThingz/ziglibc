@@ -423,6 +423,17 @@ fn supportsSetjmp(target: std.Target) bool {
     };
 }
 
+fn requireRepoPath(b: *std.Build, rel_path: []const u8) []const u8 {
+    const abs_path = b.pathFromRoot(rel_path);
+    std.fs.accessAbsolute(abs_path, .{}) catch {
+        std.debug.panic(
+            "required dependency repository '{s}' is missing; run `git submodule update --init --recursive`",
+            .{rel_path},
+        );
+    };
+    return abs_path;
+}
+
 fn addPosix(artifact: *std.Build.Step.Compile, zig_posix: *std.Build.Step.Compile) void {
     artifact.linkLibrary(zig_posix);
     artifact.addIncludePath(lazyPath(artifact.step.owner, "inc" ++ std.fs.path.sep_str ++ "posix"));
@@ -465,13 +476,7 @@ fn addGlibcCheck(
         return glibc_check_step;
     }
 
-    const repo = GitRepoStep.create(b, .{
-        .url = "https://github.com/cloudius-systems/glibc-testsuite",
-        .sha = "c1278866ed57e51576a78b71c6326115004a9676",
-        .branch = null,
-        .fetch_enabled = true,
-    });
-    const repo_path = repo.path;
+    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "glibc-testsuite");
 
     inline for (.{ "io/tst-getcwd.c", "libio/test-fmemopen.c", "malloc/tst-malloc.c", "rt/tst-clock.c" }) |src| {
         const name = b.fmt("glibc-check-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
@@ -482,7 +487,6 @@ fn addGlibcCheck(
             .optimize = optimize,
         });
         addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, src })}, &.{"-D_GNU_SOURCE"});
-        exe.step.dependOn(&repo.step);
         exe.addIncludePath(lazyPath(b, repo_path));
         exe.linkLibC();
         if (target.result.os.tag == .windows) {
@@ -508,13 +512,7 @@ fn addPosixTestSuite(
         return posix_test_suite_step;
     }
 
-    const repo = GitRepoStep.create(b, .{
-        .url = "https://github.com/nloopa/open_posix_testsuite",
-        .sha = "b803d6e01aa516b234e784bc46aa3446881fac53",
-        .branch = null,
-        .fetch_enabled = true,
-    });
-    const repo_path = repo.path;
+    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "open_posix_testsuite");
     const include_path = b.pathJoin(&.{ repo_path, "include" });
 
     inline for (.{"conformance/interfaces/clock_gettime/1-1.c"}) |src| {
@@ -530,7 +528,6 @@ fn addPosixTestSuite(
             "-D_POSIX_C_SOURCE=200112L",
             "-D_XOPEN_SOURCE=600",
         });
-        exe.step.dependOn(&repo.step);
         exe.addIncludePath(lazyPath(b, include_path));
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
@@ -560,13 +557,7 @@ fn addAustinGroupTests(
         return austin_group_tests_step;
     }
 
-    const repo = GitRepoStep.create(b, .{
-        .url = "git://nsz.repo.hu:49100/repo/libc-test",
-        .sha = "b7ec467969a53756258778fa7d9b045f912d1c93",
-        .branch = null,
-        .fetch_enabled = true,
-    });
-    const repo_path = repo.path;
+    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "libc-test");
     const common_inc_path = b.pathJoin(&.{ repo_path, "src", "common" });
     const common_src = &[_][]const u8{
         b.pathJoin(&.{ repo_path, "src", "common", "print.c" }),
@@ -584,7 +575,6 @@ fn addAustinGroupTests(
             "-Dsetenv(a,b,c)=0",
         });
         addCSourceFilesCompat(exe, common_src, &.{});
-        exe.step.dependOn(&repo.step);
         exe.addIncludePath(lazyPath(b, common_inc_path));
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
@@ -609,13 +599,7 @@ fn addLibcTest(
     zig_start: *std.Build.Step.Compile,
     libc_only_posix: *std.Build.Step.Compile,
 ) *std.Build.Step {
-    const libc_test_repo = GitRepoStep.create(b, .{
-        .url = "git://nsz.repo.hu:49100/repo/libc-test",
-        .sha = "b7ec467969a53756258778fa7d9b045f912d1c93",
-        .branch = null,
-        .fetch_enabled = true,
-    });
-    const libc_test_path = libc_test_repo.path;
+    const libc_test_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "libc-test");
     const libc_test_step = b.step("libc-test", "run tests from the libc-test project");
 
     // inttypes
@@ -627,7 +611,6 @@ fn addLibcTest(
             .optimize = optimize,
         });
         lib.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-        lib.step.dependOn(&libc_test_repo.step);
         libc_test_step.dependOn(&lib.step);
     }
     const libc_inc_path = b.pathJoin(&.{ libc_test_path, "src", "common" });
@@ -645,7 +628,6 @@ fn addLibcTest(
             .optimize = optimize,
         });
         addCSourceFilesCompat(exe, common_src, &.{});
-        exe.step.dependOn(&libc_test_repo.step);
         exe.addIncludePath(lazyPath(b, libc_inc_path));
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
@@ -670,14 +652,8 @@ fn addTinyRegexCTests(
     zig_start: *std.Build.Step.Compile,
     zig_posix: *std.Build.Step.Compile,
 ) *std.Build.Step {
-    const repo = GitRepoStep.create(b, .{
-        .url = "https://github.com/marler8997/tiny-regex-c",
-        .sha = "95ef2ad35d36783d789b0ade3178b30a942f085c",
-        .branch = "nocompile",
-        .fetch_enabled = true,
-    });
-
     const re_step = b.step("re-tests", "run the tiny-regex-c tests");
+    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "tiny-regex-c");
     inline for (&[_][]const u8{ "test1", "test3" }) |test_name| {
         const exe = addExecutableCompat(b, .{
             .name = "re" ++ test_name,
@@ -685,9 +661,6 @@ fn addTinyRegexCTests(
             .target = target,
             .optimize = optimize,
         });
-        //b.installArtifact(exe);
-        exe.step.dependOn(&repo.step);
-        const repo_path = repo.getPath(&exe.step);
         var files = std.array_list.Managed([]const u8).init(b.allocator);
         const sources = [_][]const u8{
             "re.c", "tests" ++ std.fs.path.sep_str ++ test_name ++ ".c",

@@ -1,0 +1,12 @@
+[submodule "dep/libc-test"]
+	path = dep/libc-test
+	url = git://nsz.repo.hu:49100/repo/libc-test
+[submodule "dep/tiny-regex-c"]
+	path = dep/tiny-regex-c
+	url = https://github.com/marler8997/tiny-regex-c
+[submodule "dep/open_posix_testsuite"]
+	path = dep/open_posix_testsuite
+	url = https://github.com/nloopa/open_posix_testsuite
+[submodule "dep/glibc-testsuite"]
+	path = dep/glibc-testsuite
+	url = https://github.com/cloudius-systems/glibc-testsuite

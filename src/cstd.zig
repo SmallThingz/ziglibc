@@ -851,17 +851,20 @@ export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
     }
     if (builtin.os.tag.isDarwin()) {
         var action = std.mem.zeroes(c.struct_sigaction);
-        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrCast(func));
+        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(@intFromPtr(func)));
         action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
 
         var old_action = std.mem.zeroes(c.struct_sigaction);
         if (c.sigaction(sig, &action, &old_action) != 0) {
             return sig_err;
         }
-        return @as(?SignalFn, @ptrCast(old_action.sa_handler));
+        return if (old_action.sa_handler) |h|
+            @as(?SignalFn, @ptrFromInt(@intFromPtr(h)))
+        else
+            null;
     }
     var action = std.mem.zeroes(c.struct_sigaction);
-    action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrCast(func));
+    action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(@intFromPtr(func)));
     action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
 
     var old_action: std.posix.Sigaction = undefined;
