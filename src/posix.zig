@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const os = std.posix;
 const winfd = @import("winfd.zig");
+const winproc = @import("winproc.zig");
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -20,6 +21,11 @@ const c = @cImport({
 
 const cstd = struct {
     extern fn __zreserveFile() callconv(.c) ?*c.FILE;
+    extern fn __zwindows_sigaction(
+        sig: c_int,
+        act: ?*const c.struct_sigaction,
+        oact: ?*c.struct_sigaction,
+    ) callconv(.c) c_int;
 };
 
 extern "c" fn syscall(number: c_long, ...) c_long;
@@ -45,6 +51,14 @@ const winapi = if (builtin.os.tag == .windows) struct {
         lpFileInformation: *std.os.windows.BY_HANDLE_FILE_INFORMATION,
     ) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+    pub extern "kernel32" fn PeekNamedPipe(
+        hNamedPipe: std.os.windows.HANDLE,
+        lpBuffer: ?*anyopaque,
+        nBufferSize: u32,
+        lpBytesRead: ?*u32,
+        lpTotalBytesAvail: ?*u32,
+        lpBytesLeftThisMessage: ?*u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
@@ -80,6 +94,9 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const access: c_long = 33;
     const sigaction: c_long = 46;
     const ioctl: c_long = 54;
+    const setitimer: c_long = 83;
+    const getitimer: c_long = 86;
+    const select: c_long = 93;
     const gettimeofday: c_long = 116;
     const rename: c_long = 128;
 } else struct {};
@@ -134,7 +151,10 @@ fn unregisterPopenStream(stream: *c.FILE) ?PopenPid {
 }
 
 fn waitForPidStatus(pid: PopenPid) c_int {
-    if (comptime (builtin.os.tag == .windows or builtin.os.tag == .wasi)) {
+    if (comptime builtin.os.tag == .windows) {
+        return winproc.waitProcessStatus(@ptrFromInt(pid));
+    }
+    if (comptime builtin.os.tag == .wasi) {
         c.errno = errnoConst("ENOSYS", c.EINVAL);
         return -1;
     }
@@ -581,11 +601,11 @@ export fn fileno(stream: *c.FILE) callconv(.c) c_int {
 
 export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
     trace.log("popen '{f}' mode='{s}'", .{ trace.fmtStr(command), mode });
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.os.tag == .wasi) {
         c.errno = errnoConst("ENOSYS", c.EINVAL);
         return null;
     }
-    if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) {
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) {
         c.errno = errnoConst("ENOSYS", c.EINVAL);
         return null;
     }
@@ -594,6 +614,63 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
     if (mode_ch != 'r' and mode_ch != 'w') {
         c.errno = c.EINVAL;
         return null;
+    }
+
+    if (builtin.os.tag == .windows) {
+        var security = std.mem.zeroes(std.os.windows.SECURITY_ATTRIBUTES);
+        security.nLength = @sizeOf(std.os.windows.SECURITY_ATTRIBUTES);
+        security.bInheritHandle = 1;
+
+        var read_handle: std.os.windows.HANDLE = undefined;
+        var write_handle: std.os.windows.HANDLE = undefined;
+        std.os.windows.CreatePipe(&read_handle, &write_handle, &security) catch {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return null;
+        };
+
+        const parent_handle = if (mode_ch == 'r') read_handle else write_handle;
+        const child_handle = if (mode_ch == 'r') write_handle else read_handle;
+        std.os.windows.SetHandleInformation(parent_handle, std.os.windows.HANDLE_FLAG_INHERIT, 0) catch {
+            _ = winapi.CloseHandle(read_handle);
+            _ = winapi.CloseHandle(write_handle);
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return null;
+        };
+
+        var spawn_errno: c_int = 0;
+        const process_handle = if (mode_ch == 'r')
+            winproc.spawnShell(command, null, child_handle, child_handle, true, &spawn_errno)
+        else
+            winproc.spawnShell(command, child_handle, null, null, true, &spawn_errno);
+        if (process_handle == null) {
+            _ = winapi.CloseHandle(read_handle);
+            _ = winapi.CloseHandle(write_handle);
+            c.errno = spawn_errno;
+            return null;
+        }
+        _ = winapi.CloseHandle(child_handle);
+
+        const parent_fd = winfd.allocHandle(parent_handle) catch {
+            _ = winapi.CloseHandle(parent_handle);
+            _ = winapi.CloseHandle(process_handle.?);
+            c.errno = errnoConst("EMFILE", c.ENOMEM);
+            return null;
+        };
+
+        const stream = fdopen(parent_fd, mode) orelse {
+            const saved_errno = c.errno;
+            _ = winfd.closeFd(parent_fd);
+            _ = winapi.CloseHandle(process_handle.?);
+            c.errno = saved_errno;
+            return null;
+        };
+        if (!registerPopenStream(stream, @intFromPtr(process_handle.?))) {
+            c.errno = errnoConst("EMFILE", c.ENOMEM);
+            _ = c.fclose(stream);
+            _ = winapi.CloseHandle(process_handle.?);
+            return null;
+        }
+        return stream;
     }
 
     var pipe_fds: [2]os.fd_t = undefined;
@@ -1019,8 +1096,44 @@ export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
     return 0;
 }
 
+export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
+    trace.log("getitimer which={}", .{which});
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.getitimer, which, value);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.syscall2(
+            .getitimer,
+            @as(usize, @bitCast(@as(isize, which))),
+            @intFromPtr(value),
+        );
+        switch (os.errno(rc)) {
+            .SUCCESS => return 0,
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
+}
+
 export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
     trace.log("setitimer which={}", .{which});
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.setitimer, which, value, avalue);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     if (comptime builtin.os.tag != .linux) {
         c.errno = errnoConst("ENOSYS", c.EINVAL);
         return -1;
@@ -1100,6 +1213,9 @@ fn darwinSigsetToC(mask: std.c.sigset_t) c.sigset_t {
 
 export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.c) c_int {
     trace.log("sigaction sig={}", .{sig});
+    if (builtin.os.tag == .windows) {
+        return cstd.__zwindows_sigaction(sig, act, oact);
+    }
     if (builtin.os.tag.isDarwin()) {
         var native_act = std.mem.zeroes(std.c.Sigaction);
         native_act.mask = cSigsetToDarwin(act.sa_mask);
@@ -1424,6 +1540,97 @@ comptime {
 // --------------------------------------------------------------------------------
 // sys/select
 // --------------------------------------------------------------------------------
+const FdSetWord = @TypeOf(@as(c.fd_set, undefined).fds_bits[0]);
+const fd_set_word_bits = @bitSizeOf(FdSetWord);
+const fd_set_capacity = @typeInfo(@TypeOf(@as(c.fd_set, undefined).fds_bits)).array.len * fd_set_word_bits;
+
+fn fdSetParts(fd: c_int) ?struct { word: usize, mask: FdSetWord } {
+    if (fd < 0 or fd >= fd_set_capacity) return null;
+    const word = @as(usize, @intCast(fd)) / fd_set_word_bits;
+    const bit = @as(std.math.Log2Int(FdSetWord), @intCast(@as(usize, @intCast(fd)) % fd_set_word_bits));
+    return .{ .word = word, .mask = @as(FdSetWord, 1) << bit };
+}
+
+export fn FD_ZERO(fdset: *c.fd_set) callconv(.c) void {
+    @memset(fdset.fds_bits[0..], 0);
+}
+
+export fn FD_SET(fd: c_int, fdset: *c.fd_set) callconv(.c) void {
+    const parts = fdSetParts(fd) orelse return;
+    fdset.fds_bits[parts.word] |= parts.mask;
+}
+
+export fn FD_CLR(fd: c_int, fdset: *c.fd_set) callconv(.c) void {
+    const parts = fdSetParts(fd) orelse return;
+    fdset.fds_bits[parts.word] &= ~parts.mask;
+}
+
+export fn FD_ISSET(fd: c_int, fdset: *c.fd_set) callconv(.c) c_int {
+    const parts = fdSetParts(fd) orelse return 0;
+    return @intFromBool((fdset.fds_bits[parts.word] & parts.mask) != 0);
+}
+
+fn windowsHandleReadable(handle: std.os.windows.HANDLE) ?bool {
+    const file_type = winapi.GetFileType(handle);
+    switch (file_type) {
+        std.os.windows.FILE_TYPE_DISK,
+        std.os.windows.FILE_TYPE_CHAR,
+        => return true,
+        std.os.windows.FILE_TYPE_PIPE => {
+            var available: u32 = 0;
+            if (winapi.PeekNamedPipe(handle, null, 0, null, &available, null) != 0) {
+                return available != 0;
+            }
+            const win_err = std.os.windows.kernel32.GetLastError();
+            if (win_err == .BROKEN_PIPE) return true;
+            c.errno = winfd.errnoFromWin32(win_err);
+            return null;
+        },
+        else => {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return null;
+        },
+    }
+}
+
+fn windowsHandleWritable(handle: std.os.windows.HANDLE) ?bool {
+    const file_type = winapi.GetFileType(handle);
+    switch (file_type) {
+        std.os.windows.FILE_TYPE_DISK,
+        std.os.windows.FILE_TYPE_CHAR,
+        std.os.windows.FILE_TYPE_PIPE,
+        => return true,
+        else => {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return null;
+        },
+    }
+}
+
+fn windowsSelectScanSet(comptime mode: enum { read, write, err }, nfds: c_int, fdset: *c.fd_set) ?c_int {
+    var ready_count: c_int = 0;
+    var fd: c_int = 0;
+    while (fd < nfds) : (fd += 1) {
+        if (FD_ISSET(fd, fdset) == 0) continue;
+        const handle = winfd.handleFromFd(fd) orelse {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return null;
+        };
+        const is_ready = switch (mode) {
+            .read => windowsHandleReadable(handle),
+            .write => windowsHandleWritable(handle),
+            .err => false,
+        };
+        if (is_ready == null) return null;
+        if (is_ready.?) {
+            ready_count += 1;
+        } else {
+            FD_CLR(fd, fdset);
+        }
+    }
+    return ready_count;
+}
+
 export fn select(
     nfds: c_int,
     readfds: ?*c.fd_set,
@@ -1434,6 +1641,95 @@ export fn select(
     if (nfds < 0) {
         c.errno = c.EINVAL;
         return -1;
+    }
+    if (nfds > fd_set_capacity) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+    if (builtin.os.tag == .windows) {
+        var read_template: c.fd_set = undefined;
+        var write_template: c.fd_set = undefined;
+        var error_template: c.fd_set = undefined;
+        if (readfds) |rf| read_template = rf.*;
+        if (writefds) |wf| write_template = wf.*;
+        if (errorfds) |ef| error_template = ef.*;
+
+        const timeout_ns: ?u64 = if (timeout) |to| blk: {
+            if (to.tv_sec < 0 or to.tv_usec < 0 or to.tv_usec >= 1000000) {
+                c.errno = c.EINVAL;
+                return -1;
+            }
+            const sec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_sec)), std.time.ns_per_s) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            const usec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_usec)), std.time.ns_per_us) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            break :blk std.math.add(u64, sec_ns, usec_ns) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+        } else null;
+        const start_ns = if (timeout_ns != null) std.time.nanoTimestamp() else 0;
+
+        while (true) {
+            if (readfds) |rf| rf.* = read_template;
+            if (writefds) |wf| wf.* = write_template;
+            if (errorfds) |ef| ef.* = error_template;
+
+            var ready_count: c_int = 0;
+            if (readfds) |rf| {
+                ready_count += windowsSelectScanSet(.read, nfds, rf) orelse return -1;
+            }
+            if (writefds) |wf| {
+                ready_count += windowsSelectScanSet(.write, nfds, wf) orelse return -1;
+            }
+            if (errorfds) |ef| {
+                FD_ZERO(ef);
+            }
+            if (ready_count != 0) {
+                if (timeout) |to| {
+                    to.tv_sec = 0;
+                    to.tv_usec = 0;
+                }
+                return ready_count;
+            }
+
+            if (timeout_ns) |limit_ns| {
+                const elapsed_ns = @as(u64, @intCast(@max(0, std.time.nanoTimestamp() - start_ns)));
+                if (elapsed_ns >= limit_ns) {
+                    if (readfds) |rf| FD_ZERO(rf);
+                    if (writefds) |wf| FD_ZERO(wf);
+                    if (errorfds) |ef| FD_ZERO(ef);
+                    if (timeout) |to| {
+                        to.tv_sec = 0;
+                        to.tv_usec = 0;
+                    }
+                    return 0;
+                }
+                const remaining_ns = limit_ns - elapsed_ns;
+                std.Thread.sleep(@min(remaining_ns, std.time.ns_per_ms));
+            } else {
+                std.Thread.sleep(std.time.ns_per_ms);
+            }
+        }
+    }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(
+            darwin_syscall.select,
+            nfds,
+            readfds,
+            writefds,
+            errorfds,
+            timeout,
+        );
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(c_int, @intCast(rc));
     }
     if (builtin.os.tag == .linux) {
         var linux_timeout: LinuxTimeval = undefined;

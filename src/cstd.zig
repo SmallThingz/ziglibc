@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const winfd = @import("winfd.zig");
+const winproc = @import("winproc.zig");
 
 const c = @cImport({
     // problem with LONG_MIN/LONG_MAX, they are currently assuming 64 bit
@@ -150,6 +151,47 @@ const windows = struct {
     pub extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
 };
 
+const windows_signal_count = 32;
+var windows_signal_mutex: std.Thread.Mutex = .{};
+var windows_sigactions: [windows_signal_count]c.struct_sigaction =
+    [_]c.struct_sigaction{std.mem.zeroes(c.struct_sigaction)} ** windows_signal_count;
+
+fn windowsSignalIndex(sig: c_int) ?usize {
+    if (sig <= 0 or sig >= windows_signal_count) return null;
+    return @as(usize, @intCast(sig));
+}
+
+fn __zwindows_sigaction(
+    sig: c_int,
+    act: ?*const c.struct_sigaction,
+    oact: ?*c.struct_sigaction,
+) callconv(.c) c_int {
+    if (builtin.os.tag != .windows) {
+        errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+
+    const index = windowsSignalIndex(sig) orelse {
+        errno = c.EINVAL;
+        return -1;
+    };
+
+    windows_signal_mutex.lock();
+    defer windows_signal_mutex.unlock();
+
+    if (oact) |out| out.* = windows_sigactions[index];
+    if (act) |in| windows_sigactions[index] = in.*;
+    return 0;
+}
+
+comptime {
+    if (builtin.target.ofmt == .coff) {
+        @export(&__zwindows_sigaction, .{ .name = "__zwindows_sigaction" });
+    } else {
+        @export(&__zwindows_sigaction, .{ .name = "__zwindows_sigaction", .visibility = .hidden });
+    }
+}
+
 // --------------------------------------------------------------------------------
 // errno
 // --------------------------------------------------------------------------------
@@ -263,7 +305,21 @@ fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) b
 
 export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
     trace.log("system {f}", .{trace.fmtStr(string)});
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.os.tag == .windows) {
+        if (string == null) {
+            return if (winproc.hasShell()) 1 else 0;
+        }
+
+        var spawn_errno: c_int = 0;
+        const process = winproc.spawnShell(string.?, null, null, null, false, &spawn_errno) orelse {
+            errno = spawn_errno;
+            return -1;
+        };
+        const status = winproc.waitProcessStatus(process);
+        if (status == -1) return -1;
+        return status;
+    }
+    if (builtin.os.tag == .wasi) {
         errno = c.ENOSYS;
         return -1;
     }
@@ -838,12 +894,21 @@ const SignalFn = switch (builtin.zig_backend) {
     // not guaranteed to satisfy function-pointer alignment.
     else => *align(1) const fn (c_int) callconv(.c) void,
 };
+
 export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
     const sig_err = @as(?SignalFn, @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))));
     if (builtin.os.tag == .windows) {
-        // TODO: maybe we can emulate/handle some signals?
-        trace.log("ignoring the 'signal' function (sig={}) on windows", .{sig});
-        return null;
+        var action = std.mem.zeroes(c.struct_sigaction);
+        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(@intFromPtr(func)));
+
+        var old_action = std.mem.zeroes(c.struct_sigaction);
+        if (__zwindows_sigaction(sig, &action, &old_action) != 0) {
+            return sig_err;
+        }
+        return if (old_action.sa_handler) |h|
+            @as(?SignalFn, @ptrFromInt(@intFromPtr(h)))
+        else
+            null;
     }
     if (sig < 0 or sig > std.math.maxInt(u6)) {
         errno = c.EINVAL;
