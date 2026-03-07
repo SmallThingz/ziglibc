@@ -1,6 +1,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "expect.h"
 
@@ -54,15 +55,32 @@ int main(int argc, char *argv[])
   {
     FILE *plus = fopen("stdio-plus.txt", "w+");
     char buf[8];
+    fpos_t pos;
     expect(plus != NULL);
     expect(3 == fwrite("xyz", 1, 3, plus));
+    expect(0 == fgetpos(plus, &pos));
     expect(0 == fseek(plus, 0, SEEK_SET));
     expect(3 == fread(buf, 1, 3, plus));
     buf[3] = 0;
     expect(0 == strcmp("xyz", buf));
+    expect(0 == fsetpos(plus, &pos));
+    expect(1 == fwrite("!", 1, 1, plus));
     expect(plus == freopen("stdio-plus.txt", "r", plus));
     expect('x' == fgetc(plus));
     expect(0 == fclose(plus));
+  }
+
+  {
+    char buf[8];
+    FILE *g = fopen("stdio-gets.txt", "w");
+    expect(g != NULL);
+    setbuf(g, NULL);
+    expect(3 == fwrite("hi\n", 1, 3, g));
+    expect(0 == fclose(g));
+    expect(stdin == freopen("stdio-gets.txt", "r", stdin));
+    expect(buf == gets(buf));
+    expect(0 == strcmp("hi", buf));
+    expect(0 == remove("stdio-gets.txt"));
   }
 
   {

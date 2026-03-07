@@ -14,12 +14,15 @@
 #define AF_INET 2
 #define PF_INET AF_INET
 
-/* NOTE: this can differ on some architectures */
+#ifdef _WIN32
+#define SOL_SOCKET 0xffff
+#define SO_KEEPALIVE 0x0008
+#define SO_SNDBUF 0x1001
+#else
 #define SOL_SOCKET 1
-
-/* NOTE: these can differ on some architectures */
 #define SO_KEEPALIVE 9
 #define SO_SNDBUF 7
+#endif
 
 int socket(int domain, int type, int protocol);
 

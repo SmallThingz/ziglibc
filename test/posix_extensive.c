@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <libgen.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +86,30 @@ int main(int argc, char *argv[])
     expect(EINVAL == errno);
   }
 
+  {
+    char path1[] = "/usr/lib";
+    char path2[] = "noslash";
+    char path3[] = "/";
+    expect(0 == strcmp("/usr", dirname(path1)));
+    expect(0 == strcmp(".", dirname(path2)));
+    expect(0 == strcmp("/", dirname(path3)));
+  }
+
+  {
+    time_t t = 946684800;
+    struct tm *utc = gmtime(&t);
+    char *asc;
+    char *ct;
+    expect(utc != NULL);
+    asc = asctime(utc);
+    expect(asc != NULL);
+    expect(0 == strncmp(asc, "Sat Jan  1 00:00:00 2000\n", 25));
+    ct = ctime(&t);
+    expect(ct != NULL);
+    expect(0 == strcmp(ct, asctime(localtime(&t))));
+    expect(0 == sleep(0));
+  }
+
 #ifndef _WIN32
   {
     const char *name = "posix-stat.tmp";
@@ -114,6 +139,22 @@ int main(int argc, char *argv[])
     expect(0 == close(fd));
     expect(0 == stat(name, &st));
     expect(4 == st.st_size);
+    expect(0 == unlink(name));
+  }
+
+  {
+    const char *name = "posix-openat-relative.tmp";
+    int dirfd = open(".", O_RDONLY);
+    int fd;
+    struct stat st;
+    expect(dirfd >= 0);
+    fd = openat(dirfd, name, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    expect(fd >= 0);
+    expect(3 == write(fd, "dir", 3));
+    expect(0 == close(fd));
+    expect(0 == stat(name, &st));
+    expect(3 == st.st_size);
+    expect(0 == close(dirfd));
     expect(0 == unlink(name));
   }
 

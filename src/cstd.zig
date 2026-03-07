@@ -11,6 +11,7 @@ const c = @cImport({
     @cInclude("stdarg.h");
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
+    @cInclude("strings.h");
     @cInclude("setjmp.h");
     @cInclude("locale.h");
     @cInclude("time.h");
@@ -86,9 +87,13 @@ fn zopenCompat(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
 
 fn zunlinkCompat(path: [*:0]const u8) c_int {
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.unlink, path);
-        if (rc == -1) errno = __error().*;
-        return @as(c_int, @intCast(rc));
+        switch (std.posix.errno(std.posix.system.unlinkat(c.AT_FDCWD, path, 0))) {
+            .SUCCESS => return 0,
+            else => |e| {
+                errno = @intFromEnum(e);
+                return -1;
+            },
+        }
     }
 
     std.posix.unlinkZ(path) catch |err| {
@@ -572,10 +577,148 @@ export fn abs(j: c_int) callconv(.c) c_int {
     return if (j >= 0) j else -j;
 }
 
+export fn div(numer: c_int, denom: c_int) callconv(.c) c.div_t {
+    return .{
+        .quot = @divTrunc(numer, denom),
+        .rem = @rem(numer, denom),
+    };
+}
+
+export fn labs(j: c_long) callconv(.c) c_long {
+    return if (j >= 0) j else -j;
+}
+
+export fn ldiv(numer: c_long, denom: c_long) callconv(.c) c.ldiv_t {
+    return .{
+        .quot = @divTrunc(numer, denom),
+        .rem = @rem(numer, denom),
+    };
+}
+
+export fn atof(nptr: [*:0]const u8) callconv(.c) f64 {
+    return strtod(nptr, null);
+}
+
 export fn atoi(nptr: [*:0]const u8) callconv(.c) c_int {
     // `atoi` intentionally follows the shared `strto` parsing path and does not
     // expose richer error reporting beyond the C return value contract.
     return strto(c_int, nptr, null, 10);
+}
+
+export fn atol(nptr: [*:0]const u8) callconv(.c) c_long {
+    return strto(c_long, nptr, null, 10);
+}
+
+export fn mblen(s: ?[*:0]const u8, n: usize) callconv(.c) c_int {
+    if (s == null) return 0;
+    if (n == 0) return -1;
+    if (s.?[0] == 0) return 0;
+    return 1;
+}
+
+export fn mbtowc(pwc: ?*c.wchar_t, s: ?[*:0]const u8, n: usize) callconv(.c) c_int {
+    if (s == null) return 0;
+    if (n == 0) return -1;
+    if (s.?[0] == 0) {
+        if (pwc) |out| out.* = 0;
+        return 0;
+    }
+    if (pwc) |out| out.* = @as(c.wchar_t, s.?[0]);
+    return 1;
+}
+
+export fn wctomb(s: ?[*]u8, wchar: c.wchar_t) callconv(.c) c_int {
+    if (s == null) return 0;
+    if (wchar < 0 or wchar > 255) return -1;
+    s.?[0] = @intCast(wchar);
+    return 1;
+}
+
+export fn mbstowcs(pwcs: ?[*]c.wchar_t, s: [*:0]const u8, n: usize) callconv(.c) usize {
+    var i: usize = 0;
+    while (s[i] != 0) : (i += 1) {
+        if (pwcs != null and i < n) pwcs.?[i] = @as(c.wchar_t, s[i]);
+    }
+    if (pwcs != null and i < n) pwcs.?[i] = 0;
+    return i;
+}
+
+export fn wcstombs(s: ?[*]u8, pwcs: [*]const c.wchar_t, n: usize) callconv(.c) usize {
+    var i: usize = 0;
+    while (pwcs[i] != 0) : (i += 1) {
+        if (pwcs[i] < 0 or pwcs[i] > 255) return std.math.maxInt(usize);
+        if (s != null and i < n) s.?[i] = @intCast(pwcs[i]);
+    }
+    if (s != null and i < n) s.?[i] = 0;
+    return i;
+}
+
+const SortCompareFn = *const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
+
+fn sortElemPtr(base: [*]u8, index: usize, size: usize) [*]u8 {
+    return base + index * size;
+}
+
+fn swapSortElems(base: [*]u8, lhs: usize, rhs: usize, size: usize) void {
+    if (lhs == rhs) return;
+    const lhs_ptr = sortElemPtr(base, lhs, size);
+    const rhs_ptr = sortElemPtr(base, rhs, size);
+    var i: usize = 0;
+    while (i < size) : (i += 1) {
+        std.mem.swap(u8, &lhs_ptr[i], &rhs_ptr[i]);
+    }
+}
+
+fn qsortRange(base: [*]u8, lo: usize, hi: usize, size: usize, compar: SortCompareFn) void {
+    if (hi - lo < 2) return;
+
+    const pivot_index = lo + (hi - lo) / 2;
+    const last = hi - 1;
+    swapSortElems(base, pivot_index, last, size);
+
+    var store = lo;
+    var i = lo;
+    while (i < last) : (i += 1) {
+        if (compar(@ptrCast(sortElemPtr(base, i, size)), @ptrCast(sortElemPtr(base, last, size))) < 0) {
+            swapSortElems(base, store, i, size);
+            store += 1;
+        }
+    }
+    swapSortElems(base, store, last, size);
+
+    qsortRange(base, lo, store, size, compar);
+    qsortRange(base, store + 1, hi, size, compar);
+}
+
+export fn bsearch(
+    key: ?*const anyopaque,
+    base: ?*const anyopaque,
+    nmemb: usize,
+    size: usize,
+    compar: SortCompareFn,
+) callconv(.c) ?*anyopaque {
+    if (nmemb == 0 or size == 0 or base == null) return null;
+    const bytes: [*]u8 = @ptrCast(@constCast(base.?));
+    var lo: usize = 0;
+    var hi: usize = nmemb;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const mid_ptr: ?*anyopaque = @ptrCast(sortElemPtr(bytes, mid, size));
+        const cmp = compar(key, @ptrCast(mid_ptr));
+        if (cmp < 0) {
+            hi = mid;
+        } else if (cmp > 0) {
+            lo = mid + 1;
+        } else {
+            return mid_ptr;
+        }
+    }
+    return null;
+}
+
+export fn qsort(base: ?*anyopaque, nmemb: usize, size: usize, compar: SortCompareFn) callconv(.c) void {
+    if (nmemb < 2 or size == 0 or base == null) return;
+    qsortRange(@ptrCast(base.?), 0, nmemb, size, compar);
 }
 
 // --------------------------------------------------------------------------------
@@ -621,6 +764,28 @@ export fn strncmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c) c_i
 export fn strcoll(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) c_int {
     // Locale-aware collation is not implemented yet; match "C" locale behavior.
     return strcmp(s1, s2);
+}
+
+export fn strxfrm(s1: ?[*]u8, s2: [*:0]const u8, n: usize) callconv(.c) usize {
+    const len = strlen(s2);
+    if (s1 != null and n != 0) {
+        const copy_len = @min(len, n - 1);
+        @memcpy(s1.?[0..copy_len], s2[0..copy_len]);
+        s1.?[copy_len] = 0;
+    }
+    return len;
+}
+
+export fn strncasecmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c) c_int {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const ac = tolower(a[i]);
+        const bc = tolower(b[i]);
+        if (ac != bc or a[i] == 0 or b[i] == 0) {
+            return ac -| bc;
+        }
+    }
+    return 0;
 }
 
 export fn strchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
@@ -1214,6 +1379,7 @@ const global = struct {
     var current_locale = [_:0]u8{'C'};
     var gmtime_tm: c.tm = std.mem.zeroes(c.tm);
     var localtime_tm: c.tm = std.mem.zeroes(c.tm);
+    var asctime_buf: [26:0]u8 = [_:0]u8{0} ** 26;
 
     var atexit_mutex = std.Thread.Mutex{};
     var atexit_started = false;
@@ -1269,12 +1435,7 @@ export fn __zreserveFile() callconv(.c) ?*c.FILE {
 export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
     trace.log("remove {f}", .{trace.fmtStr(filename)});
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.unlink, filename);
-        if (rc == -1) {
-            errno = __error().*;
-            return -1;
-        }
-        return 0;
+        return zunlinkCompat(filename);
     }
     std.posix.unlinkZ(filename) catch |err| {
         errno = switch (err) {
@@ -1696,6 +1857,22 @@ export fn ftell(stream: *c.FILE) callconv(.c) c_long {
     }
     stream.errno = 0;
     return @as(c_long, @intCast(offset));
+}
+
+export fn fgetpos(stream: *c.FILE, pos: *c.fpos_t) callconv(.c) c_int {
+    const offset = ftell(stream);
+    if (offset < 0) return -1;
+    pos.* = @intCast(offset);
+    return 0;
+}
+
+export fn fsetpos(stream: *c.FILE, pos: *const c.fpos_t) callconv(.c) c_int {
+    if (pos.* > std.math.maxInt(c_long)) {
+        errno = errnoConst("EOVERFLOW", c.ERANGE);
+        stream.errno = errno;
+        return -1;
+    }
+    return fseek(stream, @intCast(pos.*), c.SEEK_SET);
 }
 
 export fn rewind(stream: *c.FILE) callconv(.c) void {
@@ -2292,6 +2469,22 @@ export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
     }
 }
 
+export fn gets(s: [*]u8) callconv(.c) ?[*]u8 {
+    var len: usize = 0;
+    while (true) {
+        const ch = getchar();
+        if (ch == c.EOF) {
+            if (len == 0) return null;
+            break;
+        }
+        if (ch == '\n') break;
+        s[len] = @intCast(ch);
+        len += 1;
+    }
+    s[len] = 0;
+    return s;
+}
+
 export fn tmpfile() callconv(.c) ?*c.FILE {
     if (builtin.os.tag == .windows) {
         var temp_buf: [std.os.windows.MAX_PATH:0]u8 = undefined;
@@ -2403,6 +2596,10 @@ export fn setvbuf(stream: *c.FILE, buf: ?[*]u8, mode: c_int, size: usize) callco
     return 0;
 }
 
+export fn setbuf(stream: *c.FILE, buf: ?[*]u8) callconv(.c) void {
+    _ = setvbuf(stream, buf, if (buf == null) c._IONBF else c._IOFBF, if (buf == null) 0 else c.BUFSIZ);
+}
+
 export fn ferror(stream: *c.FILE) callconv(.c) c_int {
     trace.log("ferror {*} return {}", .{ stream, stream.errno });
     return stream.errno;
@@ -2472,25 +2669,232 @@ export fn atan2(y: f64, x: f64) callconv(.c) f64 {
     return std.math.atan2(y, x);
 }
 
-// cos/sin are already defined somewhere in the libraries Zig includes
-// on linux, not sure what library though or how
+const trig_pi = 3.14159265358979323846264338327950288;
+const trig_tau = 2.0 * trig_pi;
+const trig_half_pi = trig_pi / 2.0;
+const trig_ln2 = 0.69314718055994530941723212145817657;
+const trig_inv_ln2 = 1.44269504088896340735992468100189214;
+const trig_ln10 = 2.30258509299404568401799145468436421;
 
-export fn tan(x: f64) callconv(.c) f64 {
-    return std.math.sin(x) / std.math.cos(x);
+fn reduceTrigAngle(x: f64) f64 {
+    if (std.math.isNan(x) or std.math.isInf(x)) return std.math.nan(f64);
+    var y = x - floorCompat(x / trig_tau) * trig_tau;
+    if (y > trig_pi) y -= trig_tau;
+    if (y < -trig_pi) y += trig_tau;
+    return y;
 }
 
-export fn frexp(value: f32, exp: *c_int) callconv(.c) f64 {
+fn sinApprox(x: f64) f64 {
+    var y = reduceTrigAngle(x);
+    if (y > trig_half_pi) {
+        y = trig_pi - y;
+    } else if (y < -trig_half_pi) {
+        y = -trig_pi - y;
+    }
+    const y2 = y * y;
+    const poly = (((((-1.0 / 39916800.0) * y2 + 1.0 / 362880.0) * y2 - 1.0 / 5040.0) * y2 + 1.0 / 120.0) * y2 - 1.0 / 6.0) * y2 + 1.0;
+    return poly * y;
+}
+
+fn cosApprox(x: f64) f64 {
+    var y = reduceTrigAngle(x);
+    if (y > trig_half_pi) {
+        y = trig_pi - y;
+        return -cosApprox(y);
+    }
+    if (y < -trig_half_pi) {
+        y = -trig_pi - y;
+        return -cosApprox(y);
+    }
+    const y2 = y * y;
+    return (((((-1.0 / 3628800.0) * y2 + 1.0 / 40320.0) * y2 - 1.0 / 720.0) * y2 + 1.0 / 24.0) * y2 - 1.0 / 2.0) * y2 + 1.0;
+}
+
+export fn cos(x: f64) callconv(.c) f64 {
+    return cosApprox(x);
+}
+
+export fn sin(x: f64) callconv(.c) f64 {
+    return sinApprox(x);
+}
+
+export fn cosh(x: f64) callconv(.c) f64 {
+    const pos = expApprox(x);
+    const neg = expApprox(-x);
+    return (pos + neg) / 2.0;
+}
+
+export fn sinh(x: f64) callconv(.c) f64 {
+    const pos = expApprox(x);
+    const neg = expApprox(-x);
+    return (pos - neg) / 2.0;
+}
+
+export fn tan(x: f64) callconv(.c) f64 {
+    return sinApprox(x) / cosApprox(x);
+}
+
+export fn tanh(x: f64) callconv(.c) f64 {
+    if (std.math.isNan(x)) return std.math.nan(f64);
+    if (x >= 20.0) return 1.0;
+    if (x <= -20.0) return -1.0;
+    const pos = expApprox(x);
+    const neg = expApprox(-x);
+    return (pos - neg) / (pos + neg);
+}
+
+export fn exp(x: f64) callconv(.c) f64 {
+    return expApprox(x);
+}
+
+export fn frexp(value: f32, out_exp: *c_int) callconv(.c) f64 {
     const result = std.math.frexp(value);
-    exp.* = result.exponent;
+    out_exp.* = result.exponent;
     return result.significand;
 }
 
-export fn ldexp(x: f64, exp: c_int) callconv(.c) f64 {
-    return std.math.ldexp(x, @as(i32, @intCast(exp)));
+export fn ldexp(x: f64, exponent: c_int) callconv(.c) f64 {
+    return std.math.ldexp(x, @as(i32, @intCast(exponent)));
 }
 
 export fn pow(x: f64, y: f64) callconv(.c) f64 {
-    return std.math.pow(f64, x, y);
+    if (y == 0.0) return 1.0;
+    if (x == 0.0) return if (y > 0.0) 0.0 else std.math.inf(f64);
+    const truncated = @trunc(y);
+    if (y == truncated and truncated >= @as(f64, @floatFromInt(std.math.minInt(i63))) and truncated <= @as(f64, @floatFromInt(std.math.maxInt(i63)))) {
+        var base: f64 = x;
+        var exponent: i64 = @intFromFloat(truncated);
+        var result: f64 = 1.0;
+        const invert = exponent < 0;
+        if (invert) exponent = -exponent;
+        while (exponent != 0) : (exponent >>= 1) {
+            if ((exponent & 1) != 0) result *= base;
+            base *= base;
+        }
+        return if (invert) 1.0 / result else result;
+    }
+    if (x < 0.0) return std.math.nan(f64);
+    return expApprox(y * logApprox(x));
+}
+
+export fn log(x: f64) callconv(.c) f64 {
+    return logApprox(x);
+}
+
+export fn log10(x: f64) callconv(.c) f64 {
+    return logApprox(x) / trig_ln10;
+}
+
+export fn modf(value: f64, iptr: *f64) callconv(.c) f64 {
+    const parts = std.math.modf(value);
+    iptr.* = parts.ipart;
+    return parts.fpart;
+}
+
+export fn sqrt(x: f64) callconv(.c) f64 {
+    return @sqrt(x);
+}
+
+export fn ceil(x: f64) callconv(.c) f64 {
+    return ceilCompat(x);
+}
+
+export fn fabs(x: f64) callconv(.c) f64 {
+    return @abs(x);
+}
+
+export fn floor(x: f64) callconv(.c) f64 {
+    return floorCompat(x);
+}
+
+export fn fmod(x: f64, y: f64) callconv(.c) f64 {
+    if (y == 0.0) return std.math.nan(f64);
+    return x - @trunc(x / y) * y;
+}
+
+export fn log2(x: f64) callconv(.c) f64 {
+    return logApprox(x) / trig_ln2;
+}
+
+export fn log2f(x: f32) callconv(.c) f32 {
+    return @floatCast(logApprox(x) / trig_ln2);
+}
+
+export fn log2l(x: c_longdouble) callconv(.c) c_longdouble {
+    return @floatCast(logApprox(@floatCast(x)) / trig_ln2);
+}
+
+fn expApprox(x: f64) f64 {
+    if (std.math.isNan(x)) return std.math.nan(f64);
+    if (x == std.math.inf(f64)) return std.math.inf(f64);
+    if (x == -std.math.inf(f64)) return 0.0;
+    if (x > 709.0) return std.math.inf(f64);
+    if (x < -745.0) return 0.0;
+
+    const n = @as(i32, @intFromFloat(floorCompat(x * trig_inv_ln2 + 0.5)));
+    const r = x - @as(f64, @floatFromInt(n)) * trig_ln2;
+    const r2 = r * r;
+    const r3 = r2 * r;
+    const r4 = r3 * r;
+    const r5 = r4 * r;
+    const r6 = r5 * r;
+    const r7 = r6 * r;
+    const r8 = r7 * r;
+    const r9 = r8 * r;
+    const r10 = r9 * r;
+    const r11 = r10 * r;
+    const r12 = r11 * r;
+    const poly = 1.0 +
+        r +
+        r2 * 0.5 +
+        r3 * (1.0 / 6.0) +
+        r4 * (1.0 / 24.0) +
+        r5 * (1.0 / 120.0) +
+        r6 * (1.0 / 720.0) +
+        r7 * (1.0 / 5040.0) +
+        r8 * (1.0 / 40320.0) +
+        r9 * (1.0 / 362880.0) +
+        r10 * (1.0 / 3628800.0) +
+        r11 * (1.0 / 39916800.0) +
+        r12 * (1.0 / 479001600.0);
+    return std.math.ldexp(poly, n);
+}
+
+fn logApprox(x: f64) f64 {
+    if (std.math.isNan(x)) return std.math.nan(f64);
+    if (x == 0.0) return -std.math.inf(f64);
+    if (x < 0.0) return std.math.nan(f64);
+    if (x == std.math.inf(f64)) return std.math.inf(f64);
+
+    const parts = std.math.frexp(x);
+    var mantissa = parts.significand;
+    var exponent = parts.exponent;
+    if (mantissa < 0.7071067811865475244) {
+        mantissa *= 2.0;
+        exponent -= 1;
+    }
+
+    const y = (mantissa - 1.0) / (mantissa + 1.0);
+    const y2 = y * y;
+    var series = y;
+    var term = y;
+    inline for ([_]f64{ 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0, 25.0 }) |denom| {
+        term *= y2;
+        series += term / denom;
+    }
+    return 2.0 * series + @as(f64, @floatFromInt(exponent)) * trig_ln2;
+}
+
+fn floorCompat(x: f64) f64 {
+    if (std.math.isNan(x) or std.math.isInf(x) or x == 0.0) return x;
+    const truncated = @trunc(x);
+    return if (truncated > x) truncated - 1.0 else truncated;
+}
+
+fn ceilCompat(x: f64) f64 {
+    if (std.math.isNan(x) or std.math.isInf(x) or x == 0.0) return x;
+    const truncated = @trunc(x);
+    return if (truncated < x) truncated + 1.0 else truncated;
 }
 
 // --------------------------------------------------------------------------------
@@ -2568,6 +2972,34 @@ export fn time(timer: ?*c.time_t) callconv(.c) c.time_t {
     }
     trace.log("time return {}", .{now});
     return now;
+}
+
+export fn asctime(timeptr: *const c.tm) callconv(.c) ?[*:0]u8 {
+    if (timeptr.tm_wday < 0 or timeptr.tm_wday >= weekday_abbrev.len) return null;
+    if (timeptr.tm_mon < 0 or timeptr.tm_mon >= month_abbrev.len) return null;
+    // Keep this manual and unsigned. Zig's signed integer formatting with width
+    // can emit leading '+' characters for positive values, which breaks libc's
+    // fixed asctime layout.
+    const rendered = std.fmt.bufPrint(
+        global.asctime_buf[0 .. global.asctime_buf.len - 1],
+        "{s} {s} {d: >2} {d:0>2}:{d:0>2}:{d:0>2} {d}\n",
+        .{
+            weekday_abbrev[@intCast(timeptr.tm_wday)],
+            month_abbrev[@intCast(timeptr.tm_mon)],
+            @as(u32, @intCast(timeptr.tm_mday)),
+            @as(u32, @intCast(timeptr.tm_hour)),
+            @as(u32, @intCast(timeptr.tm_min)),
+            @as(u32, @intCast(timeptr.tm_sec)),
+            @as(u32, @intCast(@as(i64, @intCast(timeptr.tm_year)) + 1900)),
+        },
+    ) catch return null;
+    global.asctime_buf[rendered.len] = 0;
+    return &global.asctime_buf;
+}
+
+export fn ctime(timer: *const c.time_t) callconv(.c) ?[*:0]u8 {
+    const tm = localtime(timer) orelse return null;
+    return asctime(tm);
 }
 
 export fn gmtime(timer: *const c.time_t) callconv(.c) ?*c.tm {
@@ -2965,9 +3397,22 @@ export fn tolower(char: c_int) callconv(.c) c_int {
     return std.ascii.toLower(std.math.cast(u8, char) orelse return char);
 }
 
+export fn isascii(char: c_int) callconv(.c) c_int {
+    return @intFromBool(char >= 0 and char <= 0x7f);
+}
+
+export fn toascii(char: c_int) callconv(.c) c_int {
+    return char & 0x7f;
+}
+
 export fn isspace(char: c_int) callconv(.c) c_int {
     trace.log("isspace {}", .{char});
     return @intFromBool(std.ascii.isWhitespace(std.math.cast(u8, char) orelse return 0));
+}
+
+export fn isblank(char: c_int) callconv(.c) c_int {
+    const c_u8 = std.math.cast(u8, char) orelse return 0;
+    return @intFromBool(c_u8 == ' ' or c_u8 == '\t');
 }
 
 export fn isxdigit(char: c_int) callconv(.c) c_int {

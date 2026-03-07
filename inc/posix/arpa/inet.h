@@ -2,7 +2,7 @@
 #define _ARPA_INET_H
 
 #include "../../libc/private/uint16_t.h"
-#include "../../libc/private/uint32_t.h"
+#include "../netinet/in.h"
 
 uint32_t htonl(uint32_t hostlong);
 uint16_t htons(uint16_t hostshort);

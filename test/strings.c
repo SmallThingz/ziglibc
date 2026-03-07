@@ -1,5 +1,7 @@
 #include <assert.h>
+#include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 
 #include "expect.h"
@@ -34,6 +36,25 @@ int main(int argc, char *argv[])
     const char *s = "abcdef";
     expect(s+1 == strstr(s, "bcde"));
     expect(NULL == strstr(s, "bcdeg"));
+  }
+
+  {
+    char buf[16];
+    expect(3 == strxfrm(buf, "zig", sizeof(buf)));
+    expect(0 == strcmp("zig", buf));
+    expect(0 == strcasecmp("AbCd", "aBcD"));
+    expect(0 == strncasecmp("AbCd", "aBcZ", 3));
+    expect(0 == strcasecmp_l("AbCd", "aBcD", (locale_t)0));
+    expect(0 == strncasecmp_l("AbCd", "aBcZ", 3, (locale_t)0));
+    expect(strncasecmp("abc", "abD", 3) < 0);
+    expect(strcasecmp_l("abc", "abD", (locale_t)0) < 0);
+    expect(strncasecmp_l("abc", "abD", 3, (locale_t)0) < 0);
+    expect(1 == isascii('A'));
+    expect(0 == isascii(0x80));
+    expect('a' == toascii(0xE1));
+    expect(1 == isblank(' '));
+    expect(1 == isblank('\t'));
+    expect(0 == isblank('\n'));
   }
 
   {

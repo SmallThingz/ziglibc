@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <errno.h>
+#include <string.h>
 
 #if defined(__APPLE__)
 #include <sys/time.h>
@@ -15,6 +16,141 @@
 #else
 #define LIBCGUANA_INTERNAL
 #endif
+
+extern char *optarg;
+extern int opterr, optind, optopt;
+int getopt(int argc, char * const argv[], const char *optstring);
+
+struct option {
+    const char *name;
+    int has_arg;
+    int *flag;
+    int val;
+};
+
+enum {
+    no_argument = 0,
+    required_argument = 1,
+    optional_argument = 2,
+};
+
+static size_t zgnu_long_option_name_len(const char *name)
+{
+    size_t i = 0;
+    while (name[i] != '\0' && name[i] != '=') i += 1;
+    return i;
+}
+
+static int zgnu_getopt_long_common(
+    int argc,
+    char * const argv[],
+    const char *optstring,
+    const struct option *longopts,
+    int *longindex,
+    int long_only)
+{
+    const char *arg;
+    const char *long_name;
+    char *inline_value;
+    int single_dash_long = 0;
+    size_t name_len;
+    size_t i;
+
+    optarg = NULL;
+    if (optind < 1) optind = 1;
+    if (optind >= argc) return -1;
+
+    arg = argv[optind];
+    if (arg[0] == '-' && arg[1] == '-') {
+        if (arg[2] == '\0') {
+            optind += 1;
+            return -1;
+        }
+        long_name = arg + 2;
+    } else if (long_only && arg[0] == '-' && arg[1] != '\0' && arg[1] != '-') {
+        long_name = arg + 1;
+        single_dash_long = 1;
+    } else {
+        return getopt(argc, argv, optstring);
+    }
+
+    name_len = zgnu_long_option_name_len(long_name);
+    inline_value = long_name[name_len] == '=' ? (char *)(long_name + name_len + 1) : NULL;
+
+    for (i = 0; longopts[i].name != NULL; ++i) {
+        const struct option *opt = &longopts[i];
+        if (strncmp(opt->name, long_name, name_len) != 0 || opt->name[name_len] != '\0') continue;
+
+        if (longindex != NULL) *longindex = (int)i;
+
+        switch (opt->has_arg) {
+            case no_argument:
+                if (inline_value != NULL) {
+                    optind += 1;
+                    return '?';
+                }
+                optarg = NULL;
+                break;
+            case required_argument:
+                if (inline_value != NULL) {
+                    optarg = inline_value;
+                } else if (optind + 1 < argc) {
+                    optind += 1;
+                    optarg = argv[optind];
+                } else {
+                    optind += 1;
+                    return optstring[0] == ':' ? ':' : '?';
+                }
+                break;
+            case optional_argument:
+                optarg = inline_value;
+                break;
+            default:
+                errno = EINVAL;
+                optind += 1;
+                return '?';
+        }
+
+        optind += 1;
+        if (opt->flag != NULL) {
+            *opt->flag = opt->val;
+            return 0;
+        }
+        return opt->val;
+    }
+
+    if (single_dash_long) return getopt(argc, argv, optstring);
+
+    optind += 1;
+    return '?';
+}
+
+int __ziglibc_getopt_long(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
+{
+    // Keep the long-option parser in C. The Zig version matched Linux but crashed
+    // in macOS-target/Darling runs before entering user-visible logic, which is
+    // consistent with a target-specific ABI/codegen issue rather than parser
+    // semantics. Export the standard GNU names for ABI compatibility, but keep
+    // the implementation under a private alias so our own macOS-target callers
+    // do not rely on Darling resolving the public symbol back into the same
+    // image correctly.
+    return zgnu_getopt_long_common(argc, argv, optstring, longopts, longindex, 0);
+}
+
+int getopt_long(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
+{
+    return __ziglibc_getopt_long(argc, argv, optstring, longopts, longindex);
+}
+
+int __ziglibc_getopt_long_only(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
+{
+    return zgnu_getopt_long_common(argc, argv, optstring, longopts, longindex, 1);
+}
+
+int getopt_long_only(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
+{
+    return __ziglibc_getopt_long_only(argc, argv, optstring, longopts, longindex);
+}
 
 // --------------------------------------------------------------------------------
 // fcntl

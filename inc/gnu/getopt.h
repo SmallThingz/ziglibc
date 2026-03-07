@@ -19,5 +19,18 @@ struct option {
 
 int getopt_long(int argc, char *const argv[], const char *optstring, const struct option *longopts, int *longindex);
 int getopt_long_only(int argc, char *const argv[], const char *optstring, const struct option *longopts, int *longindex);
+int __ziglibc_getopt_long(int argc, char *const argv[], const char *optstring, const struct option *longopts, int *longindex);
+int __ziglibc_getopt_long_only(int argc, char *const argv[], const char *optstring, const struct option *longopts, int *longindex);
+
+#ifdef __APPLE__
+/*
+ * Darling is sensitive to same-image resolution of some public libc symbols.
+ * Keep exporting the standard names for ABI compatibility, but route source
+ * built against our headers through stable private aliases so the call target is
+ * unambiguous in macOS-target tests.
+ */
+#define getopt_long __ziglibc_getopt_long
+#define getopt_long_only __ziglibc_getopt_long_only
+#endif
 
 #endif /* _GETOPT_H */

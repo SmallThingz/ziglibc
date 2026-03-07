@@ -1,6 +1,7 @@
 const c = @cImport({
     @cInclude("argp.h");
     @cInclude("glob.h");
+    @cInclude("stdio.h");
     @cInclude("stdlib.h");
 });
 const std = @import("std");
@@ -11,8 +12,11 @@ fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
 }
 
 export fn argp_usage(state: *const c.argp_state) callconv(.c) void {
-    _ = state;
-    // No-op fallback for now.
+    if (state.argc > 0 and state.argv != null and state.argv[0] != null) {
+        _ = c.fprintf(c.stderr, "Usage: %s [OPTION...]\n", state.argv[0]);
+    } else {
+        _ = c.fprintf(c.stderr, "Usage: program [OPTION...]\n");
+    }
 }
 
 export fn argp_parse(

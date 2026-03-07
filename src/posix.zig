@@ -8,8 +8,10 @@ const c = @cImport({
     @cInclude("errno.h");
     @cInclude("fcntl.h");
     @cInclude("string.h");
+    @cInclude("strings.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
+    @cInclude("locale.h");
     @cInclude("unistd.h");
     @cInclude("time.h");
     @cInclude("signal.h");
@@ -20,11 +22,16 @@ const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("sys/select.h");
     @cInclude("sys/uio.h");
+    @cInclude("sys/socket.h");
+    @cInclude("netinet/in.h");
+    @cInclude("arpa/inet.h");
+    @cInclude("netdb.h");
     @cInclude("dirent.h");
 });
 
 const cstd = struct {
     extern fn __zreserveFile() callconv(.c) ?*c.FILE;
+    extern fn strncasecmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c) c_int;
     extern fn __zwindows_sigaction(
         sig: c_int,
         act: ?*const c.struct_sigaction,
@@ -58,6 +65,8 @@ const winapi = if (builtin.os.tag == .windows) struct {
     ) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
     pub extern "kernel32" fn GetComputerNameA(lpBuffer: [*]u8, nSize: *u32) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?std.os.windows.HMODULE;
+    pub extern "kernel32" fn GetProcAddress(hModule: ?std.os.windows.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     pub extern "kernel32" fn CreateHardLinkA(
         lpFileName: [*:0]const u8,
         lpExistingFileName: [*:0]const u8,
@@ -108,11 +117,14 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const ioctl: c_long = 54;
     const setitimer: c_long = 83;
     const getitimer: c_long = 86;
+    const fcntl: c_long = 92;
     const select: c_long = 93;
     const gettimeofday: c_long = 116;
+    const rename: c_long = 128;
     const utimes: c_long = 138;
     const futimes: c_long = 139;
-    const rename: c_long = 128;
+    // xnu's syscall table exposes openat via a stable BSD number on Darwin.
+    const openat: c_long = 463;
     const pselect: c_long = 394;
 } else struct {};
 
@@ -128,22 +140,98 @@ export var optopt: c_int = 0;
 var optchar_index: c_int = 1;
 var fallback_umask: c.mode_t = 0o022;
 var fallback_umask_mutex: std.Thread.Mutex = .{};
+var dirname_dot: [2:0]u8 = [_:0]u8{'.', 0};
+var dirname_root: [2:0]u8 = [_:0]u8{'/', 0};
 
 const PopenPid = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) usize else os.pid_t;
-const LongOption = extern struct {
-    name: ?[*:0]const u8,
-    has_arg: c_int,
-    flag: ?*c_int,
-    val: c_int,
-};
-
 const PopenEntry = struct {
     stream: ?*c.FILE = null,
     pid: PopenPid = 0,
 };
 
+const HostentState = struct {
+    mutex: std.Thread.Mutex = .{},
+    name_buf: [256]u8 = [_]u8{0} ** 256,
+    addr_buf: [4]u8 = [_]u8{0} ** 4,
+    aliases: [1:null]?[*:0]u8 = .{null},
+    addr_list: [2:null]?[*:0]u8 = .{ null, null },
+    hostent: c.struct_hostent = .{
+        .h_name = null,
+        .h_aliases = null,
+        .h_addrtype = c.AF_INET,
+        .h_length = 4,
+        .h_addr_list = null,
+    },
+};
+
 var popen_entries: [c.FOPEN_MAX]PopenEntry = [_]PopenEntry{.{}} ** c.FOPEN_MAX;
 var popen_mutex: std.Thread.Mutex = .{};
+var hostent_state: HostentState = .{};
+
+const windows_socket_base: c_int = 2048;
+const windows_socket_slots = 128;
+const WindowsSocket = std.os.windows.ws2_32.SOCKET;
+const WindowsSocketEntry = struct {
+    used: bool = false,
+    socket: WindowsSocket = std.os.windows.ws2_32.INVALID_SOCKET,
+};
+var windows_socket_mutex: std.Thread.Mutex = .{};
+var windows_socket_entries: [windows_socket_slots]WindowsSocketEntry = [_]WindowsSocketEntry{.{}} ** windows_socket_slots;
+var windows_wsa_once = std.once(struct {
+    fn init() void {
+        std.os.windows.callWSAStartup() catch {};
+    }
+}.init);
+const WinsockRawSocketFn = *const fn (af: i32, @"type": i32, protocol: i32) callconv(.winapi) WindowsSocket;
+const WinsockRawBindFn = *const fn (s: WindowsSocket, name: *const std.os.windows.ws2_32.sockaddr, namelen: i32) callconv(.winapi) i32;
+const WinsockRawConnectFn = *const fn (s: WindowsSocket, name: *const std.os.windows.ws2_32.sockaddr, namelen: i32) callconv(.winapi) i32;
+const WinsockRawGetNameFn = *const fn (s: WindowsSocket, name: *std.os.windows.ws2_32.sockaddr, namelen: *i32) callconv(.winapi) i32;
+const WinsockRawGetSockOptFn = *const fn (s: WindowsSocket, level: i32, optname: i32, optval: [*]u8, optlen: *i32) callconv(.winapi) i32;
+const WinsockRawSetSockOptFn = *const fn (s: WindowsSocket, level: i32, optname: i32, optval: ?[*]const u8, optlen: i32) callconv(.winapi) i32;
+const WinsockRawSendFn = *const fn (s: WindowsSocket, buf: [*]const u8, len: i32, flags: u32) callconv(.winapi) i32;
+const WinsockRawSendToFn = *const fn (s: WindowsSocket, buf: [*]const u8, len: i32, flags: i32, to: ?*const std.os.windows.ws2_32.sockaddr, tolen: i32) callconv(.winapi) i32;
+const WinsockRawRecvFn = *const fn (s: WindowsSocket, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+const WinsockRawRecvFromFn = *const fn (s: WindowsSocket, buf: [*]u8, len: i32, flags: i32, from: ?*std.os.windows.ws2_32.sockaddr, fromlen: ?*i32) callconv(.winapi) i32;
+const WinsockRawShutdownFn = *const fn (s: WindowsSocket, how: i32) callconv(.winapi) i32;
+// On Windows, calling imported Winsock functions by their plain names from the
+// same image that exports libc symbols such as `socket`, `bind`, `connect`,
+// `recv`, or `shutdown` can self-bind back into our own exports and recurse
+// until stack overflow. Resolve those entry points through GetProcAddress so
+// the Windows socket path always targets ws2_32.dll directly.
+const WinsockApi = struct {
+    module: ?std.os.windows.HMODULE = null,
+    socket_fn: ?WinsockRawSocketFn = null,
+    bind_fn: ?WinsockRawBindFn = null,
+    connect_fn: ?WinsockRawConnectFn = null,
+    getsockname_fn: ?WinsockRawGetNameFn = null,
+    getpeername_fn: ?WinsockRawGetNameFn = null,
+    getsockopt_fn: ?WinsockRawGetSockOptFn = null,
+    setsockopt_fn: ?WinsockRawSetSockOptFn = null,
+    send_fn: ?WinsockRawSendFn = null,
+    sendto_fn: ?WinsockRawSendToFn = null,
+    recv_fn: ?WinsockRawRecvFn = null,
+    recvfrom_fn: ?WinsockRawRecvFromFn = null,
+    shutdown_fn: ?WinsockRawShutdownFn = null,
+};
+var windows_winsock_api: WinsockApi = .{};
+var windows_winsock_api_once = std.once(struct {
+    fn init() void {
+        const module = winapi.LoadLibraryA("ws2_32.dll") orelse return;
+        windows_winsock_api.module = module;
+        windows_winsock_api.socket_fn = @ptrCast(winapi.GetProcAddress(module, "socket") orelse return);
+        windows_winsock_api.bind_fn = @ptrCast(winapi.GetProcAddress(module, "bind") orelse return);
+        windows_winsock_api.connect_fn = @ptrCast(winapi.GetProcAddress(module, "connect") orelse return);
+        windows_winsock_api.getsockname_fn = @ptrCast(winapi.GetProcAddress(module, "getsockname") orelse return);
+        windows_winsock_api.getpeername_fn = @ptrCast(winapi.GetProcAddress(module, "getpeername") orelse return);
+        windows_winsock_api.getsockopt_fn = @ptrCast(winapi.GetProcAddress(module, "getsockopt") orelse return);
+        windows_winsock_api.setsockopt_fn = @ptrCast(winapi.GetProcAddress(module, "setsockopt") orelse return);
+        windows_winsock_api.send_fn = @ptrCast(winapi.GetProcAddress(module, "send") orelse return);
+        windows_winsock_api.sendto_fn = @ptrCast(winapi.GetProcAddress(module, "sendto") orelse return);
+        windows_winsock_api.recv_fn = @ptrCast(winapi.GetProcAddress(module, "recv") orelse return);
+        windows_winsock_api.recvfrom_fn = @ptrCast(winapi.GetProcAddress(module, "recvfrom") orelse return);
+        windows_winsock_api.shutdown_fn = @ptrCast(winapi.GetProcAddress(module, "shutdown") orelse return);
+    }
+}.init);
 
 fn registerPopenStream(stream: *c.FILE, pid: PopenPid) bool {
     popen_mutex.lock();
@@ -169,6 +257,74 @@ fn unregisterPopenStream(stream: *c.FILE) ?PopenPid {
         }
     }
     return null;
+}
+
+fn ensureWindowsSockets() void {
+    if (comptime builtin.os.tag != .windows) return;
+    windows_wsa_once.call();
+    windows_winsock_api_once.call();
+}
+
+fn windowsWinsockReady() bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    return windows_winsock_api.socket_fn != null and
+        windows_winsock_api.bind_fn != null and
+        windows_winsock_api.connect_fn != null and
+        windows_winsock_api.getsockname_fn != null and
+        windows_winsock_api.getpeername_fn != null and
+        windows_winsock_api.getsockopt_fn != null and
+        windows_winsock_api.setsockopt_fn != null and
+        windows_winsock_api.send_fn != null and
+        windows_winsock_api.sendto_fn != null and
+        windows_winsock_api.recv_fn != null and
+        windows_winsock_api.recvfrom_fn != null and
+        windows_winsock_api.shutdown_fn != null;
+}
+
+fn windowsWinsockUnavailable() c_int {
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
+}
+
+fn windowsSocketFd(sock: WindowsSocket) ?c_int {
+    if (comptime builtin.os.tag != .windows) return null;
+    windows_socket_mutex.lock();
+    defer windows_socket_mutex.unlock();
+    for (&windows_socket_entries, 0..) |*entry, i| {
+        if (!entry.used) {
+            entry.* = .{ .used = true, .socket = sock };
+            return windows_socket_base + @as(c_int, @intCast(i));
+        }
+    }
+    return null;
+}
+
+fn windowsSocketFromFd(fd: c_int) ?WindowsSocket {
+    if (comptime builtin.os.tag != .windows) return null;
+    if (fd < windows_socket_base) return null;
+    const index = fd - windows_socket_base;
+    if (index < 0 or index >= windows_socket_slots) return null;
+    windows_socket_mutex.lock();
+    defer windows_socket_mutex.unlock();
+    const entry = windows_socket_entries[@as(usize, @intCast(index))];
+    if (!entry.used) return null;
+    return entry.socket;
+}
+
+fn closeWindowsSocket(fd: c_int) c_int {
+    if (comptime builtin.os.tag != .windows) return errnoConst("ENOSYS", c.EINVAL);
+    if (fd < windows_socket_base) return errnoConst("EBADF", c.EINVAL);
+    const index = fd - windows_socket_base;
+    if (index < 0 or index >= windows_socket_slots) return errnoConst("EBADF", c.EINVAL);
+    windows_socket_mutex.lock();
+    defer windows_socket_mutex.unlock();
+    const entry = &windows_socket_entries[@as(usize, @intCast(index))];
+    if (!entry.used) return errnoConst("EBADF", c.EINVAL);
+    std.os.windows.closesocket(entry.socket) catch {
+        return errnoConst("EIO", c.EINVAL);
+    };
+    entry.* = .{};
+    return 0;
 }
 
 fn waitForPidStatus(pid: PopenPid) c_int {
@@ -312,135 +468,6 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         optchar_index += 1;
     }
     return @as(c_int, opt_ch);
-}
-
-fn longOptionNameLen(name: [*:0]const u8) usize {
-    var i: usize = 0;
-    while (name[i] != 0 and name[i] != '=') : (i += 1) {}
-    return i;
-}
-
-fn getoptLongCommon(
-    argc: c_int,
-    argv: [*][*:0]u8,
-    optstring: [*:0]const u8,
-    longopts: [*c]const LongOption,
-    longindex: ?*c_int,
-    long_only: bool,
-) c_int {
-    const dbg = struct {
-        fn mark(msg: []const u8) void {
-            if (!builtin.os.tag.isDarwin()) return;
-            _ = zwriteRaw(2, msg.ptr, msg.len);
-            _ = zwriteRaw(2, "\n".ptr, 1);
-        }
-    };
-    optarg = null;
-    if (optind < 1) {
-        optind = 1;
-        optchar_index = 1;
-    }
-    if (optind >= argc) return -1;
-
-    const arg = argv[@as(usize, @intCast(optind))];
-    var long_name: [*:0]const u8 = undefined;
-    var single_dash_long = false;
-    if (arg[0] == '-' and arg[1] == '-') {
-        if (arg[2] == 0) {
-            optind += 1;
-            optchar_index = 1;
-            return -1;
-        }
-        long_name = @ptrCast(arg + 2);
-    } else if (long_only and arg[0] == '-' and arg[1] != 0 and arg[1] != '-') {
-        long_name = @ptrCast(arg + 1);
-        single_dash_long = true;
-    } else {
-        return getopt(argc, argv, optstring);
-    }
-
-    const name_len = longOptionNameLen(long_name);
-    const inline_value: ?[*:0]u8 = if (long_name[name_len] == '=') @ptrCast(@constCast(long_name + name_len + 1)) else null;
-
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        const opt = longopts[i];
-        const opt_name = opt.name orelse break;
-        if (std.mem.eql(u8, std.mem.span(opt_name), long_name[0..name_len]) and opt_name[name_len] == 0) {
-            dbg.mark("gl:match");
-            if (longindex) |idx| idx.* = @as(c_int, @intCast(i));
-
-            switch (opt.has_arg) {
-                0 => {
-                    if (inline_value != null) {
-                        optind += 1;
-                        optchar_index = 1;
-                        return '?';
-                    }
-                    optarg = null;
-                },
-                1 => {
-                    if (inline_value) |value| {
-                        optarg = value;
-                    } else if (optind + 1 < argc) {
-                        optind += 1;
-                        optarg = @ptrCast(argv[@as(usize, @intCast(optind))]);
-                    } else {
-                        optind += 1;
-                        optchar_index = 1;
-                        return if (optstring[0] == ':') ':' else '?';
-                    }
-                },
-                2 => {
-                    optarg = inline_value;
-                },
-                else => {
-                    optind += 1;
-                    optchar_index = 1;
-                    c.errno = c.EINVAL;
-                    return '?';
-                },
-            }
-
-            optind += 1;
-            optchar_index = 1;
-            if (opt.flag) |flag| {
-                dbg.mark("gl:flag-before");
-                flag.* = opt.val;
-                dbg.mark("gl:flag-after");
-                return 0;
-            }
-            dbg.mark("gl:return-val");
-            return opt.val;
-        }
-    }
-
-    if (single_dash_long) {
-        return getopt(argc, argv, optstring);
-    }
-    optind += 1;
-    optchar_index = 1;
-    return '?';
-}
-
-export fn getopt_long(
-    argc: c_int,
-    argv: [*][*:0]u8,
-    optstring: [*:0]const u8,
-    longopts: [*c]const LongOption,
-    longindex: ?*c_int,
-) callconv(.c) c_int {
-    return getoptLongCommon(argc, argv, optstring, longopts, longindex, false);
-}
-
-export fn getopt_long_only(
-    argc: c_int,
-    argv: [*][*:0]u8,
-    optstring: [*:0]const u8,
-    longopts: [*c]const LongOption,
-    longindex: ?*c_int,
-) callconv(.c) c_int {
-    return getoptLongCommon(argc, argv, optstring, longopts, longindex, true);
 }
 
 fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
@@ -645,12 +672,12 @@ fn zopenAtRaw(dirfd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_i
         return -1;
     }
     if (builtin.os.tag.isDarwin()) {
-        if (dirfd == c.AT_FDCWD) return zopenRaw(path, oflag, create_mode);
-        // Do not call the public `openat` symbol from inside our own libc; that
-        // recurses through the C shim and crashed under Darling. A real dirfd-
-        // relative Darwin implementation still needs a private entry point.
-        c.errno = errnoConst("ENOSYS", c.EINVAL);
-        return -1;
+        const rc = syscall(darwin_syscall.openat, dirfd, path, oflag, create_mode);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @intCast(rc);
     }
 
     const flags_bits: u32 = @bitCast(oflag);
@@ -675,6 +702,14 @@ export fn write(fd: c_int, buf: [*]const u8, nbyte: usize) callconv(.c) isize {
 
 export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
     return zreadRaw(fd, buf, len);
+}
+
+fn darwinAccessMask(st: c.struct_stat) c_int {
+    var mask: c_int = 0;
+    if ((st.st_mode & 0o444) != 0) mask |= c.R_OK;
+    if ((st.st_mode & 0o222) != 0) mask |= c.W_OK;
+    if ((st.st_mode & 0o111) != 0) mask |= c.X_OK;
+    return mask;
 }
 
 fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
@@ -1026,6 +1061,12 @@ comptime {
 fn close(fd: c_int) callconv(.c) c_int {
     trace.log("close {}", .{fd});
     if (builtin.os.tag == .windows) {
+        if (windowsSocketFromFd(fd) != null) {
+            const close_errno = closeWindowsSocket(fd);
+            if (close_errno == 0) return 0;
+            c.errno = close_errno;
+            return -1;
+        }
         const close_errno = winfd.closeFd(fd);
         if (close_errno == 0) return 0;
         c.errno = close_errno;
@@ -1043,10 +1084,27 @@ fn close(fd: c_int) callconv(.c) c_int {
 export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
     trace.log("access '{f}' mode=0x{x}", .{ trace.fmtStr(path), amode });
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.access, path, amode);
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
+        const valid_bits = c.R_OK | c.W_OK | c.X_OK;
+        if ((amode & ~(valid_bits | c.F_OK)) != 0) {
+            c.errno = c.EINVAL;
             return -1;
+        }
+        const open_flags = if ((amode & c.W_OK) != 0 and (amode & c.R_OK) != 0)
+            c.O_RDWR
+        else if ((amode & c.W_OK) != 0)
+            c.O_WRONLY
+        else
+            c.O_RDONLY;
+        const fd = zopenRaw(path, open_flags, 0);
+        if (fd < 0) return -1;
+        defer _ = close(fd);
+        if ((amode & c.X_OK) != 0) {
+            var st: c.struct_stat = undefined;
+            if (fstat(fd, &st) != 0) return -1;
+            if ((darwinAccessMask(st) & c.X_OK) == 0) {
+                c.errno = c.EACCES;
+                return -1;
+            }
         }
         return 0;
     }
@@ -1068,6 +1126,505 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
         return -1;
     };
     return 0;
+}
+
+fn socketErrno(err: anyerror) c_int {
+    return switch (err) {
+        error.AccessDenied, error.PermissionDenied => c.EACCES,
+        error.AddressFamilyNotSupported => errnoConst("EAFNOSUPPORT", c.EINVAL),
+        error.ProtocolFamilyNotAvailable => errnoConst("EPROTONOSUPPORT", c.EINVAL),
+        error.ProtocolNotSupported => errnoConst("EPROTONOSUPPORT", c.EINVAL),
+        error.SocketTypeNotSupported => errnoConst("ESOCKTNOSUPPORT", c.EINVAL),
+        error.ProcessFdQuotaExceeded => errnoConst("EMFILE", c.ENOMEM),
+        error.SystemFdQuotaExceeded => errnoConst("ENFILE", c.ENOMEM),
+        error.SystemResources, error.NetworkSubsystemFailed => c.ENOMEM,
+        error.AddressInUse => errnoConst("EADDRINUSE", c.EINVAL),
+        error.AddressNotAvailable => errnoConst("EADDRNOTAVAIL", c.EINVAL),
+        error.FileDescriptorNotASocket => errnoConst("ENOTSOCK", c.EINVAL),
+        error.AlreadyBound => errnoConst("EINVAL", c.EINVAL),
+        error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
+        error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
+        error.FileNotFound => c.ENOENT,
+        error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
+        error.ReadOnlyFileSystem => errnoConst("EROFS", c.EACCES),
+        error.ConnectionPending, error.WouldBlock => errnoConst("EWOULDBLOCK", c.EAGAIN),
+        error.ConnectionRefused => errnoConst("ECONNREFUSED", c.EINVAL),
+        error.ConnectionResetByPeer => errnoConst("ECONNRESET", c.EINVAL),
+        error.ConnectionTimedOut => errnoConst("ETIMEDOUT", c.EINVAL),
+        error.NetworkUnreachable => errnoConst("ENETUNREACH", c.EINVAL),
+        error.SocketNotConnected => errnoConst("ENOTCONN", c.EINVAL),
+        error.ConnectionAborted => errnoConst("ECONNABORTED", c.EINVAL),
+        error.BlockingOperationInProgress => errnoConst("EINPROGRESS", c.EAGAIN),
+        error.MessageTooBig => errnoConst("EMSGSIZE", c.EINVAL),
+        error.BrokenPipe => errnoConst("EPIPE", c.EINVAL),
+        error.UnreachableAddress => errnoConst("EINVAL", c.EINVAL),
+        error.SocketNotBound => errnoConst("EINVAL", c.EINVAL),
+        error.FastOpenAlreadyInProgress => errnoConst("EALREADY", c.EINVAL),
+        else => errnoConst("EIO", c.EINVAL),
+    };
+}
+
+fn windowsSocketErrno() c_int {
+    if (comptime builtin.os.tag != .windows) return errnoConst("ENOSYS", c.EINVAL);
+    return switch (std.os.windows.ws2_32.WSAGetLastError()) {
+        .WSAEACCES => c.EACCES,
+        .WSAEADDRINUSE => errnoConst("EADDRINUSE", c.EINVAL),
+        .WSAEADDRNOTAVAIL => errnoConst("EADDRNOTAVAIL", c.EINVAL),
+        .WSAEAFNOSUPPORT => errnoConst("EAFNOSUPPORT", c.EINVAL),
+        .WSAEWOULDBLOCK => errnoConst("EWOULDBLOCK", c.EAGAIN),
+        .WSAECONNREFUSED => errnoConst("ECONNREFUSED", c.EINVAL),
+        .WSAECONNRESET => errnoConst("ECONNRESET", c.EINVAL),
+        .WSAETIMEDOUT => errnoConst("ETIMEDOUT", c.EINVAL),
+        .WSAEINPROGRESS => errnoConst("EINPROGRESS", c.EINVAL),
+        .WSAEALREADY => errnoConst("EALREADY", c.EINVAL),
+        .WSAEISCONN => errnoConst("EISCONN", c.EINVAL),
+        .WSAENOTCONN => errnoConst("ENOTCONN", c.EINVAL),
+        .WSAENOTSOCK => errnoConst("ENOTSOCK", c.EINVAL),
+        .WSAEMSGSIZE => errnoConst("EMSGSIZE", c.EINVAL),
+        .WSAEINVAL => c.EINVAL,
+        .WSAENOPROTOOPT => errnoConst("ENOPROTOOPT", c.EINVAL),
+        .WSAEPROTONOSUPPORT => errnoConst("EPROTONOSUPPORT", c.EINVAL),
+        .WSAESOCKTNOSUPPORT => errnoConst("ESOCKTNOSUPPORT", c.EINVAL),
+        .WSAEOPNOTSUPP => errnoConst("EOPNOTSUPP", c.EINVAL),
+        .WSAENETDOWN, .WSAENOBUFS => c.ENOMEM,
+        else => errnoConst("EIO", c.EINVAL),
+    };
+}
+
+fn rawSocketFd(fd: c_int) ?std.posix.socket_t {
+    if (builtin.os.tag == .windows) {
+        return windowsSocketFromFd(fd);
+    }
+    if (fd < 0) return null;
+    return @as(std.posix.socket_t, @intCast(fd));
+}
+
+export fn socket(domain: c_int, sock_type: c_int, protocol: c_int) callconv(.c) c_int {
+    if (builtin.os.tag == .windows) {
+        ensureWindowsSockets();
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        const sock = windows_winsock_api.socket_fn.?(domain, sock_type, protocol);
+        if (sock == std.os.windows.ws2_32.INVALID_SOCKET) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return windowsSocketFd(sock) orelse blk: {
+            _ = std.os.windows.ws2_32.closesocket(sock);
+            c.errno = errnoConst("EMFILE", c.ENOMEM);
+            break :blk -1;
+        };
+    }
+    const sock = std.posix.socket(
+        @as(u32, @intCast(domain)),
+        @as(u32, @intCast(sock_type)),
+        @as(u32, @intCast(protocol)),
+    ) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return @as(c_int, @intCast(sock));
+}
+
+export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        const name = addr orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        if (windows_winsock_api.bind_fn.?(sock, @ptrCast(name), @intCast(addrlen)) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    std.posix.bind(sock, @ptrCast(addr orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    }), @intCast(addrlen)) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len: c.socklen_t) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        const name = address orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        if (windows_winsock_api.connect_fn.?(sock, @ptrCast(name), @intCast(address_len)) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    std.posix.connect(sock, @ptrCast(address orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    }), @intCast(address_len)) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        const name = address orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const len_ptr = address_len orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        if (windows_winsock_api.getsockname_fn.?(sock, @ptrCast(name), @ptrCast(len_ptr)) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    std.posix.getsockname(sock, @ptrCast(address orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    }), @ptrCast(address_len orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    })) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        const name = address orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const len_ptr = address_len orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        if (windows_winsock_api.getpeername_fn.?(sock, @ptrCast(name), @ptrCast(len_ptr)) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    std.posix.getpeername(sock, @ptrCast(address orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    }), @ptrCast(address_len orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    })) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_value: ?*anyopaque, option_len: ?*c.socklen_t) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    const len_ptr = option_len orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    };
+    const out_ptr = option_value orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    };
+    const opt_buf: [*]u8 = @ptrCast(out_ptr);
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        if (windows_winsock_api.getsockopt_fn.?(sock, level, option_name, opt_buf, @ptrCast(len_ptr)) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    std.posix.getsockopt(sock, level, @as(u32, @intCast(option_name)), opt_buf[0..@intCast(len_ptr.*)]) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn setsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_value: ?*const anyopaque, option_len: c.socklen_t) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    const in_ptr = option_value orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    };
+    const opt_buf: [*]const u8 = @ptrCast(in_ptr);
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        if (windows_winsock_api.setsockopt_fn.?(sock, level, option_name, opt_buf, @intCast(option_len)) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    std.posix.setsockopt(sock, level, @as(u32, @intCast(option_name)), opt_buf[0..@intCast(option_len)]) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn sendto(sockfd: c_int, message: ?*const anyopaque, len: usize, flags: c_int, dest_addr: ?*const c.struct_sockaddr, dest_len: c.socklen_t) callconv(.c) isize {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    const data_ptr: [*]const u8 = if (len == 0)
+        @ptrFromInt(@intFromPtr(""))
+    else
+        @ptrCast(message orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        });
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) {
+            c.errno = errnoConst("ENOSYS", c.EINVAL);
+            return -1;
+        }
+        const max_len: usize = @min(len, @as(usize, std.math.maxInt(c_int)));
+        const rc = if (dest_addr) |to|
+            windows_winsock_api.sendto_fn.?(sock, data_ptr, @intCast(max_len), flags, @ptrCast(to), @intCast(dest_len))
+        else
+            windows_winsock_api.send_fn.?(sock, data_ptr, @intCast(max_len), @as(u32, @bitCast(flags)));
+        if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
+    }
+    const written = std.posix.sendto(sock, data_ptr[0..len], @as(u32, @intCast(flags)), @ptrCast(dest_addr), @intCast(dest_len)) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return @as(isize, @intCast(written));
+}
+
+export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) callconv(.c) isize {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    const buf_ptr: [*]u8 = if (length == 0)
+        @ptrFromInt(@intFromPtr(""))
+    else
+        @ptrCast(buffer orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        });
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) {
+            c.errno = errnoConst("ENOSYS", c.EINVAL);
+            return -1;
+        }
+        const max_len: usize = @min(length, @as(usize, std.math.maxInt(c_int)));
+        const rc = windows_winsock_api.recv_fn.?(sock, buf_ptr, @intCast(max_len), flags);
+        if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
+    }
+    const got = std.posix.recv(sock, buf_ptr[0..length], @as(u32, @intCast(flags))) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return @as(isize, @intCast(got));
+}
+
+export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) isize {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    const buf_ptr: [*]u8 = if (length == 0)
+        @ptrFromInt(@intFromPtr(""))
+    else
+        @ptrCast(buffer orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        });
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) {
+            c.errno = errnoConst("ENOSYS", c.EINVAL);
+            return -1;
+        }
+        const max_len: usize = @min(length, @as(usize, std.math.maxInt(c_int)));
+        const rc = windows_winsock_api.recvfrom_fn.?(
+            sock,
+            buf_ptr,
+            @intCast(max_len),
+            flags,
+            @ptrCast(address),
+            @ptrCast(address_len),
+        );
+        if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
+    }
+    const got = std.posix.recvfrom(sock, buf_ptr[0..length], @as(u32, @intCast(flags)), @ptrCast(address), @ptrCast(address_len)) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return @as(isize, @intCast(got));
+}
+
+export fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int {
+    const sock = rawSocketFd(sockfd) orelse {
+        c.errno = errnoConst("ENOTSOCK", c.EINVAL);
+        return -1;
+    };
+    if (builtin.os.tag == .windows) {
+        if (!windowsWinsockReady()) return windowsWinsockUnavailable();
+        if (windows_winsock_api.shutdown_fn.?(sock, how) == std.os.windows.ws2_32.SOCKET_ERROR) {
+            c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    const mode: std.posix.ShutdownHow = switch (how) {
+        c.SHUT_RD => .recv,
+        c.SHUT_WR => .send,
+        c.SHUT_RDWR => .both,
+        else => {
+            c.errno = c.EINVAL;
+            return -1;
+        },
+    };
+    std.posix.shutdown(sock, mode) catch |err| {
+        c.errno = socketErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn htonl(hostlong: c.in_addr_t) callconv(.c) c.in_addr_t {
+    return @byteSwap(hostlong);
+}
+
+export fn htons(hostshort: c_ushort) callconv(.c) c_ushort {
+    return @byteSwap(hostshort);
+}
+
+export fn ntohl(netlong: c.in_addr_t) callconv(.c) c.in_addr_t {
+    return @byteSwap(netlong);
+}
+
+export fn ntohs(netshort: c_ushort) callconv(.c) c_ushort {
+    return @byteSwap(netshort);
+}
+
+fn parseIpv4(text: []const u8) ?c.in_addr_t {
+    var iter = std.mem.splitScalar(u8, text, '.');
+    var parts: [4]u8 = undefined;
+    var idx: usize = 0;
+    while (iter.next()) |piece| {
+        if (idx >= parts.len or piece.len == 0) return null;
+        const value = std.fmt.parseUnsigned(u8, piece, 10) catch return null;
+        parts[idx] = value;
+        idx += 1;
+    }
+    if (idx != parts.len) return null;
+    const host_value: u32 = (@as(u32, parts[0]) << 24) | (@as(u32, parts[1]) << 16) | (@as(u32, parts[2]) << 8) | @as(u32, parts[3]);
+    return htonl(host_value);
+}
+
+fn formatIpv4(buf: []u8, addr: c.in_addr_t) []const u8 {
+    const host = ntohl(addr);
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+        (host >> 24) & 0xff,
+        (host >> 16) & 0xff,
+        (host >> 8) & 0xff,
+        host & 0xff,
+    }) catch "";
+}
+
+export fn inet_addr(cp: [*:0]const u8) callconv(.c) c.in_addr_t {
+    return parseIpv4(std.mem.span(cp)) orelse ~@as(c.in_addr_t, 0);
+}
+
+export fn inet_ntoa(input: c.struct_in_addr) callconv(.c) [*:0]u8 {
+    hostent_state.mutex.lock();
+    defer hostent_state.mutex.unlock();
+    const rendered = formatIpv4(hostent_state.name_buf[0 .. hostent_state.name_buf.len - 1], input.s_addr);
+    @memset(hostent_state.name_buf[rendered.len..], 0);
+    return @ptrCast(&hostent_state.name_buf);
+}
+
+fn fillHostent(name: []const u8, addr: c.in_addr_t) *c.struct_hostent {
+    hostent_state.mutex.lock();
+    defer hostent_state.mutex.unlock();
+    const name_len = @min(name.len, hostent_state.name_buf.len - 1);
+    @memcpy(hostent_state.name_buf[0..name_len], name[0..name_len]);
+    @memset(hostent_state.name_buf[name_len..], 0);
+    std.mem.writeInt(u32, hostent_state.addr_buf[0..4], addr, .big);
+    hostent_state.addr_list[0] = @ptrCast(&hostent_state.addr_buf);
+    hostent_state.addr_list[1] = null;
+    hostent_state.hostent.h_name = @ptrCast(&hostent_state.name_buf);
+    hostent_state.hostent.h_aliases = @ptrCast(&hostent_state.aliases);
+    hostent_state.hostent.h_addrtype = c.AF_INET;
+    hostent_state.hostent.h_length = 4;
+    hostent_state.hostent.h_addr_list = @ptrCast(&hostent_state.addr_list);
+    return &hostent_state.hostent;
+}
+
+export fn gethostbyname(name: [*:0]const u8) callconv(.c) ?*c.struct_hostent {
+    const text = std.mem.span(name);
+    if (std.ascii.eqlIgnoreCase(text, "localhost")) {
+        return fillHostent("localhost", htonl(c.INADDR_LOOPBACK));
+    }
+    const parsed = parseIpv4(text) orelse return null;
+    return fillHostent(text, parsed);
+}
+
+export fn gethostbyaddr(addr: ?*const anyopaque, len: c.socklen_t, typ: c_int) callconv(.c) ?*c.struct_hostent {
+    if (typ != c.AF_INET or len != 4 or addr == null) return null;
+    const bytes: *const [4]u8 = @ptrCast(@alignCast(addr));
+    const raw = std.mem.readInt(u32, bytes, .big);
+    if (raw == htonl(c.INADDR_LOOPBACK)) {
+        return fillHostent("localhost", raw);
+    }
+    var buf: [16]u8 = undefined;
+    const rendered = formatIpv4(&buf, raw);
+    return fillHostent(rendered, raw);
 }
 
 fn pathconfLinkMax() c_long {
@@ -1148,12 +1705,13 @@ export fn link(path1: [*:0]const u8, path2: [*:0]const u8) callconv(.c) c_int {
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.unlink, path);
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
-            return -1;
+        switch (os.errno(os.system.unlinkat(c.AT_FDCWD, path, 0))) {
+            .SUCCESS => return 0,
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
         }
-        return 0;
     }
     if (builtin.os.tag == .windows) {
         std.posix.unlinkZ(path) catch |err| {
@@ -1226,6 +1784,12 @@ export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
         };
         return -1;
     };
+    return 0;
+}
+
+export fn sleep(seconds: c_uint) callconv(.c) c_uint {
+    if (seconds == 0) return 0;
+    std.Thread.sleep(@as(u64, seconds) * std.time.ns_per_s);
     return 0;
 }
 
@@ -1998,8 +2562,8 @@ fn dirImplFromOpaque(dirp: *c.DIR) *DirImpl {
     return @ptrCast(@alignCast(dirp));
 }
 
-fn openDirPath(dirname: [*:0]const u8) !std.fs.Dir {
-    const path = std.mem.span(dirname);
+fn openDirPath(dir_name: [*:0]const u8) !std.fs.Dir {
+    const path = std.mem.span(dir_name);
     const opts = std.fs.Dir.OpenOptions{ .iterate = true };
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.openDirAbsolute(path, opts);
@@ -2007,8 +2571,8 @@ fn openDirPath(dirname: [*:0]const u8) !std.fs.Dir {
     return std.fs.cwd().openDir(path, opts);
 }
 
-export fn opendir(dirname: [*:0]const u8) callconv(.c) ?*c.DIR {
-    var dir = openDirPath(dirname) catch |err| {
+export fn opendir(dir_name: [*:0]const u8) callconv(.c) ?*c.DIR {
+    var dir = openDirPath(dir_name) catch |err| {
         c.errno = fsErrno(err);
         return null;
     };
@@ -2222,6 +2786,23 @@ export fn basename(path: ?[*:0]u8) callconv(.c) [*:0]u8 {
     return mut_ptr;
 }
 
+export fn dirname(path: ?[*:0]u8) callconv(.c) [*:0]u8 {
+    const input = path orelse return &dirname_dot;
+    if (input[0] == 0) return &dirname_dot;
+
+    var end = std.mem.len(input);
+    while (end > 1 and input[end - 1] == '/') : (end -= 1) {}
+
+    while (end > 0 and input[end - 1] != '/') : (end -= 1) {}
+    if (end == 0) return &dirname_dot;
+
+    while (end > 1 and input[end - 1] == '/') : (end -= 1) {}
+    input[end] = 0;
+
+    if (input[0] == 0) return &dirname_root;
+    return input;
+}
+
 // --------------------------------------------------------------------------------
 // termios
 // --------------------------------------------------------------------------------
@@ -2262,6 +2843,16 @@ export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
             return @as(c_int, @intCast(a_ch)) -| @as(c_int, @intCast(b_ch));
         }
     }
+}
+
+export fn strcasecmp_l(a: [*:0]const u8, b: [*:0]const u8, locale: c.locale_t) callconv(.c) c_int {
+    _ = locale;
+    return strcasecmp(a, b);
+}
+
+export fn strncasecmp_l(a: [*:0]const u8, b: [*:0]const u8, n: usize, locale: c.locale_t) callconv(.c) c_int {
+    _ = locale;
+    return cstd.strncasecmp(a, b, n);
 }
 
 // --------------------------------------------------------------------------------
