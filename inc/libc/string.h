@@ -27,9 +27,7 @@ void *memset(void *s, int c, size_t n);
 char *strerror(int errnum);
 size_t strlen(const char *s);
 
-// TODO: I'm not sure where strsignal comes from, it might
-//       be GNU-specific but the libc-test project requires it
-//       so I'm just inluding it for now.
+// POSIX/GNU extension used by imported compatibility suites.
 char* strsignal(int);
 
 // NOTE: it looks like strdup is defined by posix (not libc)

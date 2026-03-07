@@ -3,8 +3,11 @@
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
-// TODO: look into this value more
-#define RAND_MAX 65535
+#ifdef _WIN32
+    #define RAND_MAX 32767
+#else
+    #define RAND_MAX 2147483647
+#endif
 
 #include "private/null.h"
 #include "private/size_t.h"

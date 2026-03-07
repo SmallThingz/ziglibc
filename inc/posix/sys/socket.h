@@ -10,7 +10,6 @@
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
 
-/* TODO: this probably changes per platform */
 #define AF_UNIX 1
 #define AF_INET 2
 #define PF_INET AF_INET

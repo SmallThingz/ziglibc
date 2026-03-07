@@ -37,6 +37,11 @@ static void test_d(const char *str, int expected_errno, size_t parse_len, double
 
 int main(int argc, char *argv[])
 {
+#ifdef __APPLE__
+  const int no_digit_errno = EINVAL;
+#else
+  const int no_digit_errno = 123;
+#endif
   test_l("2147483647", 0, 0, 10, 2147483647L);
   test_ul("4294967295", 0, 0, 10, 4294967295UL);
 
@@ -49,6 +54,22 @@ int main(int argc, char *argv[])
   test_l("0x1234", 16, 0, 6, 0x1234);
 
   test_l("123", 37, EINVAL, 0, 0);
+  {
+    const char *s = "abc";
+    char *endptr;
+    errno = 123;
+    expect(0 == strtol(s, &endptr, 10));
+    expect(errno == no_digit_errno);
+    expect(endptr == s);
+  }
+  {
+    const char *s = "  x";
+    char *endptr;
+    errno = 123;
+    expect(0 == strtol(s, &endptr, 10));
+    expect(errno == no_digit_errno);
+    expect(endptr == s);
+  }
 
   test_l("  15437", 8, 0, 7, 015437);
   test_l("  1", 0, 0, 3, 1);
@@ -56,7 +77,7 @@ int main(int argc, char *argv[])
   test_d("12.5xyz", 0, 4, 12.499, 12.501);
   test_d("  -1.25e2x", 0, 9, -125.001, -124.999);
   test_d("1e+", 0, 1, 0.999, 1.001);
-  test_d("abc", EINVAL, 0, -0.001, 0.001);
+  test_d("abc", 0, 0, -0.001, 0.001);
 
   puts("Success!");
   return 0;

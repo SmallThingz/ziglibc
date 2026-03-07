@@ -3,10 +3,9 @@
 
 #include "sa_family_t.h"
 
-// TODO: define me better
 struct sockaddr {
   sa_family_t sa_family;
-  char reserved[100];
+  char sa_data[14];
 };
 
 #endif /* _PRIVATE_SOCKADDR_H */

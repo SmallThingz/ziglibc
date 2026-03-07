@@ -26,9 +26,11 @@ const cstd = struct {
         act: ?*const c.struct_sigaction,
         oact: ?*c.struct_sigaction,
     ) callconv(.c) c_int;
+    extern fn __zwindows_raise_signal(sig: c_int) callconv(.c) c_int;
 };
 
 extern "c" fn syscall(number: c_long, ...) c_long;
+extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 
 const trace = @import("trace.zig");
 
@@ -98,7 +100,10 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const getitimer: c_long = 86;
     const select: c_long = 93;
     const gettimeofday: c_long = 116;
+    const utimes: c_long = 138;
+    const futimes: c_long = 139;
     const rename: c_long = 128;
+    const pselect: c_long = 394;
 } else struct {};
 
 fn windowsStdHandleFromFd(fd: c_int) ?std.os.windows.HANDLE {
@@ -700,6 +705,8 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
             if (populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
                 _ = os.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
             }
+        } else if (builtin.os.tag.isDarwin()) {
+            _ = os.system.execve(shell_path, &argv, @ptrCast(_NSGetEnviron().*));
         }
         const empty_envp = [_:null]?[*:0]const u8{null};
         _ = os.system.execve(shell_path, &argv, @ptrCast(&empty_envp));
@@ -904,7 +911,6 @@ export fn _exit(status: c_int) callconv(.c) noreturn {
         std.os.wasi.proc_exit(status);
     }
     if (builtin.os.tag == .linux and !builtin.single_threaded) {
-        // TODO: is this right?
         std.os.linux.exit_group(status);
     }
     os.system.exit(status);
@@ -951,16 +957,6 @@ comptime {
     }
 }
 
-fn setTimespec(tp: *os.timespec, sec: anytype, nsec: anytype) void {
-    if (@hasField(os.timespec, "tv_sec")) {
-        tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(sec));
-        tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(nsec));
-    } else {
-        tp.sec = @as(@TypeOf(tp.sec), @intCast(sec));
-        tp.nsec = @as(@TypeOf(tp.nsec), @intCast(nsec));
-    }
-}
-
 const LinuxTimeval = extern struct {
     tv_sec: isize,
     tv_usec: isize,
@@ -989,6 +985,13 @@ fn windowsFileTimeToUnix100ns(ft: std.os.windows.FILETIME) u64 {
     return (@as(u64, ft.dwHighDateTime) << 32) | @as(u64, ft.dwLowDateTime);
 }
 
+fn windowsFileTimeToUnixSec(ft: std.os.windows.FILETIME) i64 {
+    const ticks_100ns = windowsFileTimeToUnix100ns(ft);
+    const unix_epoch_100ns: u64 = 11644473600 * 10_000_000;
+    const unix_100ns = if (ticks_100ns > unix_epoch_100ns) ticks_100ns - unix_epoch_100ns else 0;
+    return @as(i64, @intCast(unix_100ns / 10_000_000));
+}
+
 fn currentWindowsUnixTime() struct { sec: i64, usec: i64, nsec: i64 } {
     var ft: std.os.windows.FILETIME = undefined;
     winapi.GetSystemTimeAsFileTime(&ft);
@@ -1004,16 +1007,135 @@ fn currentWindowsUnixTime() struct { sec: i64, usec: i64, nsec: i64 } {
     };
 }
 
-export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_int {
+fn cTimevalIsValid(tv: c.timeval) bool {
+    return tv.tv_sec >= 0 and tv.tv_usec >= 0 and tv.tv_usec < std.time.us_per_s;
+}
+
+fn cTimevalToNs(tv: c.timeval) ?u64 {
+    if (!cTimevalIsValid(tv)) return null;
+    const sec_ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_sec)), std.time.ns_per_s) catch return null;
+    const usec_ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_usec)), std.time.ns_per_us) catch return null;
+    return std.math.add(u64, sec_ns, usec_ns) catch null;
+}
+
+fn nsToCTimeval(ns: u64) c.timeval {
+    return .{
+        .tv_sec = @as(@TypeOf(@as(c.timeval, undefined).tv_sec), @intCast(ns / std.time.ns_per_s)),
+        .tv_usec = @as(@TypeOf(@as(c.timeval, undefined).tv_usec), @intCast((ns % std.time.ns_per_s) / std.time.ns_per_us)),
+    };
+}
+
+fn cTimespecIsValid(ts: c.timespec) bool {
+    return ts.tv_sec >= 0 and ts.tv_nsec >= 0 and ts.tv_nsec < std.time.ns_per_s;
+}
+
+fn cTimespecToTimeval(ts: c.timespec) ?c.timeval {
+    if (!cTimespecIsValid(ts)) return null;
+    return .{
+        .tv_sec = @as(@TypeOf(@as(c.timeval, undefined).tv_sec), @intCast(ts.tv_sec)),
+        .tv_usec = @as(@TypeOf(@as(c.timeval, undefined).tv_usec), @intCast(@divFloor(ts.tv_nsec, std.time.ns_per_us))),
+    };
+}
+
+fn windowsMonotonicNs() u64 {
+    const now = std.time.Instant.now() catch return @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+    return now.since(now) + @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+}
+
+fn windowsTimevalToFileTime(tv: c.timeval) ?std.os.windows.FILETIME {
+    if (!cTimevalIsValid(tv)) return null;
+    const sec_100ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_sec)), 10_000_000) catch return null;
+    const usec_100ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_usec)), 10) catch return null;
+    const unix_100ns = std.math.add(u64, sec_100ns, usec_100ns) catch return null;
+    const file_100ns = std.math.add(u64, unix_100ns, 11644473600 * 10_000_000) catch return null;
+    return .{
+        .dwLowDateTime = @as(u32, @truncate(file_100ns)),
+        .dwHighDateTime = @as(u32, @truncate(file_100ns >> 32)),
+    };
+}
+
+const WindowsItimerState = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    thread_started: bool = false,
+    armed: bool = false,
+    deadline_ns: u64 = 0,
+    interval_ns: u64 = 0,
+};
+
+var windows_itimer: WindowsItimerState = .{};
+
+fn windowsCurrentItimerLocked() c.itimerval {
+    var value = std.mem.zeroes(c.itimerval);
+    if (!windows_itimer.armed) return value;
+    const now_ns = @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+    const remaining_ns = if (windows_itimer.deadline_ns > now_ns) windows_itimer.deadline_ns - now_ns else 0;
+    value.it_value = nsToCTimeval(remaining_ns);
+    value.it_interval = nsToCTimeval(windows_itimer.interval_ns);
+    return value;
+}
+
+fn windowsItimerThread() void {
+    windows_itimer.mutex.lock();
+    defer windows_itimer.mutex.unlock();
+
+    while (true) {
+        while (!windows_itimer.armed) {
+            windows_itimer.cond.wait(&windows_itimer.mutex);
+        }
+
+        const now_ns = @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+        if (windows_itimer.deadline_ns > now_ns) {
+            const wait_ns = windows_itimer.deadline_ns - now_ns;
+            windows_itimer.cond.timedWait(&windows_itimer.mutex, wait_ns) catch {};
+            continue;
+        }
+
+        const interval_ns = windows_itimer.interval_ns;
+        if (interval_ns == 0) {
+            windows_itimer.armed = false;
+        } else {
+            windows_itimer.deadline_ns = now_ns + interval_ns;
+        }
+
+        windows_itimer.mutex.unlock();
+        _ = cstd.__zwindows_raise_signal(c.SIGALRM);
+        windows_itimer.mutex.lock();
+    }
+}
+
+fn ensureWindowsItimerThread() c_int {
+    windows_itimer.mutex.lock();
+    defer windows_itimer.mutex.unlock();
+    if (windows_itimer.thread_started) return 0;
+    const thread = std.Thread.spawn(.{}, windowsItimerThread, .{}) catch {
+        c.errno = c.ENOMEM;
+        return -1;
+    };
+    thread.detach();
+    windows_itimer.thread_started = true;
+    return 0;
+}
+
+fn timespecSec(ts: os.timespec) i64 {
+    if (@hasField(os.timespec, "tv_sec")) return @as(i64, @intCast(ts.tv_sec));
+    return @as(i64, @intCast(ts.sec));
+}
+
+fn timespecNsec(ts: os.timespec) i64 {
+    if (@hasField(os.timespec, "tv_nsec")) return @as(i64, @intCast(ts.tv_nsec));
+    return @as(i64, @intCast(ts.nsec));
+}
+
+fn _zclock_gettime(clk_id: c.clockid_t, parts: [*]c_longlong) callconv(.c) c_int {
     if (builtin.os.tag.isDarwin()) {
         if (clk_id == c.CLOCK_REALTIME) {
             var tv: c.timeval = undefined;
-            const rc = syscall(darwin_syscall.gettimeofday, &tv, @as(?*anyopaque, null));
-            if (rc == -1) {
-                c.errno = darwin.__error().*;
+            if (gettimeofday(&tv, @as(?*anyopaque, null)) != 0) {
                 return -1;
             }
-            setTimespec(tp, tv.tv_sec, tv.tv_usec * 1000);
+            parts[0] = @as(c_longlong, @intCast(tv.tv_sec));
+            parts[1] = @as(c_longlong, @intCast(tv.tv_usec * 1000));
             return 0;
         }
 
@@ -1029,7 +1151,8 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
                 @as(u128, ticks) * @as(u128, timebase.numer),
                 @as(u128, timebase.denom),
             );
-            setTimespec(tp, @divFloor(nanos, std.time.ns_per_s), @mod(nanos, std.time.ns_per_s));
+            parts[0] = @as(c_longlong, @intCast(@divFloor(nanos, std.time.ns_per_s)));
+            parts[1] = @as(c_longlong, @intCast(@mod(nanos, std.time.ns_per_s)));
             return 0;
         }
 
@@ -1040,16 +1163,22 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
             const now = currentWindowsUnixTime();
-            setTimespec(tp, now.sec, now.nsec);
+            parts[0] = @as(c_longlong, @intCast(now.sec));
+            parts[1] = @as(c_longlong, @intCast(now.nsec));
             return 0;
         }
         c.errno = c.EINVAL;
         return -1;
     }
 
+    var ts: os.timespec = undefined;
     const posix_clk_id: os.clockid_t = @enumFromInt(@as(u32, @intCast(clk_id)));
-    switch (os.errno(os.system.clock_gettime(posix_clk_id, tp))) {
-        .SUCCESS => return 0,
+    switch (os.errno(os.system.clock_gettime(posix_clk_id, &ts))) {
+        .SUCCESS => {
+            parts[0] = @as(c_longlong, @intCast(timespecSec(ts)));
+            parts[1] = @as(c_longlong, @intCast(timespecNsec(ts)));
+            return 0;
+        },
         else => |e| {
             c.errno = @intFromEnum(e);
             return -1;
@@ -1057,7 +1186,11 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *os.timespec) callconv(.c) c_in
     }
 }
 
-export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
+comptime {
+    exportInternalSymbol(&_zclock_gettime, "_zclock_gettime");
+}
+
+export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {
     trace.log("gettimeofday tv={*} tz={*}", .{ tv, tz });
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.gettimeofday, tv, tz);
@@ -1081,6 +1214,16 @@ export fn gettimeofday(tv: *c.timeval, tz: *anyopaque) callconv(.c) c_int {
 
 export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
     trace.log("getitimer which={}", .{which});
+    if (builtin.os.tag == .windows) {
+        if (which != c.ITIMER_REAL) {
+            c.errno = c.EINVAL;
+            return -1;
+        }
+        windows_itimer.mutex.lock();
+        value.* = windowsCurrentItimerLocked();
+        windows_itimer.mutex.unlock();
+        return 0;
+    }
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.getitimer, which, value);
         if (rc == -1) {
@@ -1109,6 +1252,37 @@ export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
 
 export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
     trace.log("setitimer which={}", .{which});
+    if (builtin.os.tag == .windows) {
+        if (which != c.ITIMER_REAL) {
+            c.errno = c.EINVAL;
+            return -1;
+        }
+        const value_ns = cTimevalToNs(value.it_value) orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const interval_ns = cTimevalToNs(value.it_interval) orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        if (value_ns != 0 and ensureWindowsItimerThread() != 0) return -1;
+
+        windows_itimer.mutex.lock();
+        avalue.* = windowsCurrentItimerLocked();
+        if (value_ns == 0) {
+            windows_itimer.armed = false;
+            windows_itimer.deadline_ns = 0;
+            windows_itimer.interval_ns = 0;
+        } else {
+            const now_ns = @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+            windows_itimer.armed = true;
+            windows_itimer.deadline_ns = now_ns + value_ns;
+            windows_itimer.interval_ns = interval_ns;
+        }
+        windows_itimer.cond.broadcast();
+        windows_itimer.mutex.unlock();
+        return 0;
+    }
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.setitimer, which, value, avalue);
         if (rc == -1) {
@@ -1285,6 +1459,13 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 // --------------------------------------------------------------------------------
 // sys/stat.h
 // --------------------------------------------------------------------------------
+export fn stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int {
+    const fd = zopenRaw(path, c.O_RDONLY, 0);
+    if (fd < 0) return -1;
+    defer _ = close(fd);
+    return fstat(fd, buf);
+}
+
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
     if (builtin.os.tag.isDarwin()) {
@@ -1366,7 +1547,6 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
         const readonly = (info.dwFileAttributes & std.os.windows.FILE_ATTRIBUTE_READONLY) != 0;
         const size: u64 = (@as(u64, info.nFileSizeHigh) << 32) | @as(u64, info.nFileSizeLow);
         const inode: u64 = (@as(u64, info.nFileIndexHigh) << 32) | @as(u64, info.nFileIndexLow);
-        const now = currentWindowsUnixTime();
 
         buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(info.dwVolumeSerialNumber));
         buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(inode));
@@ -1374,9 +1554,9 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
         buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(mode_bits));
         buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(if (info.nNumberOfLinks == 0) 1 else info.nNumberOfLinks));
         buf.st_size = @as(@TypeOf(buf.st_size), @intCast(size));
-        buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(now.sec));
-        buf.st_mtime = buf.st_atime;
-        buf.st_ctime = buf.st_atime;
+        buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(windowsFileTimeToUnixSec(info.ftLastAccessTime)));
+        buf.st_mtime = @as(@TypeOf(buf.st_mtime), @intCast(windowsFileTimeToUnixSec(info.ftLastWriteTime)));
+        buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(windowsFileTimeToUnixSec(info.ftCreationTime)));
         return 0;
     }
     var stat_buf: os.Stat = undefined;
@@ -1770,6 +1950,144 @@ export fn select(
             // No timeout and no fds would block forever; keep behavior explicit.
             c.errno = errnoConst("ENOSYS", c.EINVAL);
             return -1;
+        }
+    }
+    c.errno = errnoConst("ENOSYS", c.EINVAL);
+    return -1;
+}
+
+export fn pselect(
+    nfds: c_int,
+    readfds: ?*c.fd_set,
+    writefds: ?*c.fd_set,
+    errorfds: ?*c.fd_set,
+    timeout: ?*const c.timespec,
+    sigmask: ?*const c.sigset_t,
+) c_int {
+    if (nfds < 0) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
+    if (builtin.os.tag.isDarwin()) {
+        var darwin_timeout: c.timeval = undefined;
+        const darwin_timeout_ptr: ?*c.timeval = if (timeout) |ts| blk: {
+            darwin_timeout = cTimespecToTimeval(ts.*) orelse {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            break :blk &darwin_timeout;
+        } else null;
+        return select(nfds, readfds, writefds, errorfds, darwin_timeout_ptr);
+    }
+    if (builtin.os.tag == .linux) {
+        const LinuxPselectSigmask = extern struct {
+            sigmask: *const c.sigset_t,
+            sigsetsize: usize,
+        };
+        var sigdata = LinuxPselectSigmask{ .sigmask = undefined, .sigsetsize = @sizeOf(c.sigset_t) };
+        const sigdata_ptr: usize = if (sigmask) |mask| blk: {
+            sigdata.sigmask = mask;
+            break :blk @intFromPtr(&sigdata);
+        } else 0;
+        const rc = std.os.linux.syscall6(
+            .pselect6,
+            @as(usize, @bitCast(@as(isize, nfds))),
+            @intFromPtr(readfds),
+            @intFromPtr(writefds),
+            @intFromPtr(errorfds),
+            @intFromPtr(timeout),
+            sigdata_ptr,
+        );
+        switch (os.errno(rc)) {
+            .SUCCESS => return @as(c_int, @intCast(rc)),
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+
+    var select_timeout: c.timeval = undefined;
+    const select_timeout_ptr: ?*c.timeval = if (timeout) |ts| blk: {
+        select_timeout = cTimespecToTimeval(ts.*) orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        break :blk &select_timeout;
+    } else null;
+    return select(nfds, readfds, writefds, errorfds, select_timeout_ptr);
+}
+
+export fn utimes(filename: [*:0]const u8, times: [*c]const c.timeval) callconv(.c) c_int {
+    if (times) |tv| {
+        if (!cTimevalIsValid(tv[0]) or !cTimevalIsValid(tv[1])) {
+            c.errno = c.EINVAL;
+            return -1;
+        }
+    }
+    if (builtin.os.tag == .windows) {
+        const handle = winapi.CreateFileA(
+            filename,
+            std.os.windows.FILE_WRITE_ATTRIBUTES,
+            std.os.windows.FILE_SHARE_READ | std.os.windows.FILE_SHARE_WRITE | std.os.windows.FILE_SHARE_DELETE,
+            null,
+            std.os.windows.OPEN_EXISTING,
+            std.os.windows.FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
+        }
+        defer _ = winapi.CloseHandle(handle.?);
+
+        var access_time: std.os.windows.FILETIME = undefined;
+        var write_time: std.os.windows.FILETIME = undefined;
+        var current_time: std.os.windows.FILETIME = undefined;
+        const access_ptr, const write_ptr = if (times) |tv| blk: {
+            access_time = windowsTimevalToFileTime(tv[0]) orelse {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            write_time = windowsTimevalToFileTime(tv[1]) orelse {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            break :blk .{ &access_time, &write_time };
+        } else blk: {
+            winapi.GetSystemTimeAsFileTime(&current_time);
+            break :blk .{ &current_time, &current_time };
+        };
+
+        std.os.windows.SetFileTime(handle.?, null, access_ptr, write_ptr) catch {
+            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            return -1;
+        };
+        return 0;
+    }
+    if (builtin.os.tag.isDarwin()) {
+        const fd = zopenRaw(filename, c.O_RDONLY, 0);
+        if (fd < 0) return -1;
+        defer _ = close(fd);
+        const rc = syscall(darwin_syscall.futimes, fd, times);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.syscall2(
+            .utimes,
+            @intFromPtr(filename),
+            @intFromPtr(times),
+        );
+        switch (os.errno(rc)) {
+            .SUCCESS => return 0,
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
         }
     }
     c.errno = errnoConst("ENOSYS", c.EINVAL);

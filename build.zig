@@ -157,8 +157,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     b.step("libc-full-shared", "").dependOn(&installArtifact(b, libc_full_shared).step);
-    // TODO: create a specs file?
-    //       you can add -specs=file to the gcc command line to override values in the spec
+    // GCC specs generation is not wired into the build yet.
+    // You can still pass `-specs=file` manually to override GCC defaults.
 
     const libc_only_std_static = libcbuild.addLibc(b, .{
         .variant = .only_std,
@@ -236,6 +236,14 @@ pub fn build(b: *std.Build) void {
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
+    const header_conformance_run = blk: {
+        const exe = addTest("header_conformance", b, target, optimize, libc_only_std_static, zig_start);
+        addPosix(exe, libc_only_posix);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+        break :blk run_step;
+    };
     {
         const exe = addTest("signal_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
@@ -346,7 +354,7 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    {
+    const parity_run = blk: {
         const system_exe = addSystemParityProbe(b, target, optimize);
         const zig_exe = addZigParityProbe(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
         const run_step = addRunArtifactCompat(b, parity_env_exe);
@@ -354,7 +362,8 @@ pub fn build(b: *std.Build) void {
         addArtifactArgCompat(run_step, b, zig_exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
-    }
+        break :blk run_step;
+    };
 
     if (supportsSetjmp(target.result)) {
         const exe = addTest("jmp", b, target, optimize, libc_only_std_static, zig_start);
@@ -406,6 +415,8 @@ pub fn build(b: *std.Build) void {
         conformance_step.dependOn(posix_test_suite_step);
         conformance_step.dependOn(austin_group_tests_step);
     }
+    conformance_step.dependOn(&header_conformance_run.step);
+    conformance_step.dependOn(&parity_run.step);
     _ = addLua(b, target, optimize, libc_only_std_static, libc_only_posix, zig_start);
     _ = addCmph(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
     _ = addYacc(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
@@ -474,7 +485,7 @@ fn addTest(
     exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
@@ -486,6 +497,9 @@ const ParityFeatures = struct {
     sigaction: bool,
     setitimer: bool,
     select: bool,
+    strsignal: bool,
+    pselect: bool,
+    utimes: bool,
 };
 
 fn parityFeaturesFor(target: std.Target) ParityFeatures {
@@ -493,6 +507,9 @@ fn parityFeaturesFor(target: std.Target) ParityFeatures {
         .sigaction = target.os.tag != .windows and target.os.tag != .wasi,
         .setitimer = target.os.tag == .linux or target.os.tag.isDarwin(),
         .select = target.os.tag == .linux or target.os.tag.isDarwin(),
+        .strsignal = target.os.tag == .linux or target.os.tag.isDarwin(),
+        .pselect = target.os.tag == .linux or target.os.tag.isDarwin(),
+        .utimes = target.os.tag == .linux or target.os.tag.isDarwin(),
     };
 }
 
@@ -512,6 +529,9 @@ fn addParityProbeCommon(
         b.fmt("-DLIBC_PARITY_HAVE_SIGACTION={d}", .{@intFromBool(parity.sigaction)}),
         b.fmt("-DLIBC_PARITY_HAVE_SETITIMER={d}", .{@intFromBool(parity.setitimer)}),
         b.fmt("-DLIBC_PARITY_HAVE_SELECT={d}", .{@intFromBool(parity.select)}),
+        b.fmt("-DLIBC_PARITY_HAVE_STRSIGNAL={d}", .{@intFromBool(parity.strsignal)}),
+        b.fmt("-DLIBC_PARITY_HAVE_PSELECT={d}", .{@intFromBool(parity.pselect)}),
+        b.fmt("-DLIBC_PARITY_HAVE_UTIMES={d}", .{@intFromBool(parity.utimes)}),
     };
     addCSourceFilesCompat(exe, &.{"test" ++ std.fs.path.sep_str ++ "libc_parity.c"}, flags[0..]);
     if (target.result.os.tag == .windows) {
@@ -716,7 +736,7 @@ fn addLibcTest(
         exe.linkLibrary(libc_only_std_static);
         exe.linkLibrary(zig_start);
         exe.linkLibrary(libc_only_posix);
-        // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+        // These static artifacts do not currently propagate system-library dependencies.
         if (target.result.os.tag == .windows) {
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
@@ -761,7 +781,7 @@ fn addTinyRegexCTests(
         exe.linkLibrary(libc_only_std_static);
         exe.linkLibrary(zig_start);
         exe.linkLibrary(zig_posix);
-        // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+        // These static artifacts do not currently propagate system-library dependencies.
         if (target.result.os.tag == .windows) {
             exe.linkSystemLibrary("ntdll");
             exe.linkSystemLibrary("kernel32");
@@ -823,7 +843,7 @@ fn addLua(
     lua_exe.linkLibrary(libc_only_std_static);
     lua_exe.linkLibrary(libc_only_posix);
     lua_exe.linkLibrary(zig_start);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
         lua_exe.addIncludePath(lazyPath(b, "inc/win32"));
         lua_exe.linkSystemLibrary("ntdll");
@@ -895,7 +915,7 @@ fn addCmph(
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
@@ -970,7 +990,7 @@ fn addYacc(
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
@@ -1025,7 +1045,7 @@ fn addYabfc(
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     exe.linkLibrary(zig_gnu);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");
@@ -1080,7 +1100,7 @@ fn addSecretGame(
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     exe.linkLibrary(zig_gnu);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");

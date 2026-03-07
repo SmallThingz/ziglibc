@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+var temp_counter: usize = 0;
 
 fn windowsPathAlloc(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
     const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
@@ -65,14 +66,30 @@ pub fn main() !u8 {
         };
     }
 
-    // TODO: improve this
-    const dirname = try std.fmt.allocPrint(
-        arena.allocator(),
-        "{s}-{x}.test.tmp",
-        .{ std.fs.path.basename(args[0]), @as(u64, @intCast(std.time.nanoTimestamp())) },
-    );
-    std.fs.cwd().deleteTree(dirname) catch {};
-    try std.fs.cwd().makeDir(dirname);
+    const dirname = blk: {
+        const base = std.fs.path.basename(args[0]);
+        var attempt: usize = 0;
+        while (attempt < 64) : (attempt += 1) {
+            const id = @atomicRmw(usize, &temp_counter, .Add, 1, .seq_cst);
+            const candidate = try std.fmt.allocPrint(
+                arena.allocator(),
+                "{s}-{d}-{x}-{x}.test.tmp",
+                .{
+                    base,
+                    attempt,
+                    @as(u64, @intCast(std.time.nanoTimestamp())),
+                    id,
+                },
+            );
+            std.fs.cwd().makeDir(candidate) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            break :blk candidate;
+        }
+        return error.PathAlreadyExists;
+    };
+    defer std.fs.cwd().deleteTree(dirname) catch {};
     var child = std.process.Child.init(child_args, arena.allocator());
     child.cwd = if (builtin.os.tag == .windows) blk: {
         const cwd = try std.process.getCwdAlloc(arena.allocator());
@@ -100,6 +117,5 @@ pub fn main() !u8 {
             return 0xff;
         },
     }
-    std.fs.cwd().deleteTree(dirname) catch {};
     return 0;
 }

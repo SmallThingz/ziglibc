@@ -1,15 +1,25 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "expect.h"
+
+static volatile sig_atomic_t timer_hits;
+
+static void alarm_handler(int sig)
+{
+  (void)sig;
+  timer_hits++;
+}
 
 int main(int argc, char *argv[])
 {
@@ -153,7 +163,7 @@ int main(int argc, char *argv[])
   }
 #endif
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   {
     struct itimerval val;
     struct itimerval old;
@@ -172,6 +182,43 @@ int main(int argc, char *argv[])
     expect(EINVAL == errno);
   }
 
+#if defined(__linux__) || defined(_WIN32)
+  {
+    struct itimerval val;
+    struct itimerval old;
+    struct itimerval cur;
+    struct itimerval zero;
+    int i;
+
+    timer_hits = 0;
+    expect(signal(SIGALRM, alarm_handler) != SIG_ERR);
+
+    memset(&val, 0, sizeof(val));
+    memset(&old, 0, sizeof(old));
+    memset(&cur, 0, sizeof(cur));
+    memset(&zero, 0, sizeof(zero));
+    val.it_value.tv_sec = 0;
+    val.it_value.tv_usec = 50000;
+
+    expect(0 == setitimer(ITIMER_REAL, &val, &old));
+    expect(0 == getitimer(ITIMER_REAL, &cur));
+    expect(cur.it_value.tv_sec >= 0);
+    expect(cur.it_value.tv_usec >= 0);
+
+    for (i = 0; i < 50 && timer_hits == 0; ++i) {
+      struct timeval wait_tv;
+      int rc;
+      wait_tv.tv_sec = 0;
+      wait_tv.tv_usec = 10000;
+      rc = select(0, NULL, NULL, NULL, &wait_tv);
+      expect(rc == 0 || (rc == -1 && errno == EINTR));
+    }
+
+    expect(timer_hits >= 1);
+    expect(0 == setitimer(ITIMER_REAL, &zero, &old));
+  }
+#endif
+
   {
     struct timeval tv;
     tv.tv_sec = 0;
@@ -186,6 +233,47 @@ int main(int argc, char *argv[])
     errno = 0;
     expect(-1 == select(-1, NULL, NULL, NULL, &tv));
     expect(EINVAL == errno);
+  }
+
+  {
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    expect(0 == pselect(0, NULL, NULL, NULL, &ts, NULL));
+  }
+
+  {
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    errno = 0;
+    expect(-1 == pselect(-1, NULL, NULL, NULL, &ts, NULL));
+    expect(EINVAL == errno);
+  }
+#endif
+
+#if !defined(__APPLE__)
+  {
+    const char *name = "posix-utimes.tmp";
+    struct timeval times[2];
+    struct stat st;
+    FILE *f = fopen(name, "w");
+    expect(f != NULL);
+    expect(0 == fclose(f));
+
+    times[0].tv_sec = 946684800;
+    times[0].tv_usec = 123456;
+    times[1].tv_sec = 946684801;
+    times[1].tv_usec = 654321;
+    expect(0 == utimes(name, times));
+    expect(0 == stat(name, &st));
+    expect(st.st_mtime == times[1].tv_sec);
+
+    times[0].tv_usec = 1000000;
+    errno = 0;
+    expect(-1 == utimes(name, times));
+    expect(EINVAL == errno);
+    expect(0 == unlink(name));
   }
 #endif
 

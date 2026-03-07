@@ -38,11 +38,10 @@ export fn __libc_start_main(
     _ = rtld_fini;
     _ = stack_end;
     std.log.warn("__libc_start_main is probably not doing everything it needs too", .{});
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    // TODO: pass envp
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    var env_count: usize = 0;
+    while (argv[@as(usize, @intCast(argc)) + 1 + env_count] != null) : (env_count += 1) {}
+    std.os.argv = @as([*][*:0]u8, @ptrCast(argv))[0..@as(usize, @intCast(argc))];
+    std.os.environ = @as([*][*:0]u8, @ptrCast(argv + @as(usize, @intCast(argc)) + 1))[0..env_count];
     var result = c.main(argc, argv);
     if (result != 0) {
         while ((result & 0xff == 0)) result = result >> 8;

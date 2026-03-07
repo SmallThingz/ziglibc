@@ -3,12 +3,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #if LIBC_PARITY_HAVE_SETITIMER
 #include <sys/time.h>
 #endif
 
 #if LIBC_PARITY_HAVE_SELECT
+#include <sys/select.h>
+#endif
+
+#if LIBC_PARITY_HAVE_PSELECT
 #include <sys/select.h>
 #endif
 
@@ -44,6 +50,7 @@ int main(void)
   printf("system-null:%d|", system(NULL));
 
   printf("system-exit7:%d|", system(CMD_EXIT7));
+  printf("getenv-path:%s|", getenv("PATH") ? getenv("PATH") : "null");
 
   {
     FILE *p = parity_popen(CMD_PRINTF, "r");
@@ -107,6 +114,31 @@ int main(void)
     printf("signal-basic:%d:%d|", old_handler != SIG_ERR, prev_handler == parity_handler);
   }
 
+  {
+    const char *s = "abc";
+    char *endptr = NULL;
+    errno = 123;
+    printf("strtol-nodigits:%ld:%d:%ld|", strtol(s, &endptr, 10), errno, (long)(endptr - s));
+  }
+
+  {
+    const char *s = "abc";
+    char *endptr = NULL;
+    double value;
+    errno = 123;
+    value = strtod(s, &endptr);
+    printf("strtod-nodigits:%d:%d:%ld|", value == 0.0, errno, (long)(endptr - s));
+  }
+
+#if LIBC_PARITY_HAVE_STRSIGNAL
+  {
+    const char *name = strsignal(SIGINT);
+    printf("strsignal-int:%s|", name ? name : "null");
+  }
+#else
+  printf("strsignal-int:skip|");
+#endif
+
 #if LIBC_PARITY_HAVE_SIGACTION
   {
     struct sigaction act;
@@ -152,6 +184,46 @@ int main(void)
   }
 #else
   printf("select-timeout:skip");
+#endif
+
+#if LIBC_PARITY_HAVE_PSELECT
+  {
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    errno = 0;
+    printf("pselect-timeout:%d:%d|", pselect(0, NULL, NULL, NULL, &ts, NULL), errno);
+  }
+#else
+  printf("pselect-timeout:skip|");
+#endif
+
+#if LIBC_PARITY_HAVE_UTIMES
+  {
+    const char *path = "libc-parity-utimes.tmp";
+    struct timeval tv[2];
+    struct stat st;
+    FILE *f = fopen(path, "w");
+    tv[0].tv_sec = 946684800;
+    tv[0].tv_usec = 0;
+    tv[1].tv_sec = 946684801;
+    tv[1].tv_usec = 0;
+    if (f != NULL) {
+      fclose(f);
+      errno = 0;
+      printf("utimes-basic:%d:%d:", utimes(path, tv), errno);
+      if (stat(path, &st) == 0) {
+        printf("%ld|", (long)st.st_mtime);
+      } else {
+        printf("stat-failed|");
+      }
+      unlink(path);
+    } else {
+      printf("utimes-basic:open-failed|");
+    }
+  }
+#else
+  printf("utimes-basic:skip|");
 #endif
 
   return 0;

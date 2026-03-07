@@ -1,9 +1,7 @@
 #ifndef _PATHS_H_
 #define _PATHS_H_
 
-// TODO: what standard is this defined in?
-//       It's used by yacc, and I see a definition from oracle here:
-//       https://docs.oracle.com/cd/E86824_01/html/E54772/paths.h-3head.html
+/* BSD/POSIX path constants used by several imported packages. */
 #define _PATH_DEFPATH "/usr/local/bin:/bin:/usr/bin"
 #define _PATH_STDPATH "/bin:/usr/bin:/sbin:/usr/sbin"
 

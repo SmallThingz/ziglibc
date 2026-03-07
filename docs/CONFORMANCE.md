@@ -41,3 +41,16 @@ zig build conformance
 zig build conformance -Dtarget=x86_64-macos
 zig build conformance -Dtarget=x86_64-windows-gnu
 ```
+
+## Parity Coverage
+
+The normal `zig build test` step also runs an in-repo parity probe that compares ziglibc against the host platform libc for supported APIs on the selected target. The current parity probe covers:
+
+- `system`, `popen`, `pclose`
+- `signal`, `sigaction`, `strsignal`
+- `strtol` and `strtod` no-digit edge cases
+- `setitimer`
+- `select` and `pselect`
+- `utimes`
+
+Some probes remain target-gated because the corresponding API is not exposed uniformly by every system libc, especially on Windows.

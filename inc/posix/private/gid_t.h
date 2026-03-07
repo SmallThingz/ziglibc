@@ -1,6 +1,6 @@
 #ifndef _PRIVATE_GID_T_H
 #define _PRIVATE_GID_T_H
 
-typedef int gid_t; // TODO: look into this type more
+typedef unsigned int gid_t;
 
 #endif /* _PRIVATE_GID_T_H */

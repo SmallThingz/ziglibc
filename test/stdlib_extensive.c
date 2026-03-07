@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,13 +45,25 @@ int main(int argc, char *argv[])
     expect(NULL == getenv(""));
     expect(NULL == getenv("A=B"));
     expect(NULL == getenv("__ZIGLIBC_MISSING_VAR__"));
-#ifdef __linux__
+#ifdef _WIN32
+    expect(path != NULL);
+#elif defined(__linux__) || defined(__APPLE__)
     expect(path != NULL || home != NULL || pwd != NULL);
 #else
     (void)path;
     (void)home;
     (void)pwd;
 #endif
+  }
+
+  {
+    int i;
+    srand(1234);
+    for (i = 0; i < 1024; ++i) {
+      int value = rand();
+      expect(value >= 0);
+      expect(value <= RAND_MAX);
+    }
   }
 
   {

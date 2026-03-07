@@ -12,7 +12,7 @@ typedef int sig_atomic_t;
 void (*signal(int sig, void (*func)(int)))(int);
 
 
-/* TODO: these are posix definitions for the signal.h libc header */
+/* POSIX signal extensions exposed from the libc-facing header. */
 #if 1
     #include "private/restrict.h"
     #include "../posix/private/sigset_t.h"

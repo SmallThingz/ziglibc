@@ -6,7 +6,7 @@ int ioctl(int filedes, int request, ...);
 // NOTE: this stuff is defined by linux, not posix, but they need
 //       to live in this header
 #if 1
-    // TODO: will change depending on platform
+    /* Linux/Darwin-compatible nonblocking ioctl request used by current callers. */
     #define FIONBIO 0x5421
 #endif
 

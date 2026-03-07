@@ -23,7 +23,9 @@ struct argp_option {
 #define ARGP_KEY_ARGS 0x1000006
 #define ARGP_KEY_NO_ARGS 0x1000002
 
-#define ARGP_ERR_UNKNOWN 999 /* TODO: what to put here? */
+#include "../libc/errno.h"
+
+#define ARGP_ERR_UNKNOWN E2BIG
 
 struct argp_state {
     int argc;

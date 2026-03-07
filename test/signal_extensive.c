@@ -70,6 +70,13 @@ int main(int argc, char *argv[])
     expect(restore.sa_handler == test_handler);
   }
 #endif
+#if defined(__linux__) || defined(__APPLE__)
+  {
+    const char *s = strsignal(SIGINT);
+    expect(s != NULL);
+    expect(s[0] != 0);
+  }
+#endif
 
   puts("Success!");
   return 0;

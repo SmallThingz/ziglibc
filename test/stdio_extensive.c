@@ -66,6 +66,20 @@ int main(int argc, char *argv[])
   }
 
   {
+    FILE *odd = fopen("stdio-odd.txt", "w+");
+    char pair[4];
+    expect(odd != NULL);
+    expect(3 == fwrite("abc", 1, 3, odd));
+    expect(0 == fseek(odd, 0, SEEK_SET));
+    expect(1 == fread(pair, 2, 2, odd));
+    expect(pair[0] == 'a');
+    expect(pair[1] == 'b');
+    expect(1 == fread(pair, 1, 1, odd));
+    expect(pair[0] == 'c');
+    expect(0 == fclose(odd));
+  }
+
+  {
     char tmp_name[L_tmpnam];
     expect(tmpnam(tmp_name) == tmp_name);
     expect(tmp_name[0] != 0);

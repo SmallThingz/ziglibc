@@ -1,6 +1,6 @@
 #ifndef _PRIVATE_DEV_T_H
 #define _PRIVATE_DEV_T_H
 
-typedef int dev_t; // TODO: look into this type more
+typedef unsigned long long dev_t;
 
 #endif /* _PRIVATE_DEV_T_H */

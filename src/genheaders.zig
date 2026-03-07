@@ -162,7 +162,7 @@ const Parser = struct {
             .definitions = std.ArrayListUnmanaged(*Definition){},
         };
     }
-    // TODO: deini?
+    // Parser ownership is short-lived today, so explicit deinit is not wired yet.
 
     fn genHeaders(self: *Parser) !void {
         var started: ?struct { ptr: [*]const u8, line_number: u32 } = null;
@@ -171,7 +171,7 @@ const Parser = struct {
 
         while (line_it.next()) |line_untrimmed| {
             line_number += 1;
-            // TODO: assert that line has no '\r\n'?
+            // Input is normalized to `\n`; trimming keeps stray spaces harmless.
             const line = std.mem.trim(u8, line_untrimmed, " ");
             //std.log.info("line {d} '{s}'", .{line_number, line});
 

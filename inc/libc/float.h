@@ -3,40 +3,38 @@
 
 #include "private/limits_and_float_shared.h"
 
-// TODO: I pulled these values from the C Standard, I need to look into them to see what
-//       the values should actually be
-#define DBL_DIG           10
-#define DBL_EPSILON       1E-9
-#define DBL_MANT_DIG      53
-#define DBL_MAX           1E+37
-#define DBL_MAX_10_EXP    37
-#define DBL_MAX_EXP       TODO_DEFINE_DBL_MAX_EXP
-#define DBL_MIN           1E-37
-#define DBL_MIN_10_EXP    -37
-#define DBL_MIN_EXP       TODO_DEFINE_DBL_MIN_EXP
-#define FLT_DIG           6
-#define FLT_EPSILON       1E-5
-#define FLT_MANT_DIG      TODO_DEFINE_FLT_MANT_DIG
-#define FLT_MAX           1E+37
-#define FLT_MAX_10_EXP    37
-#define FLT_MAX_EXP       TODO_DEFINE_FLT_MAX_EXP
-#define FLT_MIN           1E-37
-#define FLT_MIN_10_EXP    -37
-#define FLT_MIN_EXP       TODO_DEFINE_FLT_MIN_EXP
-#define FLT_RADIX         2
-#define FLT_ROUNDS        TODO_DEFINE_FLT_ROUNDS
-#define LDBL_DIG          10
-#define LDBL_EPSILON      1E-9
-#define LDBL_MANT_DIG     TODO_DEFINE_LDBL_MANT_DIG
-#define LDBL_MAX          1E+37
-#define LDBL_MAX_10_EXP   37
-#define LDBL_MAX_EXP      TODO_DEFINE_LDBL_MAX_EXP
-#define LDBL_MIN          1E-37
-#define LDBL_MIN_10_EXP   -37
-#define LDBL_MIN_EXP      TODO_DEFINE_LDBL_MIN_EXP
+#define DBL_DIG           __DBL_DIG__
+#define DBL_EPSILON       __DBL_EPSILON__
+#define DBL_MANT_DIG      __DBL_MANT_DIG__
+#define DBL_MAX           __DBL_MAX__
+#define DBL_MAX_10_EXP    __DBL_MAX_10_EXP__
+#define DBL_MAX_EXP       __DBL_MAX_EXP__
+#define DBL_MIN           __DBL_MIN__
+#define DBL_MIN_10_EXP    __DBL_MIN_10_EXP__
+#define DBL_MIN_EXP       __DBL_MIN_EXP__
+#define FLT_DIG           __FLT_DIG__
+#define FLT_EPSILON       __FLT_EPSILON__
+#define FLT_MANT_DIG      __FLT_MANT_DIG__
+#define FLT_MAX           __FLT_MAX__
+#define FLT_MAX_10_EXP    __FLT_MAX_10_EXP__
+#define FLT_MAX_EXP       __FLT_MAX_EXP__
+#define FLT_MIN           __FLT_MIN__
+#define FLT_MIN_10_EXP    __FLT_MIN_10_EXP__
+#define FLT_MIN_EXP       __FLT_MIN_EXP__
+#define FLT_RADIX         __FLT_RADIX__
+#define FLT_ROUNDS        1
+#define LDBL_DIG          __LDBL_DIG__
+#define LDBL_EPSILON      __LDBL_EPSILON__
+#define LDBL_MANT_DIG     __LDBL_MANT_DIG__
+#define LDBL_MAX          __LDBL_MAX__
+#define LDBL_MAX_10_EXP   __LDBL_MAX_10_EXP__
+#define LDBL_MAX_EXP      __LDBL_MAX_EXP__
+#define LDBL_MIN          __LDBL_MIN__
+#define LDBL_MIN_10_EXP   __LDBL_MIN_10_EXP__
+#define LDBL_MIN_EXP      __LDBL_MIN_EXP__
 
 #if __STDC_VERSION__ >= 199901L
-    #define FLT_EVAL_METHOD TODO_DEFINE_FLT_EVAL_METHOD
+    #define FLT_EVAL_METHOD __FLT_EVAL_METHOD__
 #endif
 
 #endif /* _FLOAT_H */

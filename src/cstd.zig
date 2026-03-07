@@ -24,11 +24,17 @@ const trace = @import("trace.zig");
 extern "c" fn __error() *c_int;
 extern "c" fn syscall(number: c_long, ...) c_long;
 extern "c" fn @"open$NOCANCEL"(path: [*:0]const u8, oflag: c_int, ...) c_int;
+extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 
 const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const unlink: c_long = 10;
     const rename: c_long = 128;
 } else struct {};
+
+const windows_signal_siginfo_bit: c_int = if (@hasDecl(c, "SA_SIGINFO"))
+    @as(c_int, @bitCast(@as(c_uint, @intCast(c.SA_SIGINFO))))
+else
+    0;
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
     if (@hasDecl(c, name)) return @field(c, name);
@@ -114,7 +120,7 @@ fn __main() callconv(.c) void {
     stdout.fd = std.os.windows.peb().ProcessParameters.hStdOutput;
     stderr.fd = std.os.windows.peb().ProcessParameters.hStdError;
 
-    // TODO: call constructors
+    // This startup path does not currently run C/C++ static constructors.
 }
 comptime {
     if (builtin.os.tag == .windows) @export(&__main, .{ .name = "__main" });
@@ -149,6 +155,11 @@ const windows = struct {
     ) callconv(.winapi) ?HANDLE;
     pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
+    pub extern "kernel32" fn GetEnvironmentVariableA(
+        lpName: [*:0]const u8,
+        lpBuffer: ?[*]u8,
+        nSize: u32,
+    ) callconv(.winapi) u32;
 };
 
 const windows_signal_count = 32;
@@ -184,11 +195,44 @@ fn __zwindows_sigaction(
     return 0;
 }
 
+fn __zwindows_raise_signal(sig: c_int) callconv(.c) c_int {
+    if (builtin.os.tag != .windows) {
+        errno = errnoConst("ENOSYS", c.EINVAL);
+        return -1;
+    }
+
+    const index = windowsSignalIndex(sig) orelse {
+        errno = c.EINVAL;
+        return -1;
+    };
+
+    var action: c.struct_sigaction = undefined;
+    windows_signal_mutex.lock();
+    action = windows_sigactions[index];
+    windows_signal_mutex.unlock();
+
+    if ((action.sa_flags & windows_signal_siginfo_bit) != 0) {
+        if (action.sa_sigaction) |handler| {
+            if (@intFromPtr(handler) == 1) return 0;
+            handler(sig, null, null);
+        }
+        return 0;
+    }
+
+    if (action.sa_handler) |handler| {
+        if (@intFromPtr(handler) == 1) return 0;
+        handler(sig);
+    }
+    return 0;
+}
+
 comptime {
     if (builtin.target.ofmt == .coff) {
         @export(&__zwindows_sigaction, .{ .name = "__zwindows_sigaction" });
+        @export(&__zwindows_raise_signal, .{ .name = "__zwindows_raise_signal" });
     } else {
         @export(&__zwindows_sigaction, .{ .name = "__zwindows_sigaction", .visibility = .hidden });
+        @export(&__zwindows_raise_signal, .{ .name = "__zwindows_raise_signal", .visibility = .hidden });
     }
 }
 
@@ -244,14 +288,21 @@ export fn abort() callconv(.c) noreturn {
     std.posix.abort();
 }
 
-// TODO: can name be null?
-// TODO: should we detect and do something different if there is a '=' in name?
 export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     trace.log("getenv {f}", .{trace.fmtStr(name)});
     const key = std.mem.span(name);
     if (key.len == 0) return null;
     if (std.mem.indexOfScalar(u8, key, '=') != null) return null;
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    if (builtin.os.tag == .wasi) return null;
+
+    if (builtin.os.tag == .windows) {
+        const required = windows.GetEnvironmentVariableA(name, null, 0);
+        if (required == 0 or required > global.getenv_tmp.len) return null;
+        const copied = windows.GetEnvironmentVariableA(name, &global.getenv_tmp, @intCast(global.getenv_tmp.len));
+        if (copied == 0 or copied >= global.getenv_tmp.len) return null;
+        global.getenv_tmp[copied] = 0;
+        return @as([*:0]u8, @ptrCast(&global.getenv_tmp));
+    }
 
     if (builtin.os.tag == .linux) {
         var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return null;
@@ -266,9 +317,9 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
             const line = src[begin..i];
             if (line.len > key.len and line[key.len] == '=' and std.mem.eql(u8, line[0..key.len], key)) {
                 const value = line[key.len + 1 ..];
-                const copy_len = @min(value.len, global.getenv_tmp.len - 1);
-                @memcpy(global.getenv_tmp[0..copy_len], value[0..copy_len]);
-                global.getenv_tmp[copy_len] = 0;
+                if (value.len >= global.getenv_tmp.len) return null;
+                @memcpy(global.getenv_tmp[0..value.len], value);
+                global.getenv_tmp[value.len] = 0;
                 return @as([*:0]u8, @ptrCast(&global.getenv_tmp));
             }
             i += 1;
@@ -276,7 +327,56 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
         return null;
     }
 
+    if (builtin.os.tag.isDarwin()) {
+        const envp = _NSGetEnviron().*;
+        var i: usize = 0;
+        while (envp[i]) |entry| : (i += 1) {
+            const line = std.mem.span(entry);
+            if (line.len > key.len and line[key.len] == '=' and std.mem.eql(u8, line[0..key.len], key)) {
+                const value = line[key.len + 1 ..];
+                if (value.len >= global.getenv_tmp.len) return null;
+                @memcpy(global.getenv_tmp[0..value.len], value);
+                global.getenv_tmp[value.len] = 0;
+                return @as([*:0]u8, @ptrCast(&global.getenv_tmp));
+            }
+        }
+    }
+
     return null;
+}
+
+fn signalName(sig: c_int) ?[]const u8 {
+    if (@hasDecl(c, "SIGINT") and sig == c.SIGINT) return "Interrupt";
+    if (@hasDecl(c, "SIGALRM") and sig == c.SIGALRM) return "Alarm clock";
+    if (@hasDecl(c, "SIGABRT") and sig == c.SIGABRT) return "Aborted";
+    if (@hasDecl(c, "SIGTERM") and sig == c.SIGTERM) return "Terminated";
+    if (@hasDecl(c, "SIGSEGV") and sig == c.SIGSEGV) return "Segmentation fault";
+    if (@hasDecl(c, "SIGILL") and sig == c.SIGILL) return "Illegal instruction";
+    if (@hasDecl(c, "SIGFPE") and sig == c.SIGFPE) return "Floating point exception";
+    return null;
+}
+
+export fn strsignal(sig: c_int) callconv(.c) [*:0]u8 {
+    if (signalName(sig)) |name| {
+        if (builtin.os.tag.isDarwin()) {
+            const out = std.fmt.bufPrint(&global.tmp_strerror_buffer, "{s}: {}", .{ name, sig }) catch {
+                global.tmp_strerror_buffer[0] = 0;
+                return @as([*:0]u8, @ptrCast(&global.tmp_strerror_buffer));
+            };
+            global.tmp_strerror_buffer[out.len] = 0;
+            return @as([*:0]u8, @ptrCast(&global.tmp_strerror_buffer));
+        }
+        @memcpy(global.tmp_strerror_buffer[0..name.len], name);
+        global.tmp_strerror_buffer[name.len] = 0;
+        return @as([*:0]u8, @ptrCast(&global.tmp_strerror_buffer));
+    }
+
+    const out = std.fmt.bufPrint(&global.tmp_strerror_buffer, "Unknown signal {}", .{sig}) catch {
+        global.tmp_strerror_buffer[0] = 0;
+        return @as([*:0]u8, @ptrCast(&global.tmp_strerror_buffer));
+    };
+    global.tmp_strerror_buffer[out.len] = 0;
+    return @as([*:0]u8, @ptrCast(&global.tmp_strerror_buffer));
 }
 
 fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
@@ -352,6 +452,8 @@ export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
             if (populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
                 _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
             }
+        } else if (builtin.os.tag.isDarwin()) {
+            _ = std.posix.system.execve(shell_path, &argv, @ptrCast(_NSGetEnviron().*));
         }
         const empty_envp = [_:null]?[*:0]const u8{null};
         _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&empty_envp));
@@ -379,7 +481,7 @@ export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
 /// since malloc is not type aware, it just aligns every allocation
 /// to accomodate the maximum possible alignment that could be needed.
 ///
-/// TODO: this should probably be in the zig std library somewhere.
+/// Shared malloc alignment requirement for this libc implementation.
 const alloc_align = 16;
 
 const alloc_metadata_len = std.mem.alignForward(usize, alloc_align, @sizeOf(usize));
@@ -463,7 +565,7 @@ export fn srand(seed: c_uint) callconv(.c) void {
 }
 
 export fn rand() callconv(.c) c_int {
-    return @as(c_int, @bitCast(@as(c_uint, @intCast(global.rand.random().int(std.math.IntFittingRange(0, c.RAND_MAX))))));
+    return global.rand.random().intRangeAtMostBiased(c_int, 0, c.RAND_MAX);
 }
 
 export fn abs(j: c_int) callconv(.c) c_int {
@@ -471,8 +573,8 @@ export fn abs(j: c_int) callconv(.c) c_int {
 }
 
 export fn atoi(nptr: [*:0]const u8) callconv(.c) c_int {
-    // TODO: atoi hase some behavior difference on error, get a test for
-    //       these differences
+    // `atoi` intentionally follows the shared `strto` parsing path and does not
+    // expose richer error reporting beyond the C return value contract.
     return strto(c_int, nptr, null, 10);
 }
 
@@ -485,8 +587,7 @@ export fn strlen(s: [*:0]const u8) callconv(.c) usize {
     trace.log("strlen return {}", .{result});
     return result;
 }
-// TODO: strnlen exists in some libc implementations, it might be defined by posix so
-//       I should probably move it to the posix lib
+// Keep `strnlen` here for now even though some platforms expose it through POSIX.
 fn strnlen(s: [*:0]const u8, max_len: usize) usize {
     trace.log("strnlen {*} max={}", .{ s, max_len });
     var i: usize = 0;
@@ -576,7 +677,7 @@ export fn strcat(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
     return @as([*:0]u8, @ptrCast(s1));
 }
 
-// TODO: find out which standard this function comes from
+// `strncpy` is part of the ISO C string API.
 export fn strncpy(s1: [*]u8, s2: [*:0]const u8, n: usize) callconv(.c) [*]u8 {
     trace.log("strncpy {*} {f} n={}", .{ s1, trace.fmtStr(s2), n });
     const len = strnlen(s2, n);
@@ -672,6 +773,7 @@ export fn strtok(s1: ?[*:0]u8, s2: [*:0]const u8) callconv(.c) ?[*:0]u8 {
 
 fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8, optional_base: c_int) T {
     var next = str;
+    const no_digit_end = str;
 
     // skip whitespace
     while (isspace(next[0]) != 0) : (next += 1) {}
@@ -751,10 +853,13 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
         };
     }
 
-    if (optional_endptr) |endptr| endptr.* = next;
     if (next == digit_start) {
-        errno = c.EINVAL; // TODO: is this right?
+        if (builtin.os.tag.isDarwin()) {
+            errno = c.EINVAL;
+        }
+        if (optional_endptr) |endptr| endptr.* = no_digit_end;
     } else {
+        if (optional_endptr) |endptr| endptr.* = next;
         trace.log("strto str='{s}' result={}", .{ start[0 .. @intFromPtr(next) - @intFromPtr(start)], x });
     }
     return x;
@@ -796,7 +901,6 @@ export fn strtod(nptr: [*:0]const u8, endptr: ?*[*:0]const u8) callconv(.c) f64 
 
     if (!saw_digit or token_start == i) {
         if (endptr) |ep| ep.* = nptr;
-        errno = c.EINVAL;
         return 0;
     }
 
@@ -805,7 +909,6 @@ export fn strtod(nptr: [*:0]const u8, endptr: ?*[*:0]const u8) callconv(.c) f64 
     const result = std.fmt.parseFloat(f64, nptr[token_start..i]) catch |err| switch (err) {
         error.InvalidCharacter => {
             if (endptr) |ep| ep.* = nptr;
-            errno = c.EINVAL;
             return 0;
         },
     };
@@ -970,6 +1073,10 @@ const global = struct {
             .errno = 0,
         },
     };
+    const RemainderState = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .{},
+        index: usize = 0,
+    };
     const file_page_len = 64;
     const FilePage = [file_page_len]FileEntry;
 
@@ -989,6 +1096,8 @@ const global = struct {
     var static_file_page: FilePage = initStaticFilePage();
     var dynamic_file_pages: std.ArrayListUnmanaged(*FilePage) = .{};
     var file_pages_mutex = std.Thread.Mutex{};
+    var remainder_states: std.AutoHashMapUnmanaged(usize, RemainderState) = .empty;
+    var remainder_mutex = std.Thread.Mutex{};
     var tmpnam_counter: u32 = 0;
     var tmpfile_counter: u32 = 0;
 
@@ -997,6 +1106,7 @@ const global = struct {
         entry.file.errno = 0;
         entry.unread_valid = false;
         entry.unread_char = 0;
+        clearRemainder(&entry.file);
         return &entry.file;
     }
 
@@ -1038,20 +1148,77 @@ const global = struct {
         defer file_pages_mutex.unlock();
         entry.unread_valid = false;
         entry.unread_char = 0;
+        removeRemainder(file);
         entry.reserved = false;
     }
 
-    // TODO: remove this.  Just using it to return error numbers as strings for now
+    fn clearRemainder(file: *c.FILE) void {
+        remainder_mutex.lock();
+        defer remainder_mutex.unlock();
+        if (remainder_states.getPtr(@intFromPtr(file))) |state| {
+            state.bytes.clearRetainingCapacity();
+            state.index = 0;
+        }
+    }
+
+    fn removeRemainder(file: *c.FILE) void {
+        remainder_mutex.lock();
+        defer remainder_mutex.unlock();
+        if (remainder_states.fetchRemove(@intFromPtr(file))) |kv| {
+            var state = kv.value;
+            state.bytes.deinit(gpa.allocator());
+        }
+    }
+
+    fn hasRemainder(file: *c.FILE) bool {
+        remainder_mutex.lock();
+        defer remainder_mutex.unlock();
+        if (remainder_states.getPtr(@intFromPtr(file))) |state| {
+            return state.index < state.bytes.items.len;
+        }
+        return false;
+    }
+
+    fn readRemainder(file: *c.FILE, dest: []u8) usize {
+        if (dest.len == 0) return 0;
+        remainder_mutex.lock();
+        defer remainder_mutex.unlock();
+        const state = remainder_states.getPtr(@intFromPtr(file)) orelse return 0;
+        const pending = state.bytes.items[state.index..];
+        if (pending.len == 0) return 0;
+        const copy_len = @min(dest.len, pending.len);
+        @memcpy(dest[0..copy_len], pending[0..copy_len]);
+        state.index += copy_len;
+        if (state.index == state.bytes.items.len) {
+            state.bytes.clearRetainingCapacity();
+            state.index = 0;
+        }
+        return copy_len;
+    }
+
+    fn replaceRemainder(file: *c.FILE, bytes: []const u8) !void {
+        remainder_mutex.lock();
+        defer remainder_mutex.unlock();
+        const gop = try remainder_states.getOrPut(gpa.allocator(), @intFromPtr(file));
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        gop.value_ptr.bytes.clearRetainingCapacity();
+        gop.value_ptr.index = 0;
+        try gop.value_ptr.bytes.appendSlice(gpa.allocator(), bytes);
+    }
+
+    // Scratch storage for short strerror/strsignal-style formatting.
     var tmp_strerror_buffer: [30]u8 = undefined;
-    var getenv_tmp: [4096:0]u8 = [_:0]u8{0} ** 4096;
+    var getenv_tmp: [32768:0]u8 = [_:0]u8{0} ** 32768;
     var current_locale = [_:0]u8{'C'};
     var gmtime_tm: c.tm = std.mem.zeroes(c.tm);
     var localtime_tm: c.tm = std.mem.zeroes(c.tm);
 
     var atexit_mutex = std.Thread.Mutex{};
     var atexit_started = false;
-    // TODO: these don't need to be contiguous, use a chain of fixed size chunks
-    //       that don't need to move/be resized ChunkedArrayList or something
+    // `atexit` storage is contiguous today; chunking would only be a future
+    // allocation/perf improvement.
     var atexit_funcs: std.ArrayListUnmanaged(ExitFunc) = .{};
 
     var decimal_point = [_:0]u8{'.'};
@@ -1176,30 +1343,15 @@ export fn getchar() callconv(.c) c_int {
 
 export fn getc(stream: *c.FILE) callconv(.c) c_int {
     trace.log("getc {*}", .{stream});
-    const entry = entryFromFile(stream);
-    if (entry.unread_valid) {
-        entry.unread_valid = false;
-        return entry.unread_char;
-    }
-    if (stream.eof != 0) return c.EOF;
-
-    if (builtin.os.tag == .windows) {
-        var buf: [1]u8 = undefined;
-        const len = _fread_buf(&buf, 1, stream);
-        if (len == 0) return c.EOF;
-        std.debug.assert(len == 1);
-        return buf[0];
-    }
-
     var buf: [1]u8 = undefined;
-    const rc = std.posix.system.read(stream.fd, &buf, 1);
-    if (rc == 1) {
-        trace.log("getc return {}", .{buf[0]});
-        return buf[0];
+    const len = _fread_buf(&buf, 1, stream);
+    if (len == 0) {
+        trace.log("getc return EOF, errno={}", .{stream.errno});
+        return c.EOF;
     }
-    stream.errno = if (rc == 0) 0 else @intFromEnum(std.posix.errno(rc));
-    trace.log("getc return EOF, errno={}", .{stream.errno});
-    return c.EOF;
+    std.debug.assert(len == 1);
+    trace.log("getc return {}", .{buf[0]});
+    return buf[0];
 }
 
 // NOTE: this causes a bug in the Zig compiler, but it shouldn't
@@ -1227,7 +1379,6 @@ export fn ungetc(char: c_int, stream: *c.FILE) callconv(.c) c_int {
 }
 
 export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usize {
-    // TODO: should I check stream.eof here?
     if (size == 0) return 0;
     var prefilled: usize = 0;
     const entry = entryFromFile(stream);
@@ -1237,6 +1388,10 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
         prefilled = 1;
         if (size == 1) return 1;
     }
+    if (prefilled < size) {
+        prefilled += global.readRemainder(stream, ptr[prefilled..size]);
+        if (prefilled == size) return prefilled;
+    }
     const remaining = size - prefilled;
     const dest = ptr + prefilled;
 
@@ -1244,7 +1399,6 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
         const actual_read_len = @as(u32, @intCast(@min(@as(u32, std.math.maxInt(u32)), remaining)));
         while (true) {
             var amt_read: u32 = undefined;
-            // TODO: is stream.fd.? right?
             if (std.os.windows.kernel32.ReadFile(stream.fd.?, dest, actual_read_len, &amt_read, null) == 0) {
                 switch (std.os.windows.kernel32.GetLastError()) {
                     .OPERATION_ABORTED => continue,
@@ -1284,17 +1438,24 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
 }
 
 export fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
-    if (stream.eof != 0 and !entryFromFile(stream).unread_valid) {
+    const entry = entryFromFile(stream);
+    if (size == 0 or nmemb == 0) return 0;
+    if (stream.eof != 0 and !entry.unread_valid and !global.hasRemainder(stream)) {
         return 0;
     }
     const total = size * nmemb;
     const result = _fread_buf(ptr, total, stream);
     if (result == 0) return 0;
     if (result == total) return nmemb;
-    // TODO: if length read is not aligned then we need to leave it
-    //       in an internal read buffer inside FILE
-    //       for now we'll crash if it's not aligned
-    return @divExact(result, size);
+    const remainder_len = result % size;
+    if (remainder_len == 0) return result / size;
+    const aligned_len = result - remainder_len;
+    global.replaceRemainder(stream, ptr[aligned_len..result]) catch {
+        stream.errno = c.ENOMEM;
+        errno = c.ENOMEM;
+        return aligned_len / size;
+    };
+    return aligned_len / size;
 }
 
 export fn feof(stream: *c.FILE) callconv(.c) c_int {
@@ -1513,6 +1674,7 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
     stream.eof = 0;
     stream.errno = 0;
     entryFromFile(stream).unread_valid = false;
+    global.clearRemainder(stream);
     return 0;
 }
 
@@ -1544,8 +1706,6 @@ export fn rewind(stream: *c.FILE) callconv(.c) void {
     }
 }
 
-// TODO: why is there a putc and an fputc function? They seem to be equivalent
-//       so what's the history?
 comptime {
     @export(&fputc, .{ .name = "putc" });
 }
@@ -2066,8 +2226,6 @@ comptime {
     @export(&vsscanf, .{ .name = "vsscanf" });
 }
 
-// TODO: can ptr be NULL?
-// TODO: can stream be NULL (I don't think it can)
 export fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
     trace.log("fwrite {*} size={} n={} stream={*}", .{ ptr, size, nmemb, stream });
     if (size == 0 or nmemb == 0) return 0;
@@ -2107,7 +2265,7 @@ export fn fputs(s: [*:0]const u8, stream: *c.FILE) callconv(.c) c_int {
 export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
     if (stream.eof != 0) return null;
 
-    // TODO: this implementation is very slow/inefficient
+    // This is intentionally simple and currently reads byte-at-a-time.
     var total_read: usize = 0;
     while (true) : (total_read += 1) {
         if (total_read + 1 >= n) {
@@ -2322,19 +2480,16 @@ export fn tan(x: f64) callconv(.c) f64 {
 }
 
 export fn frexp(value: f32, exp: *c_int) callconv(.c) f64 {
-    // TODO: look into error handling to match C spec
     const result = std.math.frexp(value);
     exp.* = result.exponent;
     return result.significand;
 }
 
 export fn ldexp(x: f64, exp: c_int) callconv(.c) f64 {
-    // TODO: look into error handling to match C spec
     return std.math.ldexp(x, @as(i32, @intCast(exp)));
 }
 
 export fn pow(x: f64, y: f64) callconv(.c) f64 {
-    // TODO: look into error handling to match C spec
     return std.math.pow(f64, x, y);
 }
 

@@ -10,6 +10,11 @@
   - macOS targets executed through `darling`
   - Windows GNU targets executed through `wineconsole`
 - `zig build conformance` passes on the same matrix.
+- The in-tree parity runner compares ziglibc and the platform libc for the validated matrix on:
+  - process execution (`system`, `popen`, `pclose`)
+  - signal/sigaction basics
+  - `strtol`/`strtod` no-digit behavior
+  - `setitimer`, `select`, `pselect`, and `utimes` where the platform libc exposes them
 
 ## Repository Setup
 
@@ -96,5 +101,6 @@ zig cc \
 
 ## Notes
 
-- The implementation is still incomplete in some non-conformance areas.
+- The validated Linux/macOS/Windows matrix is green for both `test` and `conformance`.
+- Remaining `ENOSYS` paths are scoped to unsupported targets or unsupported OS-specific features outside that matrix.
 - The build will fail fast if required submodules are missing rather than cloning repositories during `zig build`.

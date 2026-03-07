@@ -4,14 +4,15 @@
 #include "private/limits_and_float_shared.h"
 
 #if __STDC_VERSION__ >= 199901L
-    /* assume 64-bit long long for now */
-    #define LLONG_MAX  9223372036854775807
-    #define LLONG_MIN -9223372036854775807
-    #define ULLONG_MAX 18446744073709551615
+    #define LLONG_MAX __LONG_LONG_MAX__
+    #define LLONG_MIN (-__LONG_LONG_MAX__ - 1LL)
+    #define ULLONG_MAX (__LONG_LONG_MAX__ * 2ULL + 1ULL)
 #endif
 
-/* TODO: fixme */
-/* TODO: I think PATH_MAX is supposed to be in "linux/limits.h" rather than "limits.h"?? */
-#define PATH_MAX 1024
+#ifdef _WIN32
+    #define PATH_MAX 260
+#else
+    #define PATH_MAX 4096
+#endif
 
 #endif /* _LIMITS_H */
