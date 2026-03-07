@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -34,8 +36,7 @@ jobs:
           path: |
             .zig-cache
             .zig-global-cache
-            dep
-          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'inc/**/*.h', 'test/**/*', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'inc/**/*.h', 'test/**/*', '.github/workflows/ci.yml', '.gitmodules') }}
           restore-keys: |
             ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
 

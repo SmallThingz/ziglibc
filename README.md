@@ -1,17 +1,89 @@
 # ziglibc
 
-An exploration on creating a libc implementation in Zig.
+`ziglibc` is an experimental libc implementation in Zig covering the C standard library plus a growing POSIX surface.
 
-"libc" includes implementations for the C Standard and the Posix Standard.
+## Status
 
-# How to Use
+- Builds with Zig `0.15.2`.
+- `zig build test` passes on:
+  - Linux native
+  - macOS targets executed through `darling`
+  - Windows GNU targets executed through `wineconsole`
+- `zig build conformance` passes on the same matrix.
 
-This is a little ugly and should change but I'm documenting it here for the adventurous.
+## Repository Setup
 
-You can use ziglibc by running `zig build` on this repository.  Then add these arguments
-to your `zig cc` command line:
+Conformance sources are tracked as git submodules. Initialize them before running the test or conformance steps:
 
+```sh
+git submodule update --init --recursive
 ```
+
+The conformance-related submodules live under `dep/`:
+
+- `dep/libc-test`
+- `dep/tiny-regex-c`
+- `dep/open_posix_testsuite`
+- `dep/glibc-testsuite`
+
+## Building
+
+Build the default install artifacts with:
+
+```sh
+zig build
+```
+
+Run the project test suite with:
+
+```sh
+zig build test
+```
+
+Run the conformance suite bundle with:
+
+```sh
+zig build conformance
+```
+
+Useful individual steps:
+
+```sh
+zig build libc-test
+zig build glibc-check
+zig build posix-test-suite
+zig build austin-group-tests
+zig build re-tests
+```
+
+## Cross-Platform Validation
+
+On a Linux host, the build uses external runners for foreign test execution:
+
+- Darwin targets: `darling`
+- Windows GNU targets: `wineconsole`
+
+Examples:
+
+```sh
+zig build test -Dtarget=x86_64-macos
+zig build conformance -Dtarget=x86_64-macos
+
+zig build test -Dtarget=x86_64-windows-gnu
+zig build conformance -Dtarget=x86_64-windows-gnu
+```
+
+`aarch64-macos` is also kept compiling in CI:
+
+```sh
+zig build -Dtarget=aarch64-macos
+```
+
+## Using ziglibc
+
+After `zig build`, point `zig cc` at the generated headers and libraries:
+
+```sh
 zig cc \
     -nostdlib \
     -I PATH_TO_ZIGLIBC_SRC/inc/libc \
@@ -22,35 +94,7 @@ zig cc \
     -lc
 ```
 
-Currently builds with zig version `0.11.0-dev.3886+0c1bfe271`.
+## Notes
 
-# Thoughts
-
-I'd like a common codebase that can create libc headers that emulate various libc implementations.
-For this I'd like to create a database for the libc API that includes information about features,
-versions, behavior changes, etc.  From this database, headers can be generated for any combination
-of parameters based on the database.
-
-I'd also like to support static and dynamic linking.  Static linking means providing a full
-implementation for all of libc and dynamic means emulating whatever libc target the project needs.
-
-# Test Projects
-
-The following is a list of C projects that I could use to test ziglibc with:
-
-* libc-test: https://wiki.musl-libc.org/libc-test.html (use to test our libc)
-* Lua
-* sqlite
-* zlib
-* Make/Autotools
-* BASH
-* SDL
-* GTK
-* raylib
-* my morec project, tools directory
-* c4
-* busybox/sed
-* m4 preprocessor
-* ncurses
-* games in ncurses?
-* https://github.com/superjer/tinyc.games
+- The implementation is still incomplete in some non-conformance areas.
+- The build will fail fast if required submodules are missing rather than cloning repositories during `zig build`.
