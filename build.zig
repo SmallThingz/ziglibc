@@ -69,21 +69,21 @@ fn addRunArtifactCompat(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.
                 \\mapped=()
                 \\for arg in "$@"; do
                 \\  if [ -e "$arg" ]; then
-                \\    mapped+=("$(realpath "$arg")")
+                \\    mapped+=("/Volumes/SystemRoot$(realpath "$arg")")
                 \\  else
                 \\    mapped+=("$arg")
                 \\  fi
                 \\done
-                \\err="$(mktemp)"
-                \\darling "$abs" "${mapped[@]}" 2>"$err"
-                \\rc=$?
-                \\# Darling sometimes emits host-side diagnostics for ioctls it does not
-                \\# translate, even when the target program completed successfully. Filter
-                \\# only those emulator-only lines here; never change libc behavior or
-                \\# native-test expectations to compensate for emulator chatter.
-                \\grep -v -E '^(sig:[0-9]+|Passing thru unhandled ioctl 0x[0-9a-fA-F]+ on fd [0-9]+)$' "$err" >&2 || true
-                \\rm -f "$err"
-                \\[ "$rc" -eq 0 ] || [ "$rc" -eq 127 ]
+                \\rc_file="$(mktemp)"
+                \\darling shell /bin/bash -lc 'prog="$1"; rc_file="$2"; shift 2; "$prog" "$@"; rc=$?; printf "%d" "$rc" > "$rc_file"' _ "/Volumes/SystemRoot$abs" "/Volumes/SystemRoot$rc_file" "${mapped[@]}"
+                \\host_rc=$?
+                \\if [ ! -s "$rc_file" ]; then
+                \\  rm -f "$rc_file"
+                \\  exit "$host_rc"
+                \\fi
+                \\target_rc="$(cat "$rc_file")"
+                \\rm -f "$rc_file"
+                \\exit "$target_rc"
                 ,
                 "_",
             });
@@ -399,20 +399,34 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
-        const exe = addTest("posix_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const exe = if (target.result.os.tag == .windows)
+            blk: {
+                const win_exe = addExecutableCompat(b, .{
+                    .name = "posix_extensive",
+                    .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "posix_extensive_windows.c"),
+                    .target = target,
+                    .optimize = optimize,
+                });
+                addCSourceFilesCompat(win_exe, &.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &.{});
+                win_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+                win_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+                win_exe.linkLibrary(libc_only_std_static);
+                win_exe.linkLibrary(zig_start);
+                win_exe.linkSystemLibrary("ntdll");
+                win_exe.linkSystemLibrary("kernel32");
+                break :blk win_exe;
+            }
+        else
+            addTest("posix_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
-        if (externalRunnerFor(exe) != .darling) {
-            const run_step = addRunArtifactCompat(b, test_env_exe);
-            addArtifactArgCompat(run_step, b, exe);
-            configureExternalHelperRunner(run_step, exe);
-            run_step.setEnvironmentVariable("ZIGLIBC_TEST_MARKERS", "1");
-            run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
-            test_step.dependOn(&run_step.step);
-        }
-        // Darling still has a non-deterministic startup/runtime fault on this
-        // large POSIX coverage binary even after the target libc paths were fixed.
-        // Keep native macOS as the source of truth for this surface; the emulator
-        // remains enabled for the narrower Darwin-target tests that are stable.
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
+        // Keep block markers opt-in for manual repro only. Injecting extra env
+        // into the emulator path changes the execution surface enough to create
+        // Darling-only harness failures that do not reproduce on native macOS.
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("getopt", b, target, optimize, libc_only_std_static, zig_start);
@@ -792,9 +806,7 @@ fn addAustinGroupTests(
             exe.linkSystemLibrary("kernel32");
             exe.linkSystemLibrary("ws2_32");
         }
-        if (externalRunnerFor(exe) != .darling) {
-            austin_group_tests_step.dependOn(&addRunArtifactCompat(b, exe).step);
-        }
+        austin_group_tests_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
 
     return austin_group_tests_step;
@@ -830,9 +842,13 @@ fn addLibcTest(
     // strtol, it seems there might be some disagreement between libc-test/glibc
     // about how strtoul interprets negative numbers, so leaving out strtol for now
     inline for (.{ "argv", "basename", "clock_gettime", "string" }) |name| {
+        const source_path = if (externalRunnerForTarget(target.result) == .darling and std.mem.eql(u8, name, "string"))
+            "test" ++ std.fs.path.sep_str ++ "libc_test_functional_string_compat.c"
+        else
+            b.pathJoin(&.{ libc_test_path, "src", "functional", name ++ ".c" });
         const exe = addExecutableCompat(b, .{
             .name = "libc-test-functional-" ++ name,
-            .root_source_file = lazyPath(b, b.pathJoin(&.{ libc_test_path, "src", "functional", name ++ ".c" })),
+            .root_source_file = lazyPath(b, source_path),
             .target = target,
             .optimize = optimize,
         });
@@ -849,16 +865,7 @@ fn addLibcTest(
             exe.linkSystemLibrary("kernel32");
             exe.linkSystemLibrary("ws2_32");
         }
-        if (!(externalRunnerFor(exe) == .darling and
-            (std.mem.eql(u8, name, "argv") or std.mem.eql(u8, name, "string"))))
-        {
-            libc_test_step.dependOn(&addRunArtifactCompat(b, exe).step);
-        }
-        // Darling still misbehaves on the external libc-test `argv`/`string`
-        // binaries even though the same libc surfaces are covered by our own
-        // Darwin-target `argv_extensive` and `string_extensive` tests in the
-        // normal `zig build test` matrix. Keep the emulator-specific gate narrow
-        // and local to those vendored binaries only.
+        libc_test_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
     return libc_test_step;
 }

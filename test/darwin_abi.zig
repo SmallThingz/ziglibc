@@ -40,6 +40,8 @@ comptime {
     expectAbi("mode_t", c.mode_t, std.posix.mode_t);
     expectAbi("off_t", c.off_t, std.posix.off_t);
     expectAbi("time_t", c.time_t, std.posix.time_t);
+    expectAbi("struct stat", c.struct_stat, std.c.Stat);
+    expectAbi("struct timeval", c.struct_timeval, std.posix.timeval);
     expectAbi("struct sockaddr", c.struct_sockaddr, std.posix.sockaddr);
 }
 

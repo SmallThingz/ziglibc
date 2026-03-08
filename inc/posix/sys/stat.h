@@ -3,6 +3,7 @@
 
 #include "../../libc/private/restrict.h"
 #include "../../libc/private/time_t.h"
+#include "../../libc/private/timespec.h"
 
 #include "../private/dev_t.h"
 #include "../private/ino_t.h"
@@ -20,6 +21,31 @@
 #define S_IRWXG 0070
 #define S_IRWXO 0007
 
+#ifdef __APPLE__
+struct stat {
+  int st_dev;
+  mode_t st_mode;
+  unsigned short st_nlink;
+  ino_t st_ino;
+  uid_t st_uid;
+  gid_t st_gid;
+  int st_rdev;
+  struct timespec st_atimespec;
+  struct timespec st_mtimespec;
+  struct timespec st_ctimespec;
+  struct timespec st_birthtimespec;
+  off_t st_size;
+  blkcnt_t st_blocks;
+  int st_blksize;
+  unsigned int st_flags;
+  unsigned int st_gen;
+  int st_lspare;
+  long long st_qspare[2];
+};
+#define st_atime st_atimespec.tv_sec
+#define st_mtime st_mtimespec.tv_sec
+#define st_ctime st_ctimespec.tv_sec
+#else
 struct stat {
   dev_t st_dev;
   ino_t st_ino;
@@ -35,6 +61,7 @@ struct stat {
   blksize_t st_blksize;
   blkcnt_t st_blocks;
 };
+#endif
 
 int stat(const char *__zrestrict path, struct stat *__zrestrict buf);
 int chmod(const char *path, mode_t mode);

@@ -2875,8 +2875,66 @@ fn timespecSeconds(ts: anytype) i64 {
     return @as(i64, @intCast(ts.sec));
 }
 
+fn timespecNanoseconds(ts: anytype) c_long {
+    const ts_ty = @TypeOf(ts);
+    if (@hasField(ts_ty, "tv_nsec")) {
+        return @as(c_long, @intCast(ts.tv_nsec));
+    }
+    return @as(c_long, @intCast(ts.nsec));
+}
+
+fn writeCTimespec(dst: *c.struct_timespec, src: anytype) void {
+    dst.tv_sec = @as(@TypeOf(dst.tv_sec), @intCast(timespecSeconds(src)));
+    dst.tv_nsec = @as(@TypeOf(dst.tv_nsec), @intCast(timespecNanoseconds(src)));
+}
+
 fn copyPosixStatToC(buf: *c.struct_stat, stat_buf: os.Stat) void {
     const stat_ty = @TypeOf(stat_buf);
+    buf.* = std.mem.zeroes(c.struct_stat);
+    buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(stat_buf.dev));
+    buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(stat_buf.ino));
+    buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(stat_buf.mode));
+    buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(stat_buf.nlink));
+    buf.st_uid = @as(@TypeOf(buf.st_uid), @intCast(stat_buf.uid));
+    buf.st_gid = @as(@TypeOf(buf.st_gid), @intCast(stat_buf.gid));
+    buf.st_rdev = @as(@TypeOf(buf.st_rdev), @intCast(stat_buf.rdev));
+    buf.st_blksize = @as(@TypeOf(buf.st_blksize), @intCast(stat_buf.blksize));
+    buf.st_blocks = @as(@TypeOf(buf.st_blocks), @intCast(stat_buf.blocks));
+    buf.st_size = @as(@TypeOf(buf.st_size), @intCast(stat_buf.size));
+
+    if (builtin.os.tag.isDarwin()) {
+        const atime = if (@hasField(stat_ty, "atim")) stat_buf.atim else stat_buf.atimespec;
+        const mtime = if (@hasField(stat_ty, "mtim")) stat_buf.mtim else stat_buf.mtimespec;
+        const ctime = if (@hasField(stat_ty, "ctim")) stat_buf.ctim else stat_buf.ctimespec;
+
+        // Native Darwin is stricter than Darling here: writing the timestamp
+        // fields through the `st_mtime`/`st_atime` macro aliases can corrupt the
+        // surrounding `struct stat` layout at the Zig/C boundary. Fill the real
+        // Darwin timespec members explicitly so native macOS and emulator runs
+        // both exercise the same ABI.
+        writeCTimespec(&buf.st_atimespec, atime);
+        writeCTimespec(&buf.st_mtimespec, mtime);
+        writeCTimespec(&buf.st_ctimespec, ctime);
+        if (@hasField(stat_ty, "birthtimespec")) {
+            writeCTimespec(&buf.st_birthtimespec, stat_buf.birthtimespec);
+        }
+        if (@hasField(stat_ty, "flags")) {
+            buf.st_flags = @as(@TypeOf(buf.st_flags), @intCast(stat_buf.flags));
+        }
+        if (@hasField(stat_ty, "gen")) {
+            buf.st_gen = @as(@TypeOf(buf.st_gen), @intCast(stat_buf.gen));
+        }
+        if (@hasField(stat_ty, "lspare")) {
+            buf.st_lspare = @as(@TypeOf(buf.st_lspare), @intCast(stat_buf.lspare));
+        }
+        if (@hasField(stat_ty, "qspare")) {
+            inline for (0..2) |i| {
+                buf.st_qspare[i] = @as(@TypeOf(buf.st_qspare[i]), @intCast(stat_buf.qspare[i]));
+            }
+        }
+        return;
+    }
+
     const atime = if (@hasField(stat_ty, "atim"))
         timespecSeconds(stat_buf.atim)
     else
@@ -2889,20 +2947,9 @@ fn copyPosixStatToC(buf: *c.struct_stat, stat_buf: os.Stat) void {
         timespecSeconds(stat_buf.ctim)
     else
         timespecSeconds(stat_buf.ctimespec);
-
-    buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(stat_buf.dev));
-    buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(stat_buf.ino));
-    buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(stat_buf.mode));
-    buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(stat_buf.nlink));
-    buf.st_uid = @as(@TypeOf(buf.st_uid), @intCast(stat_buf.uid));
-    buf.st_gid = @as(@TypeOf(buf.st_gid), @intCast(stat_buf.gid));
-    buf.st_rdev = @as(@TypeOf(buf.st_rdev), @intCast(stat_buf.rdev));
-    buf.st_size = @as(@TypeOf(buf.st_size), @intCast(stat_buf.size));
     buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(atime));
     buf.st_mtime = @as(@TypeOf(buf.st_mtime), @intCast(mtime));
     buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(ctime));
-    buf.st_blksize = @as(@TypeOf(buf.st_blksize), @intCast(stat_buf.blksize));
-    buf.st_blocks = @as(@TypeOf(buf.st_blocks), @intCast(stat_buf.blocks));
 }
 
 export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
