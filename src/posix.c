@@ -157,6 +157,7 @@ int getopt_long_only(int argc, char * const argv[], const char *optstring, const
 // --------------------------------------------------------------------------------
 LIBCGUANA_INTERNAL int _zopen(const char *path, int oflag, unsigned mode);
 LIBCGUANA_INTERNAL int _zopenat(int fd, const char *path, int oflag, unsigned mode);
+LIBCGUANA_INTERNAL int _fcntlArgInt(int fildes, int cmd, int arg);
 
 int open(const char *path, int oflag, ...)
 {
@@ -180,6 +181,28 @@ int openat(int fd, const char *path, int oflag, ...)
         va_end(args);
     }
     return _zopenat(fd, path, oflag, mode);
+}
+
+int fcntl(int fildes, int cmd, ...)
+{
+    int arg = 0;
+    switch (cmd) {
+        case F_DUPFD:
+        case F_SETFD:
+        case F_SETFL:
+        case F_SETOWN:
+        case F_GETOWN:
+            {
+                va_list args;
+                va_start(args, cmd);
+                arg = va_arg(args, int);
+                va_end(args);
+            }
+            break;
+        default:
+            break;
+    }
+    return _fcntlArgInt(fildes, cmd, arg);
 }
 
 // --------------------------------------------------------------------------------

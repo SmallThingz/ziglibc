@@ -639,7 +639,8 @@ fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
             return -1;
         }
 
-        return winfd.allocHandle(handle.?) catch {
+        const fd_flags: c_int = if ((oflag & c.O_CLOEXEC) != 0) c.FD_CLOEXEC else 0;
+        return winfd.allocHandleFlags(handle.?, oflag, fd_flags) catch {
             _ = winapi.CloseHandle(handle.?);
             c.errno = errnoConst("EMFILE", c.ENOMEM);
             return -1;
@@ -726,6 +727,100 @@ fn _zopenat(dirfd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) callc
 
 comptime {
     exportInternalSymbol(&_zopenat, "_zopenat");
+}
+
+fn windowsSettableStatusFlags() c_int {
+    return c.O_APPEND | c.O_NONBLOCK;
+}
+
+fn normalizeWindowsStatusFlags(old_flags: c_int, new_flags: c_int) c_int {
+    const access_mode = old_flags & 0x3;
+    return access_mode | (new_flags & windowsSettableStatusFlags());
+}
+
+fn _fcntlArgInt(fd: c_int, cmd: c_int, arg: c_int) callconv(.c) c_int {
+    if (builtin.os.tag == .windows) {
+        switch (cmd) {
+            c.F_GETFD => {
+                const flags = winfd.getFdFlags(fd) orelse {
+                    c.errno = errnoConst("EBADF", c.EINVAL);
+                    return -1;
+                };
+                return flags;
+            },
+            c.F_SETFD => {
+                const rc = winfd.setFdFlags(fd, arg);
+                if (rc != 0) {
+                    c.errno = rc;
+                    return -1;
+                }
+                return 0;
+            },
+            c.F_GETFL => {
+                const flags = winfd.getStatusFlags(fd) orelse {
+                    c.errno = errnoConst("EBADF", c.EINVAL);
+                    return -1;
+                };
+                return flags;
+            },
+            c.F_SETFL => {
+                const old_flags = winfd.getStatusFlags(fd) orelse {
+                    c.errno = errnoConst("EBADF", c.EINVAL);
+                    return -1;
+                };
+                if (!winfd.setStatusFlags(fd, normalizeWindowsStatusFlags(old_flags, arg))) {
+                    c.errno = errnoConst("EBADF", c.EINVAL);
+                    return -1;
+                }
+                return 0;
+            },
+            c.F_DUPFD => {
+                if (arg < 0) {
+                    c.errno = c.EINVAL;
+                    return -1;
+                }
+                const rc = winfd.dupFd(fd, arg);
+                if (rc < 0) {
+                    c.errno = -rc;
+                    return -1;
+                }
+                return rc;
+            },
+            else => {
+                c.errno = errnoConst("ENOSYS", c.EINVAL);
+                return -1;
+            },
+        }
+    }
+
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.fcntl, fd, cmd, arg);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @intCast(rc);
+    }
+
+    while (true) {
+        const rc = os.system.fcntl(fd, cmd, @as(usize, @bitCast(@as(isize, @intCast(arg)))));
+        switch (os.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+}
+
+comptime {
+    // `fcntl` is variadic in the public ABI, so keep the varargs shim in C and
+    // route it into this fixed-signature Zig helper. That avoids relying on Zig
+    // to define variadic functions directly while still keeping the platform
+    // logic here, where we can test it across Linux, Darwin, and Windows.
+    exportInternalSymbol(&_fcntlArgInt, "_fcntlArgInt");
 }
 
 export fn readv(fd: c_int, iov: [*]const c.struct_iovec, iovcnt: c_int) callconv(.c) isize {
@@ -923,7 +1018,11 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
         }
         _ = winapi.CloseHandle(child_handle);
 
-        const parent_fd = winfd.allocHandle(parent_handle) catch {
+        const parent_fd = winfd.allocHandleFlags(
+            parent_handle,
+            if (mode_ch == 'r') c.O_RDONLY else c.O_WRONLY,
+            0,
+        ) catch {
             _ = winapi.CloseHandle(parent_handle);
             _ = winapi.CloseHandle(process_handle.?);
             c.errno = errnoConst("EMFILE", c.ENOMEM);

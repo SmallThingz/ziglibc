@@ -276,6 +276,30 @@ int main(void)
   }
 
   {
+    const char *path = "libc-parity-fcntl.tmp";
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (fd >= 0) {
+      int getfl = fcntl(fd, F_GETFL);
+      int setfd = fcntl(fd, F_SETFD, FD_CLOEXEC);
+      int getfd = fcntl(fd, F_GETFD);
+      int dupfd = fcntl(fd, F_DUPFD, 8);
+      printf(
+        "fcntl-basic:%d:%d:%d:%d:%d|",
+        getfl >= 0 ? (getfl & 0x3) : -1,
+        setfd,
+        getfd,
+        dupfd >= 0,
+        dupfd >= 0 ? (dupfd >= 8) : errno
+      );
+      if (dupfd >= 0) close(dupfd);
+      close(fd);
+      unlink(path);
+    } else {
+      printf("fcntl-basic:open-failed:%d|", errno);
+    }
+  }
+
+  {
     const char *path = "libc-parity-uio.tmp";
     struct iovec out[2];
     struct iovec in[2];
@@ -317,7 +341,7 @@ int main(void)
     }
   }
 #else
-  printf("gethostname:skip|openat-size:skip|link-basic:skip|writev-basic:skip|pathconf-basic:skip|");
+  printf("gethostname:skip|openat-size:skip|link-basic:skip|fcntl-basic:skip|writev-basic:skip|pathconf-basic:skip|");
 #endif
 
   return 0;

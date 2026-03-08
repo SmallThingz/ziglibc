@@ -159,6 +159,27 @@ int main(int argc, char *argv[])
   }
 
   {
+    const char *name = "posix-fcntl.tmp";
+    int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    int flags;
+    int dupfd;
+    expect(fd >= 0);
+    flags = fcntl(fd, F_GETFL);
+    expect(flags >= 0);
+    expect((flags & 0x3) == O_RDWR);
+    expect(0 == fcntl(fd, F_SETFD, FD_CLOEXEC));
+    flags = fcntl(fd, F_GETFD);
+    expect(flags >= 0);
+    expect((flags & FD_CLOEXEC) == FD_CLOEXEC);
+    dupfd = fcntl(fd, F_DUPFD, 8);
+    expect(dupfd >= 8);
+    expect(dupfd != fd);
+    expect(0 == close(dupfd));
+    expect(0 == close(fd));
+    expect(0 == unlink(name));
+  }
+
+  {
     mode_t old = umask(077);
     const char *name = "posix-umask.tmp";
     int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0666);

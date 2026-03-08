@@ -1711,7 +1711,11 @@ fn fopenImpl(
             errno = c.ENOMEM;
             return null;
         };
-        _ = winfd.allocHandle(fd.?) catch {
+        const stream_flags: c_int = switch (parsed.kind) {
+            .read => if (parsed.plus) c.O_RDWR else c.O_RDONLY,
+            .write, .append => if (parsed.plus) c.O_RDWR else c.O_WRONLY,
+        } | (if (parsed.kind == .append) c.O_APPEND else 0);
+        _ = winfd.allocHandleFlags(fd.?, stream_flags, 0) catch {
             global.releaseFile(file);
             _ = windows.CloseHandle(fd.?);
             errno = errnoConst("EMFILE", c.ENOMEM);
@@ -2522,7 +2526,7 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
                     errno = c.ENOMEM;
                     return null;
                 };
-                _ = winfd.allocHandle(fd.?) catch {
+                _ = winfd.allocHandleFlags(fd.?, c.O_RDWR, 0) catch {
                     global.releaseFile(file);
                     _ = windows.CloseHandle(fd.?);
                     errno = errnoConst("EMFILE", c.ENOMEM);
