@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -57,6 +58,16 @@ int main(void)
     expect(0 == connect(receiver, (const struct sockaddr *)&sender_addr, sizeof(sender_addr)));
 
     expect(4 == sendto(sender, "ping", 4, 0, NULL, 0));
+    {
+      fd_set readfds;
+      struct timeval tv;
+      FD_ZERO(&readfds);
+      FD_SET(receiver, &readfds);
+      tv.tv_sec = 0;
+      tv.tv_usec = 0;
+      expect(1 == select(receiver + 1, &readfds, NULL, NULL, &tv));
+      expect(FD_ISSET(receiver, &readfds));
+    }
     expect(4 == recvfrom(receiver, rx, sizeof(rx), 0, (struct sockaddr *)&peer_addr, &peer_len));
     expect(0 == memcmp(rx, "ping", 4));
     expect(peer_addr.sin_family == AF_INET);

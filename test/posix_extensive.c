@@ -310,6 +310,9 @@ int main(int argc, char *argv[])
     errno = 0;
     expect(-1 == fpathconf(-1, _PC_LINK_MAX));
     expect(errno != 0);
+    errno = 0;
+    expect(-1 == fpathconf(12345, _PC_LINK_MAX));
+    expect(EBADF == errno);
     expect(0 == fclose(f));
     expect(0 == unlink("posix-pathconf.tmp"));
   }
@@ -417,6 +420,7 @@ int main(int argc, char *argv[])
     memset(&val, 0, sizeof(val));
     memset(&old, 0, sizeof(old));
     expect(0 == setitimer(ITIMER_REAL, &val, &old));
+    expect(0 == setitimer(ITIMER_REAL, &val, NULL));
   }
 
   {

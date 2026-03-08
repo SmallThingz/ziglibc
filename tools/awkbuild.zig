@@ -1,5 +1,5 @@
 const std = @import("std");
-const GitRepoStep = @import("../GitRepoStep.zig");
+const GitRepoStep = @import("GitRepoStep.zig");
 
 pub fn addAwk(
     b: *std.Build,
@@ -51,7 +51,8 @@ pub fn addAwk(
     exe.linkLibrary(libc_only_std_static);
     exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // Static helper libraries do not currently propagate system-library
+    // dependencies for downstream executables.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");

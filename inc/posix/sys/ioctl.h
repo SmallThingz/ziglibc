@@ -1,7 +1,7 @@
 #ifndef _SYS_IOCTL_H
 #define _SYS_IOCTL_H
 
-int ioctl(int filedes, int request, ...);
+int ioctl(int filedes, unsigned long request, ...);
 
 // NOTE: this stuff is defined by linux, not posix, but they need
 //       to live in this header

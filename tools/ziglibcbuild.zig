@@ -12,7 +12,6 @@ pub const LibVariant = enum {
 };
 pub const Start = enum {
     ziglibc,
-    glibc,
 };
 pub const ZigLibcOptions = struct {
     variant: LibVariant,
@@ -59,10 +58,6 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
     trace_options.addOption(bool, "enabled", opt.trace);
 
     const modules_options = builder.addOptions();
-    modules_options.addOption(bool, "glibcstart", switch (opt.start) {
-        .glibc => true,
-        else => false,
-    });
     const index = relpath(builder, "src" ++ std.fs.path.sep_str ++ "lib.zig");
     const force_llvm_lld = opt.link == .shared and opt.target.result.os.tag == .linux;
     const lib = switch (opt.link) {

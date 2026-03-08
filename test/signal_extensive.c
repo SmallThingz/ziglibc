@@ -56,6 +56,16 @@ int main(int argc, char *argv[])
     expect(EINVAL == errno);
   }
 #endif
+  {
+    struct sigaction act;
+    struct sigaction old;
+    memset(&act, 0, sizeof(act));
+    memset(&old, 0, sizeof(old));
+    act.sa_handler = test_handler;
+    expect(0 == sigaction(SIGINT, NULL, &old));
+    expect(0 == sigaction(SIGINT, &act, NULL));
+    expect(0 == sigaction(SIGINT, &old, NULL));
+  }
 #else
   expect(signal(SIGINT, test_handler) != SIG_ERR);
 
@@ -70,6 +80,17 @@ int main(int argc, char *argv[])
     expect(0 == sigaction(SIGINT, &act, &old));
     expect(0 == sigaction(SIGINT, &old, &restore));
     expect(restore.sa_handler == test_handler);
+  }
+
+  {
+    struct sigaction act;
+    struct sigaction old;
+    memset(&act, 0, sizeof(act));
+    memset(&old, 0, sizeof(old));
+    act.sa_handler = test_handler;
+    expect(0 == sigaction(SIGINT, NULL, &old));
+    expect(0 == sigaction(SIGINT, &act, NULL));
+    expect(0 == sigaction(SIGINT, &old, NULL));
   }
 #endif
 #if defined(__linux__) || defined(__APPLE__)

@@ -168,9 +168,12 @@ var popen_entries: [c.FOPEN_MAX]PopenEntry = [_]PopenEntry{.{}} ** c.FOPEN_MAX;
 var popen_mutex: std.Thread.Mutex = .{};
 var hostent_state: HostentState = .{};
 
-const windows_socket_base: c_int = 2048;
+// Keep synthetic socket fds inside our exported FD_SETSIZE so callers can use
+// them with FD_SET/FD_ISSET/select on Windows just like regular descriptors.
+const windows_socket_base: c_int = 512;
 const windows_socket_slots = 128;
 const WindowsSocket = std.os.windows.ws2_32.SOCKET;
+const WindowsSelectMode = enum { read, write, err };
 const WindowsSocketEntry = struct {
     used: bool = false,
     socket: WindowsSocket = std.os.windows.ws2_32.INVALID_SOCKET,
@@ -193,6 +196,13 @@ const WinsockRawSendToFn = *const fn (s: WindowsSocket, buf: [*]const u8, len: i
 const WinsockRawRecvFn = *const fn (s: WindowsSocket, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
 const WinsockRawRecvFromFn = *const fn (s: WindowsSocket, buf: [*]u8, len: i32, flags: i32, from: ?*std.os.windows.ws2_32.sockaddr, fromlen: ?*i32) callconv(.winapi) i32;
 const WinsockRawShutdownFn = *const fn (s: WindowsSocket, how: i32) callconv(.winapi) i32;
+const WinsockRawSelectFn = *const fn (
+    nfds: i32,
+    readfds: ?*std.os.windows.ws2_32.fd_set,
+    writefds: ?*std.os.windows.ws2_32.fd_set,
+    exceptfds: ?*std.os.windows.ws2_32.fd_set,
+    timeout: ?*const std.os.windows.ws2_32.timeval,
+) callconv(.winapi) i32;
 // On Windows, calling imported Winsock functions by their plain names from the
 // same image that exports libc symbols such as `socket`, `bind`, `connect`,
 // `recv`, or `shutdown` can self-bind back into our own exports and recurse
@@ -212,6 +222,7 @@ const WinsockApi = struct {
     recv_fn: ?WinsockRawRecvFn = null,
     recvfrom_fn: ?WinsockRawRecvFromFn = null,
     shutdown_fn: ?WinsockRawShutdownFn = null,
+    select_fn: ?WinsockRawSelectFn = null,
 };
 var windows_winsock_api: WinsockApi = .{};
 var windows_winsock_api_once = std.once(struct {
@@ -230,6 +241,7 @@ var windows_winsock_api_once = std.once(struct {
         windows_winsock_api.recv_fn = @ptrCast(winapi.GetProcAddress(module, "recv") orelse return);
         windows_winsock_api.recvfrom_fn = @ptrCast(winapi.GetProcAddress(module, "recvfrom") orelse return);
         windows_winsock_api.shutdown_fn = @ptrCast(winapi.GetProcAddress(module, "shutdown") orelse return);
+        windows_winsock_api.select_fn = @ptrCast(winapi.GetProcAddress(module, "select") orelse return);
     }
 }.init);
 
@@ -278,7 +290,8 @@ fn windowsWinsockReady() bool {
         windows_winsock_api.sendto_fn != null and
         windows_winsock_api.recv_fn != null and
         windows_winsock_api.recvfrom_fn != null and
-        windows_winsock_api.shutdown_fn != null;
+        windows_winsock_api.shutdown_fn != null and
+        windows_winsock_api.select_fn != null;
 }
 
 fn windowsWinsockUnavailable() c_int {
@@ -1738,6 +1751,24 @@ export fn fpathconf(fileds: c_int, name: c_int) callconv(.c) c_long {
         c.errno = errnoConst("EBADF", c.EINVAL);
         return -1;
     }
+    if (builtin.os.tag == .windows) {
+        if (winfd.handleFromFd(fileds) == null) {
+            c.errno = errnoConst("EBADF", c.EINVAL);
+            return -1;
+        }
+    } else {
+        switch (os.errno(os.system.fcntl(fileds, c.F_GETFD, @as(usize, 0)))) {
+            .SUCCESS => {},
+            .BADF => {
+                c.errno = errnoConst("EBADF", c.EINVAL);
+                return -1;
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
     switch (name) {
         c._PC_LINK_MAX => return pathconfLinkMax(),
         else => {
@@ -1917,13 +1948,6 @@ export fn isatty(fd: c_int) callconv(.c) c_int {
             .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
             else => errnoConst("ENOTTY", c.EINVAL),
         };
-        return 0;
-    }
-    if (builtin.os.tag.isDarwin()) {
-        if (fd < 0) {
-            c.errno = errnoConst("EBADF", c.EINVAL);
-            return 0;
-        }
         return 0;
     }
 
@@ -2257,7 +2281,7 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         if (value_ns != 0 and ensureWindowsItimerThread() != 0) return -1;
 
         windows_itimer.mutex.lock();
-        avalue.* = windowsCurrentItimerLocked();
+        if (!cPtrIsNull(avalue)) avalue.* = windowsCurrentItimerLocked();
         if (value_ns == 0) {
             windows_itimer.armed = false;
             windows_itimer.deadline_ns = 0;
@@ -2293,12 +2317,14 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         .setitimer,
         @as(usize, @bitCast(@as(isize, which))),
         @intFromPtr(&linux_new),
-        @intFromPtr(&linux_old),
+        if (!cPtrIsNull(avalue)) @intFromPtr(&linux_old) else 0,
     );
     switch (os.errno(rc)) {
         .SUCCESS => {
-            avalue.it_interval = linuxTimevalToC(linux_old.it_interval);
-            avalue.it_value = linuxTimevalToC(linux_old.it_value);
+            if (!cPtrIsNull(avalue)) {
+                avalue.it_interval = linuxTimevalToC(linux_old.it_interval);
+                avalue.it_value = linuxTimevalToC(linux_old.it_value);
+            }
             return 0;
         },
         else => |e| {
@@ -2357,6 +2383,10 @@ fn darwinSigsetToC(mask: std.c.sigset_t) c.sigset_t {
     return .{ .__signals = @as(c_ulong, @intCast(mask)) };
 }
 
+fn cPtrIsNull(ptr: anytype) bool {
+    return @intFromPtr(ptr) == 0;
+}
+
 export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.c) c_int {
     trace.log("sigaction sig={}", .{sig});
     if (builtin.os.tag == .windows) {
@@ -2364,40 +2394,48 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
     }
     if (builtin.os.tag.isDarwin()) {
         var native_act = std.mem.zeroes(std.c.Sigaction);
-        native_act.mask = cSigsetToDarwin(act.sa_mask);
-        native_act.flags = @as(c_uint, @bitCast(act.sa_flags));
-        if ((native_act.flags & std.c.SA.SIGINFO) != 0) {
-            native_act.handler.sigaction = if (act.sa_sigaction) |f|
-                @as(?std.c.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
-            else
-                null;
-        } else {
-            native_act.handler.handler = if (act.sa_handler) |h|
-                @as(?std.c.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
-            else
-                null;
-        }
+        const native_act_ptr: ?*std.c.Sigaction = if (!cPtrIsNull(act)) blk: {
+            const new_act = act;
+            native_act.mask = cSigsetToDarwin(new_act.sa_mask);
+            native_act.flags = @as(c_uint, @bitCast(new_act.sa_flags));
+            if ((native_act.flags & std.c.SA.SIGINFO) != 0) {
+                native_act.handler.sigaction = if (new_act.sa_sigaction) |f|
+                    @as(?std.c.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
+                else
+                    null;
+            } else {
+                native_act.handler.handler = if (new_act.sa_handler) |h|
+                    @as(?std.c.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
+                else
+                    null;
+            }
+            break :blk &native_act;
+        } else null;
 
         var native_old = std.mem.zeroes(std.c.Sigaction);
-        const rc = syscall(darwin_syscall.sigaction, sig, &native_act, &native_old);
+        const native_old_ptr: ?*std.c.Sigaction = if (!cPtrIsNull(oact)) &native_old else null;
+        const rc = syscall(darwin_syscall.sigaction, sig, native_act_ptr, native_old_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
         }
-        oact.sa_mask = darwinSigsetToC(native_old.mask);
-        oact.sa_flags = @as(c_int, @bitCast(native_old.flags));
-        if ((native_old.flags & std.c.SA.SIGINFO) != 0) {
-            oact.sa_sigaction = if (native_old.handler.sigaction) |f|
-                @as(@TypeOf(oact.sa_sigaction), @ptrFromInt(@intFromPtr(f)))
-            else
-                null;
-            oact.sa_handler = null;
-        } else {
-            oact.sa_handler = if (native_old.handler.handler) |h|
-                @as(@TypeOf(oact.sa_handler), @ptrFromInt(@intFromPtr(h)))
-            else
-                null;
-            oact.sa_sigaction = null;
+        if (!cPtrIsNull(oact)) {
+            const old_act = oact;
+            old_act.sa_mask = darwinSigsetToC(native_old.mask);
+            old_act.sa_flags = @as(c_int, @bitCast(native_old.flags));
+            if ((native_old.flags & std.c.SA.SIGINFO) != 0) {
+                old_act.sa_sigaction = if (native_old.handler.sigaction) |f|
+                    @as(@TypeOf(old_act.sa_sigaction), @ptrFromInt(@intFromPtr(f)))
+                else
+                    null;
+                old_act.sa_handler = null;
+            } else {
+                old_act.sa_handler = if (native_old.handler.handler) |h|
+                    @as(@TypeOf(old_act.sa_handler), @ptrFromInt(@intFromPtr(h)))
+                else
+                    null;
+                old_act.sa_sigaction = null;
+            }
         }
         return 0;
     }
@@ -2410,31 +2448,43 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
         return -1;
     }
 
-    const flags_bits: c_uint = @bitCast(act.sa_flags);
-    var linux_act = std.os.linux.Sigaction{
-        .handler = undefined,
-        .mask = cSigsetToLinux(act.sa_mask),
-        .flags = @as(@TypeOf(@as(std.os.linux.Sigaction, undefined).flags), @intCast(flags_bits)),
-    };
-    if ((flags_bits & std.os.linux.SA.SIGINFO) != 0) {
-        linux_act.handler = .{ .sigaction = cSigactionToLinux(act.sa_sigaction) };
-    } else {
-        linux_act.handler = .{ .handler = cHandlerToLinux(act.sa_handler) };
-    }
+    var linux_act: std.os.linux.Sigaction = undefined;
+    const linux_act_ptr: ?*std.os.linux.Sigaction = if (!cPtrIsNull(act)) blk: {
+        const new_act = act;
+        const flags_bits: c_uint = @bitCast(new_act.sa_flags);
+        linux_act = .{
+            .handler = undefined,
+            .mask = cSigsetToLinux(new_act.sa_mask),
+            .flags = @as(@TypeOf(@as(std.os.linux.Sigaction, undefined).flags), @intCast(flags_bits)),
+        };
+        if ((flags_bits & std.os.linux.SA.SIGINFO) != 0) {
+            linux_act.handler = .{ .sigaction = cSigactionToLinux(new_act.sa_sigaction) };
+        } else {
+            linux_act.handler = .{ .handler = cHandlerToLinux(new_act.sa_handler) };
+        }
+        break :blk &linux_act;
+    } else null;
 
     var linux_old: std.os.linux.Sigaction = undefined;
-    const rc = std.os.linux.sigaction(@as(u8, @intCast(sig)), &linux_act, &linux_old);
+    const rc = std.os.linux.sigaction(
+        @as(u8, @intCast(sig)),
+        linux_act_ptr,
+        if (!cPtrIsNull(oact)) &linux_old else null,
+    );
     switch (os.errno(rc)) {
         .SUCCESS => {
-            const old_flags_bits: c_uint = @truncate(@as(usize, @intCast(linux_old.flags)));
-            oact.sa_flags = @as(c_int, @bitCast(old_flags_bits));
-            oact.sa_mask = linuxSigsetToC(linux_old.mask);
-            if ((old_flags_bits & std.os.linux.SA.SIGINFO) != 0) {
-                oact.sa_sigaction = linuxSigactionToC(linux_old.handler.sigaction);
-                oact.sa_handler = null;
-            } else {
-                oact.sa_handler = linuxHandlerToC(linux_old.handler.handler);
-                oact.sa_sigaction = null;
+            if (!cPtrIsNull(oact)) {
+                const old_act = oact;
+                const old_flags_bits: c_uint = @truncate(@as(usize, @intCast(linux_old.flags)));
+                old_act.sa_flags = @as(c_int, @bitCast(old_flags_bits));
+                old_act.sa_mask = linuxSigsetToC(linux_old.mask);
+                if ((old_flags_bits & std.os.linux.SA.SIGINFO) != 0) {
+                    old_act.sa_sigaction = linuxSigactionToC(linux_old.handler.sigaction);
+                    old_act.sa_handler = null;
+                } else {
+                    old_act.sa_handler = linuxHandlerToC(linux_old.handler.handler);
+                    old_act.sa_sigaction = null;
+                }
             }
             return 0;
         },
@@ -3054,19 +3104,61 @@ fn windowsHandleWritable(handle: std.os.windows.HANDLE) ?bool {
     }
 }
 
-fn windowsSelectScanSet(comptime mode: enum { read, write, err }, nfds: c_int, fdset: *c.fd_set) ?c_int {
+fn windowsSocketReady(sock: WindowsSocket, comptime mode: WindowsSelectMode) ?bool {
+    ensureWindowsSockets();
+    if (!windowsWinsockReady()) {
+        c.errno = errnoConst("ENOSYS", c.EINVAL);
+        return null;
+    }
+    var read_set = std.mem.zeroes(std.os.windows.ws2_32.fd_set);
+    var write_set = std.mem.zeroes(std.os.windows.ws2_32.fd_set);
+    var err_set = std.mem.zeroes(std.os.windows.ws2_32.fd_set);
+    switch (mode) {
+        .read => {
+            read_set.fd_count = 1;
+            read_set.fd_array[0] = sock;
+        },
+        .write => {
+            write_set.fd_count = 1;
+            write_set.fd_array[0] = sock;
+        },
+        .err => {
+            err_set.fd_count = 1;
+            err_set.fd_array[0] = sock;
+        },
+    }
+    const zero_timeout = std.os.windows.ws2_32.timeval{ .sec = 0, .usec = 0 };
+    const rc = windows_winsock_api.select_fn.?(
+        0,
+        if (mode == .read) &read_set else null,
+        if (mode == .write) &write_set else null,
+        if (mode == .err) &err_set else null,
+        &zero_timeout,
+    );
+    if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+        c.errno = windowsSocketErrno();
+        return null;
+    }
+    return rc != 0;
+}
+
+fn windowsSelectScanSet(comptime mode: WindowsSelectMode, nfds: c_int, fdset: *c.fd_set) ?c_int {
     var ready_count: c_int = 0;
     var fd: c_int = 0;
     while (fd < nfds) : (fd += 1) {
         if (FD_ISSET(fd, fdset) == 0) continue;
-        const handle = winfd.handleFromFd(fd) orelse {
-            c.errno = errnoConst("EBADF", c.EINVAL);
-            return null;
-        };
-        const is_ready = switch (mode) {
-            .read => windowsHandleReadable(handle),
-            .write => windowsHandleWritable(handle),
-            .err => false,
+        const is_ready = if (windowsSocketFromFd(fd)) |sock|
+            windowsSocketReady(sock, mode)
+        else blk: {
+            const handle = winfd.handleFromFd(fd) orelse {
+                c.errno = errnoConst("EBADF", c.EINVAL);
+                return null;
+            };
+            break :blk switch (mode) {
+                .read => windowsHandleReadable(handle),
+                .write => windowsHandleWritable(handle),
+                .err => false,
+            };
         };
         if (is_ready == null) return null;
         if (is_ready.?) {

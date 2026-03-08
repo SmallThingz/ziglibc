@@ -8,7 +8,7 @@
 - `zig build test` passes on:
   - Linux native
   - macOS targets executed through `darling`
-  - Windows GNU targets executed through `wineconsole`
+  - Windows GNU targets executed through `wine`
 - `zig build conformance` passes on the same matrix.
 - The in-tree parity runner compares ziglibc and the platform libc for the validated matrix on:
   - process execution (`system`, `popen`, `pclose`)
@@ -66,7 +66,7 @@ zig build re-tests
 On a Linux host, the build uses external runners for foreign test execution:
 
 - Darwin targets: `darling`
-- Windows GNU targets: `wineconsole`
+- Windows GNU targets: `wine`
 
 Examples:
 

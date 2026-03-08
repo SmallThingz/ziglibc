@@ -1,6 +1,6 @@
 const std = @import("std");
-const GitRepoStep = @import("../GitRepoStep.zig");
-const ProcessFileStep = @import("../ProcessFileStep.zig");
+const GitRepoStep = @import("../tools/GitRepoStep.zig");
+const ProcessFileStep = @import("../tools/ProcessFileStep.zig");
 const filecheck = @import("../tools/filecheck.zig");
 
 const NcursesPrepStep = struct {
@@ -41,10 +41,8 @@ const NcursesPrepStep = struct {
     //}
 
     fn generateNcursesDefH(self: NcursesPrepStep) !void {
-        // TODO: use bash on include/MKncurses_def.sh
-        //       they use awk, I don't think there's any reason we
-        //       couldn't use awk as well.  We should be able to get awk
-        //       working on any platform/OS.
+        // Keep this local header generation in Zig so it stays host-independent
+        // and does not depend on shell tools during the build.
         if (try filecheck.leftFileIsNewer(self.defs_h_dst, self.defs_h_src))
             return;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -175,7 +173,8 @@ pub fn add(
     //exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
     //exe.linkLibrary(zig_gnu);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // Static helper libraries do not currently propagate system-library
+    // dependencies for downstream executables.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");

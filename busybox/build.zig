@@ -1,5 +1,5 @@
 const std = @import("std");
-const GitRepoStep = @import("../GitRepoStep.zig");
+const GitRepoStep = @import("../tools/GitRepoStep.zig");
 
 const BusyboxPrepStep = struct {
     step: std.Build.Step,
@@ -25,7 +25,6 @@ const BusyboxPrepStep = struct {
         const self: *BusyboxPrepStep = @fieldParentPtr("step", step);
         const b = self.builder;
 
-        std.log.warn("TODO: check config file timestamp to prevent unnecessary copy", .{});
         var src_dir = try std.fs.cwd().openDir(b.pathJoin(&.{ b.build_root.path.?, "busybox" }), .{});
         defer src_dir.close();
         var dst_dir = try std.fs.cwd().openDir(self.repo_path, .{});
@@ -75,7 +74,8 @@ pub fn add(
     exe.linkLibrary(libc_only_std_static);
     //exe.linkLibrary(zig_start);
     exe.linkLibrary(zig_posix);
-    // TODO: should libc_only_std_static and zig_start be able to add library dependencies?
+    // Static helper libraries do not currently propagate system-library
+    // dependencies for downstream executables.
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ntdll");
         exe.linkSystemLibrary("kernel32");

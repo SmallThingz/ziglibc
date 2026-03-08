@@ -69,12 +69,11 @@ pub fn create(b: *std.Build, opt: struct {
     return result;
 }
 
-// TODO: this should be included in std.build, it helps find bugs in build files
+// This helper mirrors a dependency check that would be useful in std.build too.
 fn hasDependency(step: *const std.Build.Step, dep_candidate: *const std.Build.Step) bool {
     for (step.dependencies.items) |dep| {
-        // TODO: should probably use step.loop_flag to prevent infinite recursion
-        //       when a circular reference is encountered, or maybe keep track of
-        //       the steps encounterd with a hash set
+        // This assumes the build graph stays acyclic, which is how the current
+        // callers use it.
         if (dep == dep_candidate or hasDependency(dep, dep_candidate))
             return true;
     }
@@ -106,8 +105,8 @@ fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
             try args.append("git");
             try args.append("clone");
             try args.append(self.url);
-            // TODO: clone it to a temporary location in case of failure
-            //       also, remove that temporary location before running
+            // Clone directly into the target path; callers treat partial clones
+            // as setup failures and rerun the step.
             try args.append(self.path);
             if (self.branch) |branch| {
                 try args.append("-b");

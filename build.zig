@@ -1,7 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const GitRepoStep = @import("GitRepoStep.zig");
-const libcbuild = @import("ziglibcbuild.zig");
+const GitRepoStep = @import("tools/GitRepoStep.zig");
+const libcbuild = @import("tools/ziglibcbuild.zig");
 const luabuild = @import("tools/luabuild.zig");
 const awkbuild = @import("tools/awkbuild.zig");
 const gnumakebuild = @import("tools/gnumakebuild.zig");
@@ -95,28 +95,16 @@ fn addRunArtifactCompat(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.
                 \\  p="${p//\//\\}"
                 \\  printf 'Z:%s' "$p"
                 \\}
-                \\bat="$(mktemp --suffix=.bat)"
-                \\out="$(mktemp)"
                 \\win_exe="$(to_win "$abs")"
-                \\win_out="$(to_win "$out")"
-                \\{
-                \\  printf '@echo off\r\n'
-                \\  printf '"%s"' "$win_exe"
-                \\  for arg in "${mapped[@]}"; do
-                \\    if [ -e "$arg" ]; then
-                \\      arg="$(to_win "$arg")"
-                \\    fi
-                \\    arg="${arg//\"/\"\"}"
-                \\    printf ' "%s"' "$arg"
-                \\  done
-                \\  printf ' > "%s"\r\n' "$win_out"
-                \\  printf 'exit /b %%ERRORLEVEL%%\r\n'
-                \\} > "$bat"
-                \\WINEDEBUG="${WINEDEBUG:--all}" wineconsole "$(to_win "$bat")"
-                \\rc=$?
-                \\cat "$out"
-                \\rm -f "$bat" "$out"
-                \\exit "$rc"
+                \\argv=("$win_exe")
+                \\for arg in "${mapped[@]}"; do
+                \\  if [ -e "$arg" ]; then
+                \\    argv+=("$(to_win "$arg")")
+                \\  else
+                \\    argv+=("$arg")
+                \\  fi
+                \\done
+                \\WINEDEBUG="${WINEDEBUG:--all}" wine "${argv[@]}"
                 ,
                 "_",
             });
