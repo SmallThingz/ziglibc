@@ -604,7 +604,7 @@ export fn ldiv(numer: c_long, denom: c_long) callconv(.c) c.ldiv_t {
 }
 
 export fn atof(nptr: [*:0]const u8) callconv(.c) f64 {
-    return strtod(nptr, null);
+    return _zstrtod(nptr, null);
 }
 
 export fn atoi(nptr: [*:0]const u8) callconv(.c) c_int {
@@ -951,12 +951,29 @@ export fn strtok(s1: ?[*:0]u8, s2: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     return start;
 }
 
-fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8, optional_base: c_int) T {
+fn charToDigitBase(ch: u8, base: u8) ?u8 {
+    const digit: u8 = if (ch >= '0' and ch <= '9')
+        ch - '0'
+    else if (ch >= 'a' and ch <= 'z')
+        ch - 'a' + 10
+    else if (ch >= 'A' and ch <= 'Z')
+        ch - 'A' + 10
+    else
+        return null;
+    if (digit >= base) return null;
+    return digit;
+}
+
+inline fn isWhitespaceByte(ch: u8) bool {
+    return ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t' or ch == '\x0b' or ch == '\x0c';
+}
+
+fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: [*c][*:0]const u8, optional_base: c_int) T {
     var next = str;
     const no_digit_end = str;
 
     // skip whitespace
-    while (isspace(next[0]) != 0) : (next += 1) {}
+    while (isWhitespaceByte(next[0])) : (next += 1) {}
     const start = next;
 
     const sign: enum { pos, neg } = blk: {
@@ -971,7 +988,7 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
     const base = blk: {
         if (optional_base != 0) {
             if (optional_base > 36) {
-                if (optional_endptr) |endptr| endptr.* = next;
+                if (optional_endptr != null) optional_endptr[0] = next;
                 errno = c.EINVAL;
                 return 0;
             }
@@ -997,16 +1014,12 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
     while (true) : (next += 1) {
         const ch = next[0];
         if (ch == 0) break;
-        const digit = std.math.cast(T, std.fmt.charToDigit(ch, base) catch break) orelse {
-            if (optional_endptr) |endptr| endptr.* = next;
-            errno = c.ERANGE;
-            return 0;
-        };
+        const digit: T = @intCast(charToDigitBase(ch, base) orelse break);
         if (x != 0) x = std.math.mul(T, x, std.math.cast(T, base) orelse {
             errno = c.EINVAL;
             return 0;
         }) catch {
-            if (optional_endptr) |endptr| endptr.* = next;
+            if (optional_endptr != null) optional_endptr[0] = next;
             errno = c.ERANGE;
             return switch (sign) {
                 .neg => std.math.minInt(T),
@@ -1015,7 +1028,7 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
         };
         x = switch (sign) {
             .pos => std.math.add(T, x, digit) catch {
-                if (optional_endptr) |endptr| endptr.* = next + 1;
+                if (optional_endptr != null) optional_endptr[0] = next + 1;
                 errno = c.ERANGE;
                 return switch (sign) {
                     .neg => std.math.minInt(T),
@@ -1023,7 +1036,7 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
                 };
             },
             .neg => std.math.sub(T, x, digit) catch {
-                if (optional_endptr) |endptr| endptr.* = next + 1;
+                if (optional_endptr != null) optional_endptr[0] = next + 1;
                 errno = c.ERANGE;
                 return switch (sign) {
                     .neg => std.math.minInt(T),
@@ -1037,23 +1050,19 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: ?*[*:0]const u8,
         if (builtin.os.tag.isDarwin()) {
             errno = c.EINVAL;
         }
-        if (optional_endptr) |endptr| endptr.* = no_digit_end;
+        if (optional_endptr != null) optional_endptr[0] = no_digit_end;
     } else {
-        if (optional_endptr) |endptr| endptr.* = next;
+        if (optional_endptr != null) optional_endptr[0] = next;
         trace.log("strto str='{s}' result={}", .{ start[0 .. @intFromPtr(next) - @intFromPtr(start)], x });
     }
     return x;
 }
 
-export fn strtod(nptr: [*:0]const u8, endptr: ?*[*:0]const u8) callconv(.c) f64 {
+fn _zstrtod(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque) callconv(.c) f64 {
+    const endptr: [*c][*:0]const u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
     trace.log("strtod {f}", .{trace.fmtStr(nptr)});
     var i: usize = 0;
-    while (true) : (i += 1) {
-        switch (nptr[i]) {
-            ' ', '\t', '\n', '\r', '\x0b', '\x0c' => {},
-            else => break,
-        }
-    }
+    while (isWhitespaceByte(nptr[i])) : (i += 1) {}
     const token_start = i;
     if (nptr[i] == '+' or nptr[i] == '-') i += 1;
 
@@ -1080,39 +1089,59 @@ export fn strtod(nptr: [*:0]const u8, endptr: ?*[*:0]const u8) callconv(.c) f64 
     }
 
     if (!saw_digit or token_start == i) {
-        if (endptr) |ep| ep.* = nptr;
+        if (endptr != null) endptr[0] = nptr;
         return 0;
     }
 
-    if (endptr) |ep| ep.* = nptr + i;
+    if (endptr != null) endptr[0] = nptr + i;
 
     const result = std.fmt.parseFloat(f64, nptr[token_start..i]) catch |err| switch (err) {
         error.InvalidCharacter => {
-            if (endptr) |ep| ep.* = nptr;
+            if (endptr != null) endptr[0] = nptr;
             return 0;
         },
     };
     return result;
 }
 
-export fn strtol(nptr: [*:0]const u8, endptr: ?*[*:0]const u8, base: c_int) callconv(.c) c_long {
+fn _zstrtol(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_long {
+    const endptr: [*c][*:0]const u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
     trace.log("strtol {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
     return strto(c_long, nptr, endptr, base);
 }
 
-export fn strtoll(nptr: [*:0]const u8, endptr: ?*[*:0]const u8, base: c_int) callconv(.c) c_longlong {
+fn _zstrtoll(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_longlong {
+    const endptr: [*c][*:0]const u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
     trace.log("strtoll {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
     return strto(c_longlong, nptr, endptr, base);
 }
 
-export fn strtoul(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) callconv(.c) c_ulong {
+fn _zstrtoul(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_ulong {
+    const endptr: [*c][*:0]u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
     trace.log("strtoul {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
     return strto(c_ulong, nptr, @ptrCast(endptr), base);
 }
 
-export fn strtoull(nptr: [*:0]const u8, endptr: ?*[*:0]u8, base: c_int) callconv(.c) c_ulonglong {
+fn _zstrtoull(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_ulonglong {
+    const endptr: [*c][*:0]u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
     trace.log("strtoull {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
     return strto(c_ulonglong, nptr, @ptrCast(endptr), base);
+}
+
+comptime {
+    if (builtin.target.ofmt == .coff) {
+        @export(&_zstrtod, .{ .name = "_zstrtod" });
+        @export(&_zstrtol, .{ .name = "_zstrtol" });
+        @export(&_zstrtoll, .{ .name = "_zstrtoll" });
+        @export(&_zstrtoul, .{ .name = "_zstrtoul" });
+        @export(&_zstrtoull, .{ .name = "_zstrtoull" });
+    } else {
+        @export(&_zstrtod, .{ .name = "_zstrtod", .visibility = .hidden });
+        @export(&_zstrtol, .{ .name = "_zstrtol", .visibility = .hidden });
+        @export(&_zstrtoll, .{ .name = "_zstrtoll", .visibility = .hidden });
+        @export(&_zstrtoul, .{ .name = "_zstrtoul", .visibility = .hidden });
+        @export(&_zstrtoull, .{ .name = "_zstrtoull", .visibility = .hidden });
+    }
 }
 
 fn errnoMessage(errnum: c_int, comptime name: []const u8, comptime msg: []const u8) ?[*:0]const u8 {

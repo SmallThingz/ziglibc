@@ -46,6 +46,7 @@ const cstd = struct {
         errorfds: ?*c.fd_set,
         timeout: ?*c.timeval,
     ) callconv(.c) c_int;
+    extern fn _zdarwin_access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int;
     extern fn _zdarwin_pselect(
         nfds: c_int,
         readfds: ?*c.fd_set,
@@ -194,6 +195,17 @@ export var opterr: c_int = 1;
 export var optind: c_int = 1;
 export var optopt: c_int = 0;
 var optchar_index: c_int = 1;
+
+const GnuOption = extern struct {
+    name: ?[*:0]const u8,
+    has_arg: c_int,
+    flag: ?*c_int,
+    val: c_int,
+};
+
+const gnu_no_argument: c_int = 0;
+const gnu_required_argument: c_int = 1;
+const gnu_optional_argument: c_int = 2;
 var fallback_umask: c.mode_t = 0o022;
 var fallback_umask_mutex: SpinLock = .{};
 var dirname_dot: [2:0]u8 = [_:0]u8{'.', 0};
@@ -468,7 +480,7 @@ fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) b
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
-export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
+export fn getopt(argc: c_int, argv: [*c][*:0]u8, optstring: [*:0]const u8) callconv(.c) c_int {
     optarg = null;
     if (optind < 1) {
         optind = 1;
@@ -486,7 +498,8 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         trace.log("getopt return -1", .{});
         return -1;
     }
-    var arg = argv[@as(usize, @intCast(optind))];
+    const argv_items: [*][*:0]u8 = @ptrCast(argv);
+    var arg = argv_items[@as(usize, @intCast(optind))];
     if (optchar_index <= 1) {
         if (arg[0] != '-' or arg[1] == 0) {
             // Stop option parsing when we reach a non-option argument.
@@ -508,7 +521,7 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
     }
 
     const opt_ch = arg[arg_idx];
-    const result = c.strchr(optstring, opt_ch) orelse {
+    const result_index = cStringFindChar(optstring, opt_ch) orelse {
         const next_idx = arg_idx + 1;
         if (arg[next_idx] == 0) {
             optind += 1;
@@ -519,6 +532,7 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         optopt = @as(c_int, opt_ch);
         return '?';
     };
+    const result = optstring + result_index;
 
     const takes_arg = result[1] == ':';
     if (takes_arg) {
@@ -543,7 +557,7 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
             return if (optstring[0] == ':') ':' else '?';
         }
         optind += 1;
-        arg = argv[@as(usize, @intCast(optind))];
+        arg = argv_items[@as(usize, @intCast(optind))];
         optarg = @ptrCast(arg);
         optind += 1;
         optchar_index = 1;
@@ -557,6 +571,155 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
         optchar_index += 1;
     }
     return @as(c_int, opt_ch);
+}
+
+fn gnuLongOptionNameLen(name: [*:0]const u8) usize {
+    var i: usize = 0;
+    while (name[i] != 0 and name[i] != '=') : (i += 1) {}
+    return i;
+}
+
+fn cStringFindChar(s: [*:0]const u8, ch: u8) ?usize {
+    var i: usize = 0;
+    while (s[i] != 0) : (i += 1) {
+        if (s[i] == ch) return i;
+    }
+    return null;
+}
+
+fn cStringEqPrefixAndExactLen(lhs: [*:0]const u8, rhs: [*:0]const u8, prefix_len: usize) bool {
+    var i: usize = 0;
+    while (i < prefix_len) : (i += 1) {
+        if (lhs[i] != rhs[i]) return false;
+    }
+    return rhs[prefix_len] == 0;
+}
+
+fn gnuGetoptLongCommon(
+    argc: c_int,
+    argv: [*c][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*]const GnuOption,
+    longindex: ?*c_int,
+    long_only: bool,
+) c_int {
+    optarg = null;
+    if (optind < 1) optind = 1;
+    if (optind >= argc) return -1;
+
+    const argv_items: [*][*:0]u8 = @ptrCast(argv);
+    const current = argv_items[@intCast(optind)];
+    const long_name: [*:0]const u8 = blk: {
+        if (current[0] == '-' and current[1] == '-') {
+            if (current[2] == 0) {
+                optind += 1;
+                return -1;
+            }
+            break :blk current + 2;
+        }
+        if (long_only and current[0] == '-' and current[1] != 0 and current[1] != '-') {
+            break :blk current + 1;
+        }
+        return getopt(argc, argv, optstring);
+    };
+
+    const name_len = gnuLongOptionNameLen(long_name);
+    const inline_value: ?[*:0]u8 = if (long_name[name_len] == '=')
+        @constCast(@as([*:0]const u8, long_name + name_len + 1))
+    else
+        null;
+
+    var i: usize = 0;
+    while (longopts[i].name != null) : (i += 1) {
+        const opt = longopts[i];
+        const opt_name = opt.name.?;
+        if (!cStringEqPrefixAndExactLen(long_name, opt_name, name_len)) continue;
+
+        if (longindex) |out_index| out_index.* = @intCast(i);
+
+        switch (opt.has_arg) {
+            gnu_no_argument => {
+                if (inline_value != null) {
+                    optind += 1;
+                    return '?';
+                }
+                optarg = null;
+            },
+            gnu_required_argument => {
+                if (inline_value) |value| {
+                    optarg = value;
+                } else if (optind + 1 < argc) {
+                    optind += 1;
+                    optarg = argv_items[@intCast(optind)];
+                } else {
+                    optind += 1;
+                    return if (optstring[0] == ':') ':' else '?';
+                }
+            },
+            gnu_optional_argument => {
+                optarg = inline_value;
+            },
+            else => {
+                c.errno = c.EINVAL;
+                optind += 1;
+                return '?';
+            },
+        }
+
+        optind += 1;
+        if (opt.flag) |flag| {
+            flag.* = opt.val;
+            return 0;
+        }
+        return opt.val;
+    }
+
+    if (long_only and current[0] == '-' and current[1] != 0 and current[1] != '-') {
+        return getopt(argc, argv, optstring);
+    }
+
+    optind += 1;
+    return '?';
+}
+
+export fn __ziglibc_getopt_long(
+    argc: c_int,
+    argv: [*c][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*]const GnuOption,
+    longindex: ?*c_int,
+) callconv(.c) c_int {
+    return gnuGetoptLongCommon(argc, argv, optstring, longopts, longindex, false);
+}
+
+export fn getopt_long(
+    argc: c_int,
+    argv: [*c][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*]const GnuOption,
+    longindex: ?*c_int,
+) callconv(.c) c_int {
+    return __ziglibc_getopt_long(argc, argv, optstring, longopts, longindex);
+}
+
+export fn __ziglibc_getopt_long_only(
+    argc: c_int,
+    argv: [*c][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*]const GnuOption,
+    longindex: ?*c_int,
+) callconv(.c) c_int {
+    return gnuGetoptLongCommon(argc, argv, optstring, longopts, longindex, true);
+}
+
+export fn getopt_long_only(
+    argc: c_int,
+    argv: [*c][*:0]u8,
+    optstring: [*:0]const u8,
+    longopts: [*]const GnuOption,
+    longindex: ?*c_int,
+) callconv(.c) c_int {
+    return __ziglibc_getopt_long_only(argc, argv, optstring, longopts, longindex);
 }
 
 fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
@@ -920,6 +1083,21 @@ export fn readv(fd: c_int, iov: [*]const c.struct_iovec, iovcnt: c_int) callconv
         c.errno = c.EINVAL;
         return -1;
     }
+    if (builtin.os.tag == .linux) {
+        const count: usize = @intCast(iovcnt);
+        const native_iov: [*]const os.iovec = @ptrCast(iov);
+        while (true) {
+            const rc = os.system.readv(fd, native_iov, @min(count, os.IOV_MAX));
+            switch (os.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                else => |e| {
+                    c.errno = @intFromEnum(e);
+                    return -1;
+                },
+            }
+        }
+    }
     var total: usize = 0;
     var index: usize = 0;
     const count: usize = @intCast(iovcnt);
@@ -942,6 +1120,21 @@ export fn writev(fd: c_int, iov: [*]const c.struct_iovec, iovcnt: c_int) callcon
     if (iovcnt < 0) {
         c.errno = c.EINVAL;
         return -1;
+    }
+    if (builtin.os.tag == .linux) {
+        const count: usize = @intCast(iovcnt);
+        const native_iov: [*]const os.iovec_const = @ptrCast(iov);
+        while (true) {
+            const rc = os.system.writev(fd, native_iov, @min(count, os.IOV_MAX));
+            switch (os.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                else => |e| {
+                    c.errno = @intFromEnum(e);
+                    return -1;
+                },
+            }
+        }
     }
     var total: usize = 0;
     var index: usize = 0;
@@ -1290,17 +1483,10 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
             c.errno = c.EINVAL;
             return -1;
         }
-        // Do not route Darwin `access()` through open/fstat or Zig std's libc
-        // bindings. On native Apple Silicon that self-bound back into our own
-        // exported entry points and only showed up outside Darling.
-        const rc = syscall(darwin_syscall.access, path, darwinSysSigned(amode));
-        switch (os.errno(rc)) {
-            .SUCCESS => return 0,
-            else => |e| {
-                c.errno = @intFromEnum(e);
-                return -1;
-            },
-        }
+        // Keep Darwin `access()` on a fixed-arity shim instead of the generic
+        // variadic syscall bridge. Native Apple Silicon and Darling have both
+        // shown that this boundary is more brittle than plain integer syscalls.
+        return cstd._zdarwin_access(path, amode);
     }
     const mode: u32 = @intCast(amode);
     std.posix.accessZ(path, mode) catch |err| {
@@ -2313,11 +2499,6 @@ fn cTimespecToTimeval(ts: c.timespec) ?c.timeval {
     };
 }
 
-fn windowsMonotonicNs() u64 {
-    const now = std.time.Instant.now() catch return @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
-    return now.since(now) + @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
-}
-
 fn windowsTimevalToFileTime(tv: c.timeval) ?std.os.windows.FILETIME {
     if (!cTimevalIsValid(tv)) return null;
     const sec_100ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_sec)), 10_000_000) catch return null;
@@ -2340,6 +2521,13 @@ const WindowsItimerState = struct {
 };
 
 var windows_itimer: WindowsItimerState = .{};
+const DarwinTimebaseState = struct {
+    initialized: AtomicFlag = AtomicFlag.init(0),
+    lock: SpinLock = .{},
+    numer: u32 = 0,
+    denom: u32 = 0,
+};
+var darwin_timebase: DarwinTimebaseState = .{};
 const DarwinItimerState = struct {
     mutex: std.Thread.Mutex = .{},
     value: c.itimerval = std.mem.zeroes(c.itimerval),
@@ -2408,32 +2596,50 @@ fn timespecNsec(ts: os.timespec) i64 {
     return @as(i64, @intCast(ts.nsec));
 }
 
-fn _zclock_gettime(clk_id: c.clockid_t, parts: [*]c_longlong) callconv(.c) c_int {
+fn ensureDarwinTimebase() ?struct { numer: u32, denom: u32 } {
+    if (darwin_timebase.initialized.load(.acquire) != 0) {
+        return .{ .numer = darwin_timebase.numer, .denom = darwin_timebase.denom };
+    }
+    darwin_timebase.lock.lock();
+    defer darwin_timebase.lock.unlock();
+    if (darwin_timebase.initialized.load(.monotonic) == 0) {
+        var timebase: std.c.mach_timebase_info_data = undefined;
+        if (darwin.mach_timebase_info(&timebase) != 0 or timebase.denom == 0) {
+            c.errno = c.EINVAL;
+            return null;
+        }
+        darwin_timebase.numer = timebase.numer;
+        darwin_timebase.denom = timebase.denom;
+        darwin_timebase.initialized.store(1, .release);
+    }
+    return .{ .numer = darwin_timebase.numer, .denom = darwin_timebase.denom };
+}
+
+export fn clock_gettime(clk_id: c.clockid_t, tp: *c.timespec) callconv(.c) c_int {
     if (builtin.os.tag.isDarwin()) {
         if (clk_id == c.CLOCK_REALTIME) {
             var tv: c.timeval = undefined;
             if (gettimeofday(&tv, @as(?*anyopaque, null)) != 0) {
                 return -1;
             }
-            parts[0] = @as(c_longlong, @intCast(tv.tv_sec));
-            parts[1] = @as(c_longlong, @intCast(tv.tv_usec * 1000));
+            tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(tv.tv_sec));
+            tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(tv.tv_usec * 1000));
             return 0;
         }
 
         const monotonic_id: c.clockid_t = @as(c.clockid_t, @intCast(@intFromEnum(os.CLOCK.MONOTONIC)));
         if (clk_id == monotonic_id) {
-            var timebase: std.c.mach_timebase_info_data = undefined;
-            if (darwin.mach_timebase_info(&timebase) != 0 or timebase.denom == 0) {
-                c.errno = c.EINVAL;
-                return -1;
-            }
+            // Cache Darwin's monotonic timebase in libc. The kernel ratio is
+            // stable for the process lifetime, and re-querying it on every
+            // clock_gettime(CLOCK_MONOTONIC) call is pure overhead.
+            const timebase = ensureDarwinTimebase() orelse return -1;
             const ticks = darwin.mach_absolute_time();
             const nanos: u128 = @divFloor(
                 @as(u128, ticks) * @as(u128, timebase.numer),
                 @as(u128, timebase.denom),
             );
-            parts[0] = @as(c_longlong, @intCast(@divFloor(nanos, std.time.ns_per_s)));
-            parts[1] = @as(c_longlong, @intCast(@mod(nanos, std.time.ns_per_s)));
+            tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(@divFloor(nanos, std.time.ns_per_s)));
+            tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(@mod(nanos, std.time.ns_per_s)));
             return 0;
         }
 
@@ -2444,8 +2650,8 @@ fn _zclock_gettime(clk_id: c.clockid_t, parts: [*]c_longlong) callconv(.c) c_int
     if (builtin.os.tag == .windows) {
         if (clk_id == c.CLOCK_REALTIME) {
             const now = currentWindowsUnixTime();
-            parts[0] = @as(c_longlong, @intCast(now.sec));
-            parts[1] = @as(c_longlong, @intCast(now.nsec));
+            tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(now.sec));
+            tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(now.nsec));
             return 0;
         }
         c.errno = c.EINVAL;
@@ -2456,8 +2662,8 @@ fn _zclock_gettime(clk_id: c.clockid_t, parts: [*]c_longlong) callconv(.c) c_int
     const posix_clk_id: os.clockid_t = @enumFromInt(@as(u32, @intCast(clk_id)));
     switch (os.errno(os.system.clock_gettime(posix_clk_id, &ts))) {
         .SUCCESS => {
-            parts[0] = @as(c_longlong, @intCast(timespecSec(ts)));
-            parts[1] = @as(c_longlong, @intCast(timespecNsec(ts)));
+            tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(timespecSec(ts)));
+            tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(timespecNsec(ts)));
             return 0;
         },
         else => |e| {
@@ -2465,10 +2671,6 @@ fn _zclock_gettime(clk_id: c.clockid_t, parts: [*]c_longlong) callconv(.c) c_int
             return -1;
         },
     }
-}
-
-comptime {
-    exportInternalSymbol(&_zclock_gettime, "_zclock_gettime");
 }
 
 export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {

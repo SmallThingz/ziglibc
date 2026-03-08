@@ -69,12 +69,14 @@ int main(void)
     char a[3] = {0}, b[3] = {0};
     TEST_MARK_ALWAYS("parity_posix_fs:block:writev");
     fd = open("parity-writev.tmp", O_CREAT | O_TRUNC | O_RDWR, 0600);
-    if (fd < 0) return 1;
+    if (fd < 0) { fprintf(stderr, "parity_posix_fs:writev-open-create errno=%d\n", errno); return 1; }
     outv[0].iov_base = (void *)"ab"; outv[0].iov_len = 2;
     outv[1].iov_base = (void *)"cd"; outv[1].iov_len = 2;
-    if (writev(fd, outv, 2) != 4) return 1;
+    write_rc = (int)writev(fd, outv, 2);
+    if (write_rc != 4) { fprintf(stderr, "parity_posix_fs:writev-create rc=%d errno=%d\n", write_rc, errno); return 1; }
     close(fd);
     fd = open("parity-writev.tmp", O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "parity_posix_fs:writev-open-read errno=%d\n", errno); return 1; }
     inv[0].iov_base = a; inv[0].iov_len = 2;
     inv[1].iov_base = b; inv[1].iov_len = 2;
     read_ok = (readv(fd, inv, 2) == 4);

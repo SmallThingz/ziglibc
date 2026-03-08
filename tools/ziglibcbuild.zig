@@ -96,6 +96,7 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
         lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "printf.c"), .flags = &c_flags });
         lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "scanf.c"), .flags = &c_flags });
         lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "signal.c"), .flags = &c_flags });
+        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "strto.c"), .flags = &c_flags });
     }
     const include_posix = switch (opt.variant) {
         .only_posix, .only_gnu, .full => true,

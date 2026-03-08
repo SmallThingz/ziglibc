@@ -17,14 +17,20 @@ int main(void)
   {
     TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtol");
     const char *s = "abc"; char *endptr = NULL; long value; long dist;
-    errno = 123; value = strtol(s, &endptr, 10); dist = (long)(endptr - s);
+    errno = 123; value = strtol(s, &endptr, 10);
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtol:after-call");
+    dist = (long)(endptr - s);
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtol:print");
     printf("strtol-nodigits:%ld:%d:%ld|", value, errno, dist);
   }
 
   {
     TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtod");
     const char *s = "abc"; char *endptr = NULL; double value; long dist;
-    errno = 123; value = strtod(s, &endptr); dist = (long)(endptr - s);
+    errno = 123; value = strtod(s, &endptr);
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtod:after-call");
+    dist = (long)(endptr - s);
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtod:print");
     printf("strtod-nodigits:%d:%d:%ld|", value == 0.0, errno, dist);
   }
 

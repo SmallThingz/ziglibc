@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+var temp_counter: usize = 0;
 
 const ExternalRunner = enum {
     none,
@@ -107,6 +108,13 @@ fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const
     return std.fs.realpathAlloc(allocator, path_no_dot);
 }
 
+fn mapDarlingArgAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const mapped = try mapExistingPathAlloc(allocator, path);
+    if (!std.fs.path.isAbsolute(mapped)) return mapped;
+    std.fs.accessAbsolute(mapped, .{}) catch return mapped;
+    return darlingPathAlloc(allocator, mapped);
+}
+
 fn normalizeForeignChildCwd(allocator: std.mem.Allocator, runner: ExternalRunner, dirname: []const u8) ![]const u8 {
     const abs = try std.fs.cwd().realpathAlloc(allocator, dirname);
     return switch (runner) {
@@ -175,19 +183,14 @@ fn initChild(
     const abs_program = try std.fs.realpathAlloc(allocator, program_path);
     var child = switch (runner) {
         .darling => blk: {
-            // Keep helper-driven parity runs on the same Darling resolution path
-            // as the build wrapper (`bash -lc ...`). Otherwise the helper can hit
-            // a non-runnable host binary even though the build graph uses a valid
-            // shell-level Darling wrapper, turning a harness mismatch into a fake
-            // libc parity failure.
             var child_args = try allocator.alloc([]const u8, shared_args.len + 5);
             child_args[0] = "bash";
             child_args[1] = "-lc";
-            child_args[2] = "darling \"$@\"";
+            child_args[2] = "darling shell /bin/bash -lc 'prog=\"$1\"; shift; \"$prog\" \"$@\"' _ \"$@\"";
             child_args[3] = "_";
-            child_args[4] = abs_program;
+            child_args[4] = try darlingPathAlloc(allocator, abs_program);
             for (shared_args, 0..) |arg, i| {
-                child_args[i + 5] = try mapExistingPathAlloc(allocator, arg);
+                child_args[i + 5] = try mapDarlingArgAlloc(allocator, arg);
             }
             break :blk std.process.Child.init(child_args, allocator);
         },
@@ -224,13 +227,28 @@ fn runProgram(
     label: []const u8,
     shared_args: []const []const u8,
 ) !RunResult {
-    const dirname = try std.fmt.allocPrint(
-        allocator,
-        "{s}-{x}.parity.tmp",
-        .{ label, @as(u64, @intCast(std.time.nanoTimestamp())) },
-    );
-    std.fs.cwd().deleteTree(dirname) catch {};
-    try std.fs.cwd().makeDir(dirname);
+    const dirname = blk: {
+        var attempt: usize = 0;
+        while (attempt < 64) : (attempt += 1) {
+            const id = @atomicRmw(usize, &temp_counter, .Add, 1, .seq_cst);
+            const candidate = try std.fmt.allocPrint(
+                allocator,
+                "{s}-{d}-{x}-{x}.parity.tmp",
+                .{
+                    label,
+                    attempt,
+                    @as(u64, @intCast(std.time.nanoTimestamp())),
+                    id,
+                },
+            );
+            std.fs.cwd().makeDir(candidate) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            break :blk candidate;
+        }
+        return error.PathAlreadyExists;
+    };
     errdefer std.fs.cwd().deleteTree(dirname) catch {};
 
     var child = try initChild(allocator, runner, program_path, shared_args);

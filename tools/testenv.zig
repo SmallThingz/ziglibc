@@ -102,6 +102,13 @@ fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const
     return std.fs.realpathAlloc(allocator, path_no_dot);
 }
 
+fn mapDarlingArgAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const mapped = try mapExistingPathAlloc(allocator, path);
+    if (!std.fs.path.isAbsolute(mapped)) return mapped;
+    std.fs.accessAbsolute(mapped, .{}) catch return mapped;
+    return darlingPathAlloc(allocator, mapped);
+}
+
 fn normalizeForeignChildCwd(allocator: std.mem.Allocator, runner: ExternalRunner, dirname: []const u8) ![]const u8 {
     const abs = try std.fs.cwd().realpathAlloc(allocator, dirname);
     return switch (runner) {
@@ -127,30 +134,27 @@ fn initForeignRunnerChild(
 ) !std.process.Child {
     const abs_program = try std.fs.realpathAlloc(allocator, program_path);
     var mapped_args = try allocator.alloc([]const u8, args.len);
-    for (args, 0..) |arg, i| {
-        mapped_args[i] = try mapExistingPathAlloc(allocator, arg);
-    }
 
     var child = switch (runner) {
         .darling => blk: {
-            // Match the build-graph wrapper exactly. In CI/dev environments the
-            // usable Darling entry point can come from a shell-level wrapper,
-            // while `/usr/bin/darling` itself may be present but not runnable.
-            // Calling Darling directly from the helper would make emulator runs
-            // disagree with the build wrapper and hide real libc mismatches
-            // behind a harness-only spawn failure.
+            for (args, 0..) |arg, i| {
+                mapped_args[i] = try mapDarlingArgAlloc(allocator, arg);
+            }
             var child_args = try allocator.alloc([]const u8, args.len + 5);
             child_args[0] = "bash";
             child_args[1] = "-lc";
-            child_args[2] = "darling \"$@\"";
+            child_args[2] = "darling shell /bin/bash -lc 'prog=\"$1\"; shift; \"$prog\" \"$@\"' _ \"$@\"";
             child_args[3] = "_";
-            child_args[4] = abs_program;
+            child_args[4] = try darlingPathAlloc(allocator, abs_program);
             for (mapped_args, 0..) |arg, i| {
                 child_args[i + 5] = arg;
             }
             break :blk std.process.Child.init(child_args, allocator);
         },
         .wine => blk: {
+            for (args, 0..) |arg, i| {
+                mapped_args[i] = try mapExistingPathAlloc(allocator, arg);
+            }
             var child_args = try allocator.alloc([]const u8, args.len + 2);
             child_args[0] = "wine";
             child_args[1] = try winePathAlloc(allocator, abs_program);
