@@ -36,6 +36,7 @@ int main(int argc, char *argv[])
   }
 
   expect(NULL != setlocale(LC_ALL, "C"));
+  expect(0 == strcmp("C", setlocale(LC_ALL, NULL)));
   expect(0 == strcmp("C", setlocale(LC_ALL, "")));
   expect(NULL == setlocale(LC_ALL, "en_US.UTF-8"));
 

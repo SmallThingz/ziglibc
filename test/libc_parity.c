@@ -64,10 +64,8 @@ static void read_all(FILE *stream, char *buf, size_t len)
   buf[n] = 0;
 }
 
-int main(void)
+static void parity_system_blocks(void)
 {
-  setvbuf(stdout, NULL, _IONBF, 0);
-
   parity_mark("parity:block:system-null");
   printf("system-null:%d|", system(NULL));
 
@@ -75,7 +73,10 @@ int main(void)
   printf("system-exit7:%d|", system(CMD_EXIT7));
   parity_mark("parity:block:getenv-path");
   printf("getenv-path:%s|", getenv("PATH") ? getenv("PATH") : "null");
+}
 
+static void parity_popen_blocks(void)
+{
   {
     parity_mark("parity:block:popen-read");
     FILE *p = parity_popen(CMD_PRINTF, "r");
@@ -135,14 +136,20 @@ int main(void)
       fclose(files[count]);
     }
   }
+}
 
+static void parity_signal_block(void)
+{
   {
     parity_mark("parity:block:signal");
     void (*old_handler)(int) = signal(SIGINT, parity_handler);
     void (*prev_handler)(int) = signal(SIGINT, old_handler);
     printf("signal-basic:%d:%d|", old_handler != SIG_ERR, prev_handler == parity_handler);
   }
+}
 
+static void parity_strto_blocks(void)
+{
   {
     parity_mark("parity:block:strtol");
     const char *s = "abc";
@@ -166,7 +173,10 @@ int main(void)
     dist = (long)(endptr - s);
     printf("strtod-nodigits:%d:%d:%ld|", value == 0.0, errno, dist);
   }
+}
 
+static void parity_signal_api_blocks(void)
+{
 #if LIBC_PARITY_HAVE_STRSIGNAL
   {
     const char *name = strsignal(SIGINT);
@@ -197,7 +207,10 @@ int main(void)
 #else
   printf("sigaction-basic:skip|");
 #endif
+}
 
+static void parity_time_blocks(void)
+{
 #if LIBC_PARITY_HAVE_SETITIMER
   {
     struct itimerval val;
@@ -234,7 +247,10 @@ int main(void)
 #else
   printf("pselect-timeout:skip|");
 #endif
+}
 
+static void parity_utimes_block(void)
+{
 #if LIBC_PARITY_HAVE_UTIMES
   {
     parity_mark("parity:block:utimes");
@@ -263,7 +279,10 @@ int main(void)
 #else
   printf("utimes-basic:skip|");
 #endif
+}
 
+static void parity_posix_io_blocks(void)
+{
 #if LIBC_PARITY_HAVE_POSIX_IO
   {
     parity_mark("parity:block:gethostname");
@@ -382,6 +401,20 @@ int main(void)
 #else
   printf("gethostname:skip|openat-size:skip|link-basic:skip|fcntl-basic:skip|writev-basic:skip|pathconf-basic:skip|");
 #endif
+}
+
+int main(void)
+{
+  setvbuf(stdout, NULL, _IONBF, 0);
+
+  parity_system_blocks();
+  parity_popen_blocks();
+  parity_signal_block();
+  parity_strto_blocks();
+  parity_signal_api_blocks();
+  parity_time_blocks();
+  parity_utimes_block();
+  parity_posix_io_blocks();
 
   return 0;
 }

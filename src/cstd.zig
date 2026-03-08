@@ -1963,6 +1963,8 @@ export fn _fwrite_buf(ptr: [*]const u8, size: usize, stream: *c.FILE) callconv(.
 
 const FormatLength = enum {
     none,
+    short,
+    char,
     long,
     long_long,
     size,
@@ -2092,7 +2094,16 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
         }
 
         var spec_length: FormatLength = .none;
-        if (fmt_slice[i] == 'l') {
+        if (fmt_slice[i] == 'h') {
+            if (i + 1 < fmt_slice.len and fmt_slice[i + 1] == 'h') {
+                spec_length = .char;
+                i += 2;
+            } else {
+                spec_length = .short;
+                i += 1;
+            }
+            if (i >= fmt_slice.len) return false;
+        } else if (fmt_slice[i] == 'l') {
             if (i + 1 < fmt_slice.len and fmt_slice[i + 1] == 'l') {
                 spec_length = .long_long;
                 i += 2;
@@ -2133,6 +2144,8 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 var buf: [100]u8 = undefined;
                 const len = switch (spec_length) {
                     .none => formatIntCompat(&buf, vaArgCompat(args, c_int), 10),
+                    .short => formatIntCompat(&buf, @as(i16, @intCast(vaArgCompat(args, c_int))), 10),
+                    .char => formatIntCompat(&buf, @as(i8, @intCast(vaArgCompat(args, c_int))), 10),
                     .long => formatIntCompat(&buf, vaArgCompat(args, c_long), 10),
                     .long_long => formatIntCompat(&buf, vaArgCompat(args, c_longlong), 10),
                     .size => formatIntCompat(&buf, vaArgCompat(args, isize), 10),
@@ -2147,6 +2160,8 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 var buf: [100]u8 = undefined;
                 const len = switch (spec_length) {
                     .none => formatIntCompat(&buf, vaArgCompat(args, c_uint), base),
+                    .short => formatIntCompat(&buf, @as(u16, @intCast(vaArgCompat(args, c_uint))), base),
+                    .char => formatIntCompat(&buf, @as(u8, @intCast(vaArgCompat(args, c_uint))), base),
                     .long => formatIntCompat(&buf, vaArgCompat(args, c_ulong), base),
                     .long_long => formatIntCompat(&buf, vaArgCompat(args, c_ulonglong), base),
                     .size => formatIntCompat(&buf, vaArgCompat(args, usize), base),
@@ -2154,6 +2169,18 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 const written = writer.write(buf[0..len]);
                 out_written.* += written;
                 if (written != len) return false;
+            },
+            'p' => {
+                if (spec_length != .none or precision != precision_none) return false;
+                const ptr_value = @intFromPtr(vaArgCompat(args, ?*const anyopaque) orelse @as(?*const anyopaque, null));
+                var buf: [2 + (@sizeOf(usize) * 2)]u8 = undefined;
+                buf[0] = '0';
+                buf[1] = 'x';
+                const hex_len = formatIntCompat(buf[2..], ptr_value, 16);
+                const total_len = 2 + hex_len;
+                const written = writer.write(buf[0..total_len]);
+                out_written.* += written;
+                if (written != total_len) return false;
             },
             else => return false,
         }
@@ -2942,9 +2969,12 @@ fn ceilCompat(x: f64) f64 {
 // --------------------------------------------------------------------------------
 // locale
 // --------------------------------------------------------------------------------
-export fn setlocale(category: c_int, locale: [*:0]const u8) callconv(.c) ?[*:0]u8 {
+export fn setlocale(category: c_int, locale: ?[*:0]const u8) callconv(.c) ?[*:0]u8 {
     _ = category;
-    const requested = std.mem.span(locale);
+    if (locale == null) {
+        return @as([*:0]u8, @ptrCast(&global.current_locale));
+    }
+    const requested = std.mem.span(locale.?);
     if (requested.len == 0 or std.mem.eql(u8, requested, "C") or std.mem.eql(u8, requested, "POSIX")) {
         global.current_locale[0] = 'C';
         global.current_locale[1] = 0;

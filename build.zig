@@ -845,13 +845,9 @@ fn addLibcTest(
     // strtol, it seems there might be some disagreement between libc-test/glibc
     // about how strtoul interprets negative numbers, so leaving out strtol for now
     inline for (.{ "argv", "basename", "clock_gettime", "string" }) |name| {
-        const source_path = if (externalRunnerForTarget(target.result) == .darling and std.mem.eql(u8, name, "string"))
-            "test" ++ std.fs.path.sep_str ++ "libc_test_functional_string_compat.c"
-        else
-            b.pathJoin(&.{ libc_test_path, "src", "functional", name ++ ".c" });
         const exe = addExecutableCompat(b, .{
             .name = "libc-test-functional-" ++ name,
-            .root_source_file = lazyPath(b, source_path),
+            .root_source_file = lazyPath(b, b.pathJoin(&.{ libc_test_path, "src", "functional", name ++ ".c" })),
             .target = target,
             .optimize = optimize,
         });

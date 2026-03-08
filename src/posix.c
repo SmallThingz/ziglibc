@@ -208,6 +208,35 @@ int fcntl(int fildes, int cmd, ...)
 // --------------------------------------------------------------------------------
 LIBCGUANA_INTERNAL int _ioctlArgPtr(int fd, unsigned long request, void *arg);
 
+#if defined(__APPLE__) && defined(__aarch64__)
+LIBCGUANA_INTERNAL int _zdarwin_fstat64(int fd, void *buf)
+{
+    register long x0 __asm("x0") = (long)fd;
+    register void *x1 __asm("x1") = buf;
+    unsigned int carry;
+
+    /*
+     * Native Apple Silicon exposed a real ABI bug in the generic variadic
+     * `syscall()` path for `fstat`. Keep this on a fixed-arity trap so the
+     * kernel sees the exact register layout that libsyscall uses for
+     * `___fstat64`.
+     */
+    __asm__ volatile(
+        "mov x16, #339\n"
+        "svc #0x80\n"
+        "cset %w2, cs\n"
+        : "+r"(x0), "+r"(x1), "=r"(carry)
+        :
+        : "x16", "cc", "memory");
+
+    if (carry != 0) {
+        errno = (int)x0;
+        return -1;
+    }
+    return (int)x0;
+}
+#endif
+
 int ioctl(int fd, unsigned long request, ...)
 {
     va_list args;

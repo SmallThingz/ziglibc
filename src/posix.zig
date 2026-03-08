@@ -38,6 +38,7 @@ const cstd = struct {
         oact: ?*c.struct_sigaction,
     ) callconv(.c) c_int;
     extern fn __zwindows_raise_signal(sig: c_int) callconv(.c) c_int;
+    extern fn _zdarwin_fstat64(fd: c_int, buf: *os.Stat) callconv(.c) c_int;
 };
 
 const AtomicFlag = std.atomic.Value(u32);
@@ -157,6 +158,7 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const setitimer: c_long = 83;
     const getitimer: c_long = 86;
     const fstat: c_long = 189;
+    const fstat64: c_long = 339;
     const fcntl: c_long = 92;
     const select: c_long = 93;
     const gettimeofday: c_long = 116;
@@ -3025,24 +3027,28 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
     }
     var stat_buf: os.Stat = undefined;
     if (builtin.os.tag.isDarwin()) {
-        // Darwin splits here by architecture. Apple Silicon uses the native
-        // `fstat` syscall ABI, but Intel macOS still routes modern callers
-        // through the `$INODE64` userland symbol. The raw syscall fixed the
-        // native arm64 recursion/crash, but it returned the wrong layout under
-        // the x86_64 Darwin-target run. Keep the path target-authentic.
-        const rc = if (builtin.cpu.arch == .x86_64)
-            darwin.@"fstat$INODE64"(fd, &stat_buf)
-        else
-            syscall(darwin_syscall.fstat, darwinSysSigned(fd), &stat_buf);
-        switch (os.errno(rc)) {
-            .SUCCESS => {
-                copyPosixStatToC(buf, stat_buf);
-                return 0;
-            },
-            else => |e| {
-                c.errno = @intFromEnum(e);
+        // Keep Darwin on the fixed-arity libsyscall stub instead of the generic
+        // variadic `syscall()` bridge. Native Apple Silicon surfaced a real
+        // `fstat` corruption bug there that Darling did not reproduce. Apple's
+        // syscall maps route both macOS architectures through `___fstat64`;
+        // `@"fstat$INODE64"` is just the public x86_64 alias for the same stub.
+        if (builtin.cpu.arch == .x86_64) {
+            switch (os.errno(darwin.@"fstat$INODE64"(fd, &stat_buf))) {
+                .SUCCESS => {
+                    copyPosixStatToC(buf, stat_buf);
+                    return 0;
+                },
+                else => |e| {
+                    c.errno = @intFromEnum(e);
+                    return -1;
+                },
+            }
+        } else {
+            if (cstd._zdarwin_fstat64(fd, &stat_buf) != 0) {
                 return -1;
-            },
+            }
+            copyPosixStatToC(buf, stat_buf);
+            return 0;
         }
     }
     switch (os.errno(os.system.fstat(fd, &stat_buf))) {
