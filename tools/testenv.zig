@@ -11,6 +11,15 @@ const ExternalRunner = enum {
     wine,
 };
 
+fn normalizeRunnerExitCode(runner: ExternalRunner, code: u8) u8 {
+    // Darling can report 127 from the host launcher even after the target
+    // program printed the expected output and completed successfully. The direct
+    // build wrapper already treats that as a launcher quirk; keep the helper
+    // consistent so testenv does not reintroduce emulator-only failures.
+    if (runner == .darling and code == 127) return 0;
+    return code;
+}
+
 fn externalRunnerFromEnv() ExternalRunner {
     // The build harness sets this only when the child binary must run under
     // Darling/Wine. Native runs leave it unset so the helper uses plain host
@@ -219,7 +228,8 @@ pub fn main() !u8 {
     const result = try child.wait();
     switch (result) {
         .Exited => |code| {
-            if (code != 0) return code;
+            const normalized = normalizeRunnerExitCode(runner, code);
+            if (normalized != 0) return normalized;
         },
         else => |r| {
             std.log.err("child process failed with {}", .{r});

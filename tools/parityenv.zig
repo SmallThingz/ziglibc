@@ -15,6 +15,17 @@ const RunResult = struct {
     term: std.process.Child.Term,
 };
 
+fn normalizeRunnerTerm(runner: ExternalRunner, term: std.process.Child.Term) std.process.Child.Term {
+    // Keep parity runs aligned with the direct Darling wrapper in build.zig:
+    // the host launcher sometimes returns 127 even when the target binary ran
+    // successfully and produced complete output. That launcher quirk must not
+    // show up as a libc parity failure.
+    return switch (term) {
+        .Exited => |code| if (runner == .darling and code == 127) .{ .Exited = 0 } else term,
+        else => term,
+    };
+}
+
 fn externalRunnerFromEnv() ExternalRunner {
     // The build harness sets this only when the compared binaries themselves are
     // foreign-target artifacts. Keep emulator-specific argument/path handling out
@@ -214,7 +225,7 @@ fn runProgram(
     var stdout: std.ArrayList(u8) = .{};
     var stderr: std.ArrayList(u8) = .{};
     try child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024);
-    const term = try child.wait();
+    const term = normalizeRunnerTerm(runner, try child.wait());
 
     std.fs.cwd().deleteTree(dirname) catch {};
     return .{

@@ -386,36 +386,34 @@ pub fn build(b: *std.Build) void {
     {
         const exe = addTest("getopt", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
-        if (externalRunnerFor(exe) != .darling) {
-            {
-                const run = addRunArtifactCompat(b, exe);
-                run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='(null)'\n" });
-                test_step.dependOn(&run.step);
-            }
-            {
-                const run = addRunArtifactCompat(b, exe);
-                run.addArgs(&.{"-a"});
-                run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='(null)'\n" });
-                test_step.dependOn(&run.step);
-            }
-            {
-                const run = addRunArtifactCompat(b, exe);
-                run.addArgs(&.{ "-c", "hello" });
-                run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='hello'\n" });
-                test_step.dependOn(&run.step);
-            }
-            {
-                const run = addRunArtifactCompat(b, exe);
-                run.addArgs(&.{ "-ac", "hello" });
-                run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
-                test_step.dependOn(&run.step);
-            }
-            {
-                const run = addRunArtifactCompat(b, exe);
-                run.addArg("-achello");
-                run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
-                test_step.dependOn(&run.step);
-            }
+        {
+            const run = addRunArtifactCompat(b, exe);
+            run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='(null)'\n" });
+            test_step.dependOn(&run.step);
+        }
+        {
+            const run = addRunArtifactCompat(b, exe);
+            run.addArgs(&.{"-a"});
+            run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='(null)'\n" });
+            test_step.dependOn(&run.step);
+        }
+        {
+            const run = addRunArtifactCompat(b, exe);
+            run.addArgs(&.{ "-c", "hello" });
+            run.addCheck(.{ .expect_stdout_exact = "aflag=0, c_arg='hello'\n" });
+            test_step.dependOn(&run.step);
+        }
+        {
+            const run = addRunArtifactCompat(b, exe);
+            run.addArgs(&.{ "-ac", "hello" });
+            run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
+            test_step.dependOn(&run.step);
+        }
+        {
+            const run = addRunArtifactCompat(b, exe);
+            run.addArg("-achello");
+            run.addCheck(.{ .expect_stdout_exact = "aflag=1, c_arg='hello'\n" });
+            test_step.dependOn(&run.step);
         }
     }
 
@@ -820,11 +818,13 @@ fn addLibcTest(
             exe.linkSystemLibrary("kernel32");
             exe.linkSystemLibrary("ws2_32");
         }
-        // Darling does not reliably execute these external libc-test functional
-        // binaries on a Linux host even when the same target passes natively.
-        if (externalRunnerFor(exe) != .darling) {
+        if (!(externalRunnerFor(exe) == .darling and std.mem.eql(u8, name, "string"))) {
             libc_test_step.dependOn(&addRunArtifactCompat(b, exe).step);
         }
+        // Darling now runs the other libc-test functional binaries reliably, but
+        // `functional/string.c` still aborts under the emulator before any
+        // diagnostic output. Keep the gate narrow so Darwin-target conformance
+        // coverage keeps expanding without teaching the libc about emulator quirks.
     }
     return libc_test_step;
 }
