@@ -101,6 +101,9 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
         .only_posix, .only_gnu, .full => true,
         else => false,
     };
+    if (include_cstd or include_posix) {
+        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "errno.c"), .flags = &c_flags });
+    }
     modules_options.addOption(bool, "posix", include_posix);
     if (include_posix) {
         lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "posix.c"), .flags = &c_flags });

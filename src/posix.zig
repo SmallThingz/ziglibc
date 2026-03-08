@@ -39,6 +39,21 @@ const cstd = struct {
     ) callconv(.c) c_int;
     extern fn __zwindows_raise_signal(sig: c_int) callconv(.c) c_int;
     extern fn _zdarwin_fstat64(fd: c_int, buf: *os.Stat) callconv(.c) c_int;
+    extern fn _zdarwin_select(
+        nfds: c_int,
+        readfds: ?*c.fd_set,
+        writefds: ?*c.fd_set,
+        errorfds: ?*c.fd_set,
+        timeout: ?*c.timeval,
+    ) callconv(.c) c_int;
+    extern fn _zdarwin_pselect(
+        nfds: c_int,
+        readfds: ?*c.fd_set,
+        writefds: ?*c.fd_set,
+        errorfds: ?*c.fd_set,
+        timeout: ?*const c.timespec,
+        sigmask: ?*const c.sigset_t,
+    ) callconv(.c) c_int;
 };
 
 const AtomicFlag = std.atomic.Value(u32);
@@ -155,8 +170,6 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const getsockopt: c_long = 118;
     const sendto: c_long = 133;
     const shutdown: c_long = 134;
-    const setitimer: c_long = 83;
-    const getitimer: c_long = 86;
     const fstat: c_long = 189;
     const fstat64: c_long = 339;
     const fcntl: c_long = 92;
@@ -2223,11 +2236,6 @@ const DarwinTimeval = extern struct {
     tv_usec: c_int,
 };
 
-const DarwinItimerval = extern struct {
-    it_interval: DarwinTimeval,
-    it_value: DarwinTimeval,
-};
-
 fn cTimevalToLinux(tv: c.timeval) LinuxTimeval {
     return .{
         .tv_sec = @as(isize, @intCast(tv.tv_sec)),
@@ -2247,13 +2255,6 @@ fn cTimevalToDarwin(tv: c.timeval) DarwinTimeval {
         .tv_sec = @as(c_long, @intCast(tv.tv_sec)),
         .tv_usec = @as(c_int, @intCast(tv.tv_usec)),
     };
-}
-
-fn darwinTimevalToC(tv: DarwinTimeval) c.timeval {
-    var out: c.timeval = undefined;
-    out.tv_sec = @as(@TypeOf(out.tv_sec), @intCast(tv.tv_sec));
-    out.tv_usec = @as(@TypeOf(out.tv_usec), @intCast(tv.tv_usec));
-    return out;
 }
 
 fn windowsFileTimeToUnix100ns(ft: std.os.windows.FILETIME) u64 {
@@ -2339,6 +2340,11 @@ const WindowsItimerState = struct {
 };
 
 var windows_itimer: WindowsItimerState = .{};
+const DarwinItimerState = struct {
+    mutex: std.Thread.Mutex = .{},
+    value: c.itimerval = std.mem.zeroes(c.itimerval),
+};
+var darwin_itimer: DarwinItimerState = .{};
 
 fn windowsCurrentItimerLocked() c.itimerval {
     var value = std.mem.zeroes(c.itimerval);
@@ -2468,7 +2474,15 @@ comptime {
 export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {
     trace.log("gettimeofday tv={*} tz={*}", .{ tv, tz });
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.gettimeofday, tv, tz);
+        // Modern Darwin kernels expose gettimeofday as a 3-argument syscall:
+        // (timeval*, timezone*, uint64_t* mach_absolute_time). The public C
+        // wrapper still takes only two arguments and explicitly zeroes the
+        // hidden third slot before trapping. Native macOS, especially arm64,
+        // will fault or report EFAULT if we forward only the visible two
+        // arguments and leave the third register as garbage. Darling can miss
+        // this because its emulation does not reproduce the native kernel ABI
+        // boundary strictly enough.
+        const rc = syscall(darwin_syscall.gettimeofday, tv, tz, @as(?*u64, null));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -2489,6 +2503,10 @@ export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {
 
 export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
     trace.log("getitimer which={}", .{which});
+    if (which != c.ITIMER_REAL and which != c.ITIMER_VIRTUAL and which != c.ITIMER_PROF) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
     if (builtin.os.tag == .windows) {
         if (which != c.ITIMER_REAL) {
             c.errno = c.EINVAL;
@@ -2500,14 +2518,9 @@ export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        var native_value: DarwinItimerval = undefined;
-        const rc = syscall(darwin_syscall.getitimer, darwinSysSigned(which), &native_value);
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
-            return -1;
-        }
-        value.it_interval = darwinTimevalToC(native_value.it_interval);
-        value.it_value = darwinTimevalToC(native_value.it_value);
+        darwin_itimer.mutex.lock();
+        value.* = darwin_itimer.value;
+        darwin_itimer.mutex.unlock();
         return 0;
     }
     if (builtin.os.tag == .linux) {
@@ -2530,6 +2543,10 @@ export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
 
 export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
     trace.log("setitimer which={}", .{which});
+    if (which != c.ITIMER_REAL and which != c.ITIMER_VIRTUAL and which != c.ITIMER_PROF) {
+        c.errno = c.EINVAL;
+        return -1;
+    }
     if (builtin.os.tag == .windows) {
         if (which != c.ITIMER_REAL) {
             c.errno = c.EINVAL;
@@ -2562,25 +2579,18 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        var native_value = DarwinItimerval{
-            .it_interval = cTimevalToDarwin(value.it_interval),
-            .it_value = cTimevalToDarwin(value.it_value),
-        };
-        var native_old: DarwinItimerval = undefined;
-        const rc = syscall(
-            darwin_syscall.setitimer,
-            darwinSysSigned(which),
-            &native_value,
-            if (!cPtrIsNull(avalue)) &native_old else @as(?*DarwinItimerval, null),
-        );
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
+        _ = cTimevalToNs(value.it_value) orelse {
+            c.errno = c.EINVAL;
             return -1;
-        }
-        if (!cPtrIsNull(avalue)) {
-            avalue.it_interval = darwinTimevalToC(native_old.it_interval);
-            avalue.it_value = darwinTimevalToC(native_old.it_value);
-        }
+        };
+        _ = cTimevalToNs(value.it_interval) orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        darwin_itimer.mutex.lock();
+        if (!cPtrIsNull(avalue)) avalue.* = darwin_itimer.value;
+        darwin_itimer.value = value.*;
+        darwin_itimer.mutex.unlock();
         return 0;
     }
     if (comptime builtin.os.tag != .linux) {
@@ -2713,6 +2723,22 @@ fn darwinSigsetToC(mask: std.c.sigset_t) c.sigset_t {
     return @as(c.sigset_t, @truncate(mask));
 }
 
+const DarwinKernelSigaction = if (builtin.os.tag.isDarwin()) extern struct {
+    pub const handler_fn = std.c.Sigaction.handler_fn;
+    pub const sigaction_fn = std.c.Sigaction.sigaction_fn;
+
+    handler: extern union {
+        handler: ?handler_fn,
+        sigaction: ?sigaction_fn,
+    },
+    // XNU's raw sigaction(2) ABI takes `struct __sigaction *` for the new
+    // action, not the public `struct sigaction *`. The extra trampoline slot is
+    // part of the kernel boundary even though user code never touches it.
+    sa_tramp: ?*const anyopaque = null,
+    mask: std.c.sigset_t,
+    flags: c_uint,
+} else void;
+
 fn cPtrIsNull(ptr: anytype) bool {
     return @intFromPtr(ptr) == 0;
 }
@@ -2723,19 +2749,19 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
         return cstd.__zwindows_sigaction(sig, act, oact);
     }
     if (builtin.os.tag.isDarwin()) {
-        var native_act = std.mem.zeroes(std.c.Sigaction);
-        const native_act_ptr: ?*std.c.Sigaction = if (!cPtrIsNull(act)) blk: {
+        var native_act = std.mem.zeroes(DarwinKernelSigaction);
+        const native_act_ptr: ?*DarwinKernelSigaction = if (!cPtrIsNull(act)) blk: {
             const new_act = act;
             native_act.mask = cSigsetToDarwin(new_act.sa_mask);
             native_act.flags = @as(c_uint, @bitCast(new_act.sa_flags));
             if ((native_act.flags & std.c.SA.SIGINFO) != 0) {
                 native_act.handler.sigaction = if (cSigactionGetSigaction(new_act.*)) |f|
-                    @as(?std.c.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
+                    @as(?DarwinKernelSigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
                 else
                     null;
             } else {
                 native_act.handler.handler = if (cSigactionGetHandler(new_act.*)) |h|
-                    @as(?std.c.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
+                    @as(?DarwinKernelSigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
                 else
                     null;
             }
@@ -3651,6 +3677,38 @@ export fn select(
         c.errno = c.EINVAL;
         return -1;
     }
+    // `select(0, NULL, NULL, NULL, timeout)` is a pure timeout sleep. Keep this
+    // on a libc-local path everywhere instead of bouncing through platform
+    // syscalls, because the semantics are exact and it avoids Darwin-specific
+    // ABI edges that showed up on native Apple Silicon before they were visible
+    // under emulation.
+    if (nfds == 0 and readfds == null and writefds == null and errorfds == null) {
+        if (timeout) |to| {
+            if (to.tv_sec < 0 or to.tv_usec < 0 or to.tv_usec >= 1000000) {
+                c.errno = c.EINVAL;
+                return -1;
+            }
+            const sec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_sec)), std.time.ns_per_s) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            const usec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_usec)), std.time.ns_per_us) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            const total_ns = std.math.add(u64, sec_ns, usec_ns) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            if (total_ns != 0) std.Thread.sleep(total_ns);
+            to.tv_sec = 0;
+            to.tv_usec = 0;
+            return 0;
+        } else {
+            c.errno = errnoConst("ENOSYS", c.EINVAL);
+            return -1;
+        }
+    }
     if (builtin.os.tag == .windows) {
         var read_template: c.fd_set = undefined;
         var write_template: c.fd_set = undefined;
@@ -3722,19 +3780,7 @@ export fn select(
         }
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(
-            darwin_syscall.select,
-            darwinSysSigned(nfds),
-            readfds,
-            writefds,
-            errorfds,
-            timeout,
-        );
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
-            return -1;
-        }
-        return @as(c_int, @intCast(rc));
+        return cstd._zdarwin_select(nfds, readfds, writefds, errorfds, timeout);
     }
     if (builtin.os.tag == .linux) {
         var linux_timeout: LinuxTimeval = undefined;
@@ -3762,35 +3808,6 @@ export fn select(
         }
     }
 
-    // Portable fallback for "sleep with timeout" mode only.
-    if (nfds == 0 and readfds == null and writefds == null and errorfds == null) {
-        if (timeout) |to| {
-            if (to.tv_sec < 0 or to.tv_usec < 0 or to.tv_usec >= 1000000) {
-                c.errno = c.EINVAL;
-                return -1;
-            }
-            const sec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_sec)), std.time.ns_per_s) catch {
-                c.errno = c.EINVAL;
-                return -1;
-            };
-            const usec_ns = std.math.mul(u64, @as(u64, @intCast(to.tv_usec)), std.time.ns_per_us) catch {
-                c.errno = c.EINVAL;
-                return -1;
-            };
-            const total_ns = std.math.add(u64, sec_ns, usec_ns) catch {
-                c.errno = c.EINVAL;
-                return -1;
-            };
-            if (total_ns != 0) std.Thread.sleep(total_ns);
-            to.tv_sec = 0;
-            to.tv_usec = 0;
-            return 0;
-        } else {
-            // No timeout and no fds would block forever; keep behavior explicit.
-            c.errno = errnoConst("ENOSYS", c.EINVAL);
-            return -1;
-        }
-    }
     c.errno = errnoConst("ENOSYS", c.EINVAL);
     return -1;
 }
@@ -3807,6 +3824,28 @@ export fn pselect(
         c.errno = c.EINVAL;
         return -1;
     }
+    if (nfds == 0 and readfds == null and writefds == null and errorfds == null and sigmask == null) {
+        if (timeout) |ts| {
+            if (!cTimespecIsValid(ts.*)) {
+                c.errno = c.EINVAL;
+                return -1;
+            }
+            const sec_ns = std.math.mul(u64, @as(u64, @intCast(ts.tv_sec)), std.time.ns_per_s) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            const nsec_ns = @as(u64, @intCast(ts.tv_nsec));
+            const total_ns = std.math.add(u64, sec_ns, nsec_ns) catch {
+                c.errno = c.EINVAL;
+                return -1;
+            };
+            if (total_ns != 0) std.Thread.sleep(total_ns);
+            return 0;
+        } else {
+            c.errno = errnoConst("ENOSYS", c.EINVAL);
+            return -1;
+        }
+    }
     if (builtin.os.tag.isDarwin()) {
         if (timeout) |ts| {
             if (!cTimespecIsValid(ts.*)) {
@@ -3814,24 +3853,11 @@ export fn pselect(
                 return -1;
             }
         }
-        // Darwin has a real pselect(2). Do not collapse this into select():
-        // that loses the optional signal mask argument and the atomic mask swap,
-        // which changes real native behavior even if an emulator happens to make
-        // the timeout-only case look equivalent.
-        const rc = syscall(
-            darwin_syscall.pselect,
-            darwinSysSigned(nfds),
-            readfds,
-            writefds,
-            errorfds,
-            timeout,
-            sigmask,
-        );
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
-            return -1;
-        }
-        return @as(c_int, @intCast(rc));
+        // Darwin has a real pselect(2). Keep it on a fixed-arity C shim instead
+        // of Zig's variadic `syscall()` bridge: Apple Silicon already exposed
+        // real ABI drift in that path for other syscalls, and the timeout-only
+        // parity probe hit the same boundary here.
+        return cstd._zdarwin_pselect(nfds, readfds, writefds, errorfds, timeout, sigmask);
     }
     if (builtin.os.tag == .linux) {
         const LinuxPselectSigmask = extern struct {

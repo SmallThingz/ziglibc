@@ -20,6 +20,8 @@ int main(int argc, char *argv[])
   expect(0 == strcmp(buffer, "1234567890123"));
   expect(13 == snprintf(buffer, sizeof(buffer), "%llu", 1234567890123ULL));
   expect(0 == strcmp(buffer, "1234567890123"));
+  expect(14 == snprintf(buffer, sizeof(buffer), "%ld:%lu", -123456L, 123456UL));
+  expect(0 == strcmp(buffer, "-123456:123456"));
 
   expect(4 == snprintf(buffer, sizeof(buffer), "%s", "abcd"));
   expect(0 == strcmp(buffer, "abcd"));

@@ -245,7 +245,7 @@ comptime {
 // --------------------------------------------------------------------------------
 // errno
 // --------------------------------------------------------------------------------
-export var errno: c_int = 0;
+extern var errno: c_int;
 
 // --------------------------------------------------------------------------------
 // stdlib
@@ -1352,6 +1352,13 @@ const global = struct {
         entry.unread_valid = false;
         entry.unread_char = 0;
         removeRemainder(file);
+        file.eof = 0;
+        file.errno = 0;
+        if (builtin.os.tag == .windows) {
+            file.fd = null;
+        } else {
+            file.fd = -1;
+        }
         entry.reserved = false;
     }
 
@@ -1463,6 +1470,16 @@ export const stderr: *c.FILE = &global.static_file_page[2].file;
 
 fn entryFromFile(stream: *c.FILE) *global.FileEntry {
     return @fieldParentPtr("file", stream);
+}
+
+fn closePosixFd(fd: c_int) bool {
+    switch (std.posix.errno(std.posix.system.close(fd))) {
+        .SUCCESS => return true,
+        else => |e| {
+            errno = @intFromEnum(e);
+            return false;
+        },
+    }
 }
 
 // used by posix.zig
@@ -1814,12 +1831,19 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
             return null;
         }
     } else {
-        _ = std.posix.system.close(stream.fd);
+        if (!closePosixFd(stream.fd)) {
+            const close_errno = errno;
+            _ = fclose(new_stream);
+            errno = close_errno;
+            stream.errno = errno;
+            return null;
+        }
     }
     stream.fd = new_stream.fd;
     stream.eof = 0;
     stream.errno = 0;
     entryFromFile(stream).unread_valid = false;
+    global.clearRemainder(stream);
     entryFromFile(new_stream).unread_valid = false;
     if (new_stream != stream) global.releaseFile(new_stream);
     return stream;
@@ -1839,7 +1863,10 @@ export fn fclose(stream: *c.FILE) callconv(.c) c_int {
             return c.EOF;
         }
     } else {
-        _ = std.posix.system.close(stream.fd);
+        if (!closePosixFd(stream.fd)) {
+            stream.errno = errno;
+            return c.EOF;
+        }
     }
     global.releaseFile(stream);
     return 0;
@@ -1883,7 +1910,7 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
 
 export fn ftell(stream: *c.FILE) callconv(.c) c_long {
     const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
-    const offset = std.posix.lseek_CUR_get(fd) catch |e| {
+    var offset = std.posix.lseek_CUR_get(fd) catch |e| {
         errno = switch (e) {
             error.Unseekable => errnoConst("ESPIPE", c.EINVAL),
             error.AccessDenied => c.EACCES,
@@ -1892,6 +1919,9 @@ export fn ftell(stream: *c.FILE) callconv(.c) c_long {
         stream.errno = errno;
         return -1;
     };
+    if (entryFromFile(stream).unread_valid and offset > 0) {
+        offset -= 1;
+    }
     if (offset > std.math.maxInt(c_long)) {
         errno = errnoConst("EOVERFLOW", c.ERANGE);
         stream.errno = errno;
@@ -2016,18 +2046,6 @@ fn isFormatFlag(ch: u8) bool {
     return ch == '-' or ch == '+' or ch == ' ' or ch == '#' or ch == '0';
 }
 
-const VaListParam = if (builtin.os.tag == .windows)
-    c.va_list
-else if (@typeInfo(std.builtin.VaList) == .pointer)
-    std.builtin.VaList
-else
-    *std.builtin.VaList;
-
-const VaListCursor = if (builtin.os.tag == .windows)
-    *c.va_list
-else
-    *std.builtin.VaList;
-
 fn vaArgWindows(args: *c.va_list, comptime T: type) T {
     if (comptime builtin.cpu.arch != .x86_64) {
         return @cVaArg(args, T);
@@ -2046,11 +2064,13 @@ fn vaArgWindows(args: *c.va_list, comptime T: type) T {
     return value;
 }
 
+const VaListCursor = if (builtin.os.tag == .windows) *c.va_list else *anyopaque;
+
 inline fn vaArgCompat(args: VaListCursor, comptime T: type) T {
     if (comptime builtin.os.tag == .windows) {
         return vaArgWindows(args, T);
     }
-    return @cVaArg(args, T);
+    return @cVaArg(@as(*std.builtin.VaList, @ptrCast(@alignCast(args))), T);
 }
 
 fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args: VaListCursor) callconv(.c) bool {
@@ -2197,16 +2217,36 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
     return true;
 }
 
-fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
+fn vformatWithCVaListPtr(
+    out_written: *usize,
+    writer: *FormatWriter,
+    format: [*:0]const u8,
+    arg: *c.va_list,
+) bool {
+    if (comptime builtin.os.tag == .windows) {
+        return vformat(out_written, writer, format, arg);
+    }
+    const va_list_info = @typeInfo(c.va_list);
+    const va_list_tag = comptime std.meta.activeTag(va_list_info);
+    if (comptime va_list_tag == .array) {
+        const info = va_list_info.array;
+        if (info.len != 1) @compileError("unsupported C va_list array shape");
+        return vformat(out_written, writer, format, @ptrCast(&arg[0]));
+    }
+    if (comptime va_list_tag == .pointer) {
+        const va = arg.*;
+        return vformat(out_written, writer, format, @ptrCast(va));
+    }
+    if (comptime va_list_tag == .@"struct") {
+        return vformat(out_written, writer, format, @ptrCast(arg));
+    }
+    @compileError("unsupported C va_list representation");
+}
+
+fn _zvfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
     var writer = FormatWriter{ .stream = stream };
     var written: usize = 0;
-    const ok = if (comptime builtin.os.tag == .windows) blk: {
-        var va = arg;
-        break :blk vformat(&written, &writer, format, &va);
-    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
-        var va = arg;
-        break :blk vformat(&written, &writer, format, &va);
-    } else vformat(&written, &writer, format, arg);
+    const ok = vformatWithCVaListPtr(&written, &writer, format, arg);
     if (ok) {
         return @intCast(written);
     } else {
@@ -2215,40 +2255,24 @@ fn vfprintf(stream: *c.FILE, format: [*:0]const u8, arg: VaListParam) callconv(.
     }
 }
 
-fn vprintf(format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
-    return vfprintf(stdout, format, arg);
-}
-
-fn vsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
+fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
     var writer = FormatWriter{ .bounded = .{
         .buf = s,
         .len = n,
     } };
     var written: usize = 0;
-    const ok = if (comptime builtin.os.tag == .windows) blk: {
-        var va = arg;
-        break :blk vformat(&written, &writer, format, &va);
-    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
-        var va = arg;
-        break :blk vformat(&written, &writer, format, &va);
-    } else vformat(&written, &writer, format, arg);
+    const ok = vformatWithCVaListPtr(&written, &writer, format, arg);
     std.debug.assert(ok);
     if (written < n) s[written] = 0;
     return @intCast(written);
 }
 
-fn vsprintf(s: [*]u8, format: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
+fn _zvsprintf(s: [*]u8, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
     var writer = FormatWriter{ .unbounded = .{
         .buf = s,
     } };
     var written: usize = 0;
-    const ok = if (comptime builtin.os.tag == .windows) blk: {
-        var va = arg;
-        break :blk vformat(&written, &writer, format, &va);
-    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) blk: {
-        var va = arg;
-        break :blk vformat(&written, &writer, format, &va);
-    } else vformat(&written, &writer, format, arg);
+    const ok = vformatWithCVaListPtr(&written, &writer, format, arg);
     std.debug.assert(ok);
     s[written] = 0;
     return @intCast(written);
@@ -2451,25 +2475,43 @@ fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: VaListCursor) callconv(
     }
 }
 
-fn vsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: VaListParam) callconv(.c) c_int {
-    var reader = FixedReader{ .buf = s };
+fn vscanWithCVaListPtr(reader: *FixedReader, fmt: [*:0]const u8, arg: *c.va_list) c_int {
     if (comptime builtin.os.tag == .windows) {
-        var va = arg;
-        return vscan(&reader, fmt, &va);
-    } else if (comptime @typeInfo(std.builtin.VaList) == .pointer) {
-        var va = arg;
-        return vscan(&reader, fmt, &va);
-    } else {
-        return vscan(&reader, fmt, arg);
+        return vscan(reader, fmt, arg);
     }
+    const va_list_info = @typeInfo(c.va_list);
+    const va_list_tag = comptime std.meta.activeTag(va_list_info);
+    if (comptime va_list_tag == .array) {
+        const info = va_list_info.array;
+        if (info.len != 1) @compileError("unsupported C va_list array shape");
+        return vscan(reader, fmt, @ptrCast(&arg[0]));
+    }
+    if (comptime va_list_tag == .pointer) {
+        return vscan(reader, fmt, @ptrCast(arg.*));
+    }
+    if (comptime va_list_tag == .@"struct") {
+        return vscan(reader, fmt, @ptrCast(arg));
+    }
+    @compileError("unsupported C va_list representation");
+}
+
+fn _zvsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+    var reader = FixedReader{ .buf = s };
+    return vscanWithCVaListPtr(&reader, fmt, arg);
 }
 
 comptime {
-    @export(&vfprintf, .{ .name = "vfprintf" });
-    @export(&vprintf, .{ .name = "vprintf" });
-    @export(&vsnprintf, .{ .name = "vsnprintf" });
-    @export(&vsprintf, .{ .name = "vsprintf" });
-    @export(&vsscanf, .{ .name = "vsscanf" });
+    if (builtin.target.ofmt == .coff) {
+        @export(&_zvfprintf, .{ .name = "_zvfprintf" });
+        @export(&_zvsnprintf, .{ .name = "_zvsnprintf" });
+        @export(&_zvsprintf, .{ .name = "_zvsprintf" });
+        @export(&_zvsscanf, .{ .name = "_zvsscanf" });
+    } else {
+        @export(&_zvfprintf, .{ .name = "_zvfprintf", .visibility = .hidden });
+        @export(&_zvsnprintf, .{ .name = "_zvsnprintf", .visibility = .hidden });
+        @export(&_zvsprintf, .{ .name = "_zvsprintf", .visibility = .hidden });
+        @export(&_zvsscanf, .{ .name = "_zvsscanf", .visibility = .hidden });
+    }
 }
 
 export fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
@@ -2651,6 +2693,7 @@ export fn tmpnam(s: [*]u8) callconv(.c) [*]u8 {
 
 export fn clearerr(stream: *c.FILE) callconv(.c) void {
     trace.log("clearerr {*}", .{stream});
+    stream.eof = 0;
     stream.errno = 0;
 }
 

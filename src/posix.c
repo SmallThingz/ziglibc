@@ -5,10 +5,13 @@
 #include <time.h>
 #include <errno.h>
 #include <string.h>
+#include <unistd.h>
 
 #if defined(__APPLE__)
 #include <sys/time.h>
+#include <sys/select.h>
 #include <mach/mach_time.h>
+extern long syscall(int, ...);
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -16,6 +19,11 @@
 #else
 #define LIBCGUANA_INTERNAL
 #endif
+
+static int zdarwin_errno_value(long rc)
+{
+    return rc < 0 ? (int)(-rc) : (int)rc;
+}
 
 extern char *optarg;
 extern int opterr, optind, optopt;
@@ -230,10 +238,75 @@ LIBCGUANA_INTERNAL int _zdarwin_fstat64(int fd, void *buf)
         : "x16", "cc", "memory");
 
     if (carry != 0) {
-        errno = (int)x0;
+        errno = zdarwin_errno_value(x0);
         return -1;
     }
     return (int)x0;
+}
+#endif
+
+#if defined(__APPLE__)
+LIBCGUANA_INTERNAL int _zdarwin_select(int nfds, void *readfds, void *writefds, void *errorfds, void *timeout)
+{
+#if defined(__aarch64__)
+    register long x0 __asm("x0") = (long)nfds;
+    register void *x1 __asm("x1") = readfds;
+    register void *x2 __asm("x2") = writefds;
+    register void *x3 __asm("x3") = errorfds;
+    register void *x4 __asm("x4") = timeout;
+    unsigned int carry;
+
+    __asm__ volatile(
+        "mov x16, #93\n"
+        "svc #0x80\n"
+        "cset %w5, cs\n"
+        : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "=r"(carry)
+        :
+        : "x16", "cc", "memory");
+
+    if (carry != 0) {
+        errno = zdarwin_errno_value(x0);
+        return -1;
+    }
+    return (int)x0;
+#elif defined(__x86_64__)
+    long rc = syscall(93, nfds, readfds, writefds, errorfds, timeout);
+    return (int)rc;
+#else
+    return -1;
+#endif
+}
+
+LIBCGUANA_INTERNAL int _zdarwin_pselect(int nfds, void *readfds, void *writefds, void *errorfds, const struct timespec *timeout, const void *sigmask)
+{
+#if defined(__aarch64__)
+    register long x0 __asm("x0") = (long)nfds;
+    register void *x1 __asm("x1") = readfds;
+    register void *x2 __asm("x2") = writefds;
+    register void *x3 __asm("x3") = errorfds;
+    register const struct timespec *x4 __asm("x4") = timeout;
+    register const void *x5 __asm("x5") = sigmask;
+    unsigned int carry;
+
+    __asm__ volatile(
+        "mov x16, #394\n"
+        "svc #0x80\n"
+        "cset %w6, cs\n"
+        : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "=r"(carry)
+        :
+        : "x16", "cc", "memory");
+
+    if (carry != 0) {
+        errno = zdarwin_errno_value(x0);
+        return -1;
+    }
+    return (int)x0;
+#elif defined(__x86_64__)
+    long rc = syscall(394, nfds, readfds, writefds, errorfds, timeout, sigmask);
+    return (int)rc;
+#else
+    return -1;
+#endif
 }
 #endif
 

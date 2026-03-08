@@ -98,6 +98,21 @@ int main(int argc, char *argv[])
   }
 
   {
+    FILE *eof_file = fopen("stdio-clearerr.txt", "w+");
+    char ch;
+    expect(eof_file != NULL);
+    expect(1 == fwrite("x", 1, 1, eof_file));
+    expect(0 == fseek(eof_file, 0, SEEK_SET));
+    expect(1 == fread(&ch, 1, 1, eof_file));
+    expect(0 == fread(&ch, 1, 1, eof_file));
+    expect(0 != feof(eof_file));
+    clearerr(eof_file);
+    expect(0 == feof(eof_file));
+    expect(0 == ferror(eof_file));
+    expect(0 == fclose(eof_file));
+  }
+
+  {
     char tmp_name[L_tmpnam];
     expect(tmpnam(tmp_name) == tmp_name);
     expect(tmp_name[0] != 0);
