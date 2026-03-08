@@ -131,6 +131,7 @@ const darwin = if (builtin.os.tag.isDarwin()) struct {
     extern "c" fn mach_timebase_info(info: *std.c.mach_timebase_info_data) kern_return_t;
     extern "c" fn __error() *c_int;
     extern "c" fn @"open$NOCANCEL"(path: [*:0]const u8, oflag: c_int, ...) c_int;
+    extern "c" fn @"fstat$INODE64"(fd: c_int, buf: *os.Stat) c_int;
 } else struct {};
 
 const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
@@ -155,6 +156,7 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const shutdown: c_long = 134;
     const setitimer: c_long = 83;
     const getitimer: c_long = 86;
+    const fstat: c_long = 189;
     const fcntl: c_long = 92;
     const select: c_long = 93;
     const gettimeofday: c_long = 116;
@@ -788,14 +790,6 @@ export fn read(fd: c_int, buf: [*]u8, len: usize) callconv(.c) isize {
     return zreadRaw(fd, buf, len);
 }
 
-fn darwinAccessMask(st: c.struct_stat) c_int {
-    var mask: c_int = 0;
-    if ((st.st_mode & 0o444) != 0) mask |= c.R_OK;
-    if ((st.st_mode & 0o222) != 0) mask |= c.W_OK;
-    if ((st.st_mode & 0o111) != 0) mask |= c.X_OK;
-    return mask;
-}
-
 fn _zopen(path: [*:0]const u8, oflag: c_int, mode: c_uint) callconv(.c) c_int {
     return zopenRaw(path, oflag, mode);
 }
@@ -1281,24 +1275,17 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
             c.errno = c.EINVAL;
             return -1;
         }
-        const open_flags = if ((amode & c.W_OK) != 0 and (amode & c.R_OK) != 0)
-            c.O_RDWR
-        else if ((amode & c.W_OK) != 0)
-            c.O_WRONLY
-        else
-            c.O_RDONLY;
-        const fd = zopenRaw(path, open_flags, 0);
-        if (fd < 0) return -1;
-        defer _ = close(fd);
-        if ((amode & c.X_OK) != 0) {
-            var st: c.struct_stat = undefined;
-            if (fstat(fd, &st) != 0) return -1;
-            if ((darwinAccessMask(st) & c.X_OK) == 0) {
-                c.errno = c.EACCES;
+        // Do not route Darwin `access()` through open/fstat or Zig std's libc
+        // bindings. On native Apple Silicon that self-bound back into our own
+        // exported entry points and only showed up outside Darling.
+        const rc = syscall(darwin_syscall.access, path, darwinSysSigned(amode));
+        switch (os.errno(rc)) {
+            .SUCCESS => return 0,
+            else => |e| {
+                c.errno = @intFromEnum(e);
                 return -1;
-            }
+            },
         }
-        return 0;
     }
     const mode: u32 = @intCast(amode);
     std.posix.accessZ(path, mode) catch |err| {
@@ -3037,6 +3024,27 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
         return 0;
     }
     var stat_buf: os.Stat = undefined;
+    if (builtin.os.tag.isDarwin()) {
+        // Darwin splits here by architecture. Apple Silicon uses the native
+        // `fstat` syscall ABI, but Intel macOS still routes modern callers
+        // through the `$INODE64` userland symbol. The raw syscall fixed the
+        // native arm64 recursion/crash, but it returned the wrong layout under
+        // the x86_64 Darwin-target run. Keep the path target-authentic.
+        const rc = if (builtin.cpu.arch == .x86_64)
+            darwin.@"fstat$INODE64"(fd, &stat_buf)
+        else
+            syscall(darwin_syscall.fstat, darwinSysSigned(fd), &stat_buf);
+        switch (os.errno(rc)) {
+            .SUCCESS => {
+                copyPosixStatToC(buf, stat_buf);
+                return 0;
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
     switch (os.errno(os.system.fstat(fd, &stat_buf))) {
         .SUCCESS => {},
         else => |e| {

@@ -28,6 +28,7 @@ extern "c" fn @"open$NOCANCEL"(path: [*:0]const u8, oflag: c_int, ...) c_int;
 extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 
 const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
+    const access: c_long = 33;
     const unlink: c_long = 10;
     const rename: c_long = 128;
 } else struct {};
@@ -434,6 +435,13 @@ export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
     }
 
     if (string == null) {
+        if (builtin.os.tag.isDarwin()) {
+            // Keep the Darwin shell probe inside this object. Calling into a
+            // separate libc archive here regressed native Apple Silicon and also
+            // left Linux test link steps with an unresolved `access` symbol.
+            const rc = syscall(darwin_syscall.access, "/bin/sh", @as(usize, @intCast(c.X_OK)));
+            return if (std.posix.errno(rc) == .SUCCESS) 1 else 0;
+        }
         const rc = std.posix.system.access("/bin/sh", std.posix.X_OK);
         return if (std.posix.errno(rc) == .SUCCESS) 1 else 0;
     }
