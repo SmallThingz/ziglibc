@@ -274,8 +274,8 @@ pub fn main() !u8 {
     if (!std.mem.eql(u8, expected.stdout, actual.stdout)) {
         const msg = try std.fmt.allocPrint(
             allocator,
-            "stdout mismatch\nexpected:\n{s}\nactual:\n{s}\n",
-            .{ expected.stdout, actual.stdout },
+            "stdout mismatch\nexpected stdout:\n{s}\nactual stdout:\n{s}\nexpected stderr:\n{s}\nactual stderr:\n{s}\nexpected term: {any}\nactual term: {any}\n",
+            .{ expected.stdout, actual.stdout, expected.stderr, actual.stderr, expected.term, actual.term },
         );
         try std.fs.File.stderr().writeAll(msg);
         return 1;

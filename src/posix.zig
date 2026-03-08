@@ -2876,14 +2876,6 @@ export fn stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int {
 
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
-    if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.chmod, path, darwinSysUnsigned(mode));
-        if (rc == -1) {
-            c.errno = darwin.__error().*;
-            return -1;
-        }
-        return 0;
-    }
     if (builtin.os.tag == .windows) {
         const attrs = winapi.GetFileAttributesA(path);
         if (attrs == std.os.windows.INVALID_FILE_ATTRIBUTES) {

@@ -40,7 +40,18 @@ int main(void) {
   POSIX_MARK("posix:block:time");
   { time_t t=946684800; struct tm *utc=gmtime(&t); char *asc; char *ct; expect(utc!=NULL); asc=asctime(utc); expect(asc!=NULL); expect(0==strncmp(asc,"Sat Jan  1 00:00:00 2000\n",25)); ct=ctime(&t); expect(ct!=NULL); expect(0==strcmp(ct, asctime(localtime(&t)))); expect(0 == sleep(0)); }
   POSIX_MARK("posix:block:stat");
-  fd=open("posix-stat.tmp", O_CREAT|O_TRUNC|O_RDWR, 0600); expect(fd>=0); expect(3==write(fd,"abc",3)); expect(0==fstat(fd,&st)); expect(3==st.st_size); expect(0==chmod("posix-stat.tmp",0600)); expect(0==close(fd)); expect(0==unlink("posix-stat.tmp"));
+  POSIX_MARK("posix:block:stat-open");
+  fd=open("posix-stat.tmp", O_CREAT|O_TRUNC|O_RDWR, 0600); expect(fd>=0);
+  POSIX_MARK("posix:block:stat-write");
+  expect(3==write(fd,"abc",3));
+  POSIX_MARK("posix:block:stat-fstat");
+  expect(0==fstat(fd,&st)); expect(3==st.st_size);
+  POSIX_MARK("posix:block:stat-chmod");
+  expect(0==chmod("posix-stat.tmp",0600));
+  POSIX_MARK("posix:block:stat-close");
+  expect(0==close(fd));
+  POSIX_MARK("posix:block:stat-unlink");
+  expect(0==unlink("posix-stat.tmp"));
   POSIX_MARK("posix:block:openat");
   { mode_t old=umask(022); mode_t prev=umask(old); expect(022==prev); }
   fd=openat(AT_FDCWD,"posix-openat.tmp",O_CREAT|O_TRUNC|O_RDWR,0600); expect(fd>=0); expect(4==write(fd,"open",4)); expect(0==close(fd)); expect(0==stat("posix-openat.tmp",&st)); expect(4==st.st_size); expect(0==unlink("posix-openat.tmp"));

@@ -68,13 +68,16 @@ int main(void)
 {
   setvbuf(stdout, NULL, _IONBF, 0);
 
+  parity_mark("parity:block:system-null");
   printf("system-null:%d|", system(NULL));
 
+  parity_mark("parity:block:system-exit7");
   printf("system-exit7:%d|", system(CMD_EXIT7));
+  parity_mark("parity:block:getenv-path");
   printf("getenv-path:%s|", getenv("PATH") ? getenv("PATH") : "null");
 
   {
-    parity_mark("parity:block:system");
+    parity_mark("parity:block:popen-read");
     FILE *p = parity_popen(CMD_PRINTF, "r");
     char buf[64];
     int status = -1;
