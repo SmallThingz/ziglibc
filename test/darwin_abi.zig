@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const c = @cImport({
+    @cInclude("stdarg.h");
     @cInclude("pthread.h");
     @cInclude("signal.h");
     @cInclude("sys/select.h");
@@ -49,9 +50,15 @@ comptime {
     expectAbi("mode_t", c.mode_t, std.posix.mode_t);
     expectAbi("off_t", c.off_t, std.posix.off_t);
     expectAbi("time_t", c.time_t, std.posix.time_t);
+    expectAbi("va_list", c.va_list, std.builtin.VaList);
     expectAbi("struct stat", c.struct_stat, std.c.Stat);
     expectAbi("struct timeval", c.struct_timeval, std.posix.timeval);
     expectAbi("struct sockaddr", c.struct_sockaddr, std.posix.sockaddr);
+    if (builtin.target.cpu.arch == .aarch64) {
+        if (std.meta.activeTag(@typeInfo(c.va_list)) != .pointer) {
+            @compileError("Darwin arm64 expects pointer-shaped c.va_list");
+        }
+    }
     expectOffset("struct sigaction", "sa_mask", @offsetOf(c.struct_sigaction, "sa_mask"), @offsetOf(std.c.Sigaction, "mask"));
     expectOffset("struct sigaction", "sa_flags", @offsetOf(c.struct_sigaction, "sa_flags"), @offsetOf(std.c.Sigaction, "flags"));
     expectOffset("struct timeval", "tv_sec", @offsetOf(c.struct_timeval, "tv_sec"), @offsetOf(std.posix.timeval, "sec"));
