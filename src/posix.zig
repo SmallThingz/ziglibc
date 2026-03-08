@@ -115,6 +115,14 @@ fn exportInternalSymbol(comptime f: anytype, comptime name: []const u8) void {
     }
 }
 
+fn darwinSysSigned(value: anytype) c_long {
+    return @as(c_long, @intCast(value));
+}
+
+fn darwinSysUnsigned(value: anytype) usize {
+    return @as(usize, @intCast(value));
+}
+
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const mach_port_t = c_uint;
     const kern_return_t = c_int;
@@ -536,7 +544,10 @@ export fn getopt(argc: c_int, argv: [*][*:0]u8, optstring: [*:0]const u8) callco
 
 fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.write, fd, buf, nbyte);
+        // Keep Darwin syscall arguments widened to full slot width. Native arm64
+        // is much less forgiving than Darling when narrow integers cross the
+        // variadic syscall(2) ABI boundary.
+        const rc = syscall(darwin_syscall.write, darwinSysSigned(fd), buf, darwinSysUnsigned(nbyte));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -578,7 +589,7 @@ fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
 
 fn zreadRaw(fd: c_int, buf: [*]u8, len: usize) isize {
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.read, fd, buf, len);
+        const rc = syscall(darwin_syscall.read, darwinSysSigned(fd), buf, darwinSysUnsigned(len));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -739,7 +750,13 @@ fn zopenAtRaw(dirfd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_i
     if (builtin.os.tag.isDarwin()) {
         const darwin_flags = translateDarwinOpenFlags(oflag);
         if (darwin_flags == -1) return -1;
-        const rc = syscall(darwin_syscall.openat, dirfd, path, darwin_flags, create_mode);
+        const rc = syscall(
+            darwin_syscall.openat,
+            darwinSysSigned(dirfd),
+            path,
+            darwinSysSigned(darwin_flags),
+            darwinSysUnsigned(create_mode),
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -860,7 +877,7 @@ fn _fcntlArgInt(fd: c_int, cmd: c_int, arg: c_int) callconv(.c) c_int {
     }
 
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.fcntl, fd, cmd, arg);
+        const rc = syscall(darwin_syscall.fcntl, darwinSysSigned(fd), darwinSysSigned(cmd), darwinSysSigned(arg));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1391,7 +1408,12 @@ export fn socket(domain: c_int, sock_type: c_int, protocol: c_int) callconv(.c) 
         };
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.socket, domain, sock_type, protocol);
+        const rc = syscall(
+            darwin_syscall.socket,
+            darwinSysSigned(domain),
+            darwinSysSigned(sock_type),
+            darwinSysSigned(protocol),
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1432,7 +1454,7 @@ export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.sockle
             c.errno = c.EINVAL;
             return -1;
         };
-        const rc = syscall(darwin_syscall.bind, sock, name, addrlen);
+        const rc = syscall(darwin_syscall.bind, darwinSysSigned(sock), name, darwinSysUnsigned(addrlen));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1472,7 +1494,7 @@ export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len
             c.errno = c.EINVAL;
             return -1;
         };
-        const rc = syscall(darwin_syscall.connect, sock, name, address_len);
+        const rc = syscall(darwin_syscall.connect, darwinSysSigned(sock), name, darwinSysUnsigned(address_len));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1520,7 +1542,7 @@ export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
             c.errno = c.EINVAL;
             return -1;
         };
-        const rc = syscall(darwin_syscall.getsockname, sock, name, len_ptr);
+        const rc = syscall(darwin_syscall.getsockname, darwinSysSigned(sock), name, len_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1571,7 +1593,7 @@ export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
             c.errno = c.EINVAL;
             return -1;
         };
-        const rc = syscall(darwin_syscall.getpeername, sock, name, len_ptr);
+        const rc = syscall(darwin_syscall.getpeername, darwinSysSigned(sock), name, len_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1615,7 +1637,14 @@ export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.getsockopt, sock, level, option_name, out_ptr, len_ptr);
+        const rc = syscall(
+            darwin_syscall.getsockopt,
+            darwinSysSigned(sock),
+            darwinSysSigned(level),
+            darwinSysSigned(option_name),
+            out_ptr,
+            len_ptr,
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1649,7 +1678,14 @@ export fn setsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.setsockopt, sock, level, option_name, in_ptr, option_len);
+        const rc = syscall(
+            darwin_syscall.setsockopt,
+            darwinSysSigned(sock),
+            darwinSysSigned(level),
+            darwinSysSigned(option_name),
+            in_ptr,
+            darwinSysUnsigned(option_len),
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1695,12 +1731,12 @@ export fn sendto(sockfd: c_int, message: ?*const anyopaque, len: usize, flags: c
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(
             darwin_syscall.sendto,
-            sock,
+            darwinSysSigned(sock),
             data_ptr,
-            len,
-            flags,
+            darwinSysUnsigned(len),
+            darwinSysSigned(flags),
             dest_addr,
-            dest_len,
+            darwinSysUnsigned(dest_len),
         );
         if (rc == -1) {
             c.errno = darwin.__error().*;
@@ -1742,7 +1778,15 @@ export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) 
         return @as(isize, @intCast(rc));
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.recvfrom, sock, buf_ptr, length, flags, @as(?*c.struct_sockaddr, null), @as(?*c.socklen_t, null));
+        const rc = syscall(
+            darwin_syscall.recvfrom,
+            darwinSysSigned(sock),
+            buf_ptr,
+            darwinSysUnsigned(length),
+            darwinSysSigned(flags),
+            @as(?*c.struct_sockaddr, null),
+            @as(?*c.socklen_t, null),
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1790,7 +1834,15 @@ export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_i
         return @as(isize, @intCast(rc));
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.recvfrom, sock, buf_ptr, length, flags, address, address_len);
+        const rc = syscall(
+            darwin_syscall.recvfrom,
+            darwinSysSigned(sock),
+            buf_ptr,
+            darwinSysUnsigned(length),
+            darwinSysSigned(flags),
+            address,
+            address_len,
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1819,7 +1871,7 @@ export fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int {
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.shutdown, sock, how);
+        const rc = syscall(darwin_syscall.shutdown, darwinSysSigned(sock), darwinSysSigned(how));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -2460,7 +2512,7 @@ export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
     }
     if (builtin.os.tag.isDarwin()) {
         var native_value: DarwinItimerval = undefined;
-        const rc = syscall(darwin_syscall.getitimer, which, &native_value);
+        const rc = syscall(darwin_syscall.getitimer, darwinSysSigned(which), &native_value);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -2528,7 +2580,7 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         var native_old: DarwinItimerval = undefined;
         const rc = syscall(
             darwin_syscall.setitimer,
-            which,
+            darwinSysSigned(which),
             &native_value,
             if (!cPtrIsNull(avalue)) &native_old else @as(?*DarwinItimerval, null),
         );
@@ -2703,7 +2755,7 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 
         var native_old = std.mem.zeroes(std.c.Sigaction);
         const native_old_ptr: ?*std.c.Sigaction = if (!cPtrIsNull(oact)) &native_old else null;
-        const rc = syscall(darwin_syscall.sigaction, sig, native_act_ptr, native_old_ptr);
+        const rc = syscall(darwin_syscall.sigaction, darwinSysSigned(sig), native_act_ptr, native_old_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -2825,7 +2877,7 @@ export fn stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int {
 export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     trace.log("chmod '{s}' mode=0x{x}", .{ path, mode });
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.chmod, path, @as(c_uint, @intCast(mode)));
+        const rc = syscall(darwin_syscall.chmod, path, darwinSysUnsigned(mode));
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -3418,7 +3470,7 @@ export fn strncasecmp_l(a: [*:0]const u8, b: [*:0]const u8, n: usize, locale: c.
 fn _ioctlArgPtr(fd: c_int, request: c_ulong, arg_ptr: *anyopaque) callconv(.c) c_int {
     trace.log("ioctl fd={} request=0x{x} arg={*}", .{ fd, request, arg_ptr });
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.ioctl, fd, request, arg_ptr);
+        const rc = syscall(darwin_syscall.ioctl, darwinSysSigned(fd), darwinSysUnsigned(request), arg_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -3666,7 +3718,7 @@ export fn select(
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(
             darwin_syscall.select,
-            nfds,
+            darwinSysSigned(nfds),
             readfds,
             writefds,
             errorfds,
@@ -3762,7 +3814,7 @@ export fn pselect(
         // the timeout-only case look equivalent.
         const rc = syscall(
             darwin_syscall.pselect,
-            nfds,
+            darwinSysSigned(nfds),
             readfds,
             writefds,
             errorfds,

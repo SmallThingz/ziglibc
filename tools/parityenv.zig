@@ -145,6 +145,19 @@ fn termEqual(a: std.process.Child.Term, b: std.process.Child.Term) bool {
     };
 }
 
+fn equalIgnoringCrlf(a: []const u8, b: []const u8) bool {
+    var ai: usize = 0;
+    var bi: usize = 0;
+    while (true) {
+        while (ai < a.len and a[ai] == '\r') ai += 1;
+        while (bi < b.len and b[bi] == '\r') bi += 1;
+        if (ai == a.len or bi == b.len) return ai == a.len and bi == b.len;
+        if (a[ai] != b[bi]) return false;
+        ai += 1;
+        bi += 1;
+    }
+}
+
 fn initChild(
     allocator: std.mem.Allocator,
     runner: ExternalRunner,
@@ -267,7 +280,10 @@ pub fn main() !u8 {
         try std.fs.File.stderr().writeAll(msg);
         return 1;
     }
-    if (!std.mem.eql(u8, expected.stderr, actual.stderr)) {
+    // Marker-only diagnostics should not fail parity because one libc writes
+    // text-mode CRLF while the other writes LF. Keep stderr content checks
+    // semantic here so Windows/Wine still reports real marker differences.
+    if (!equalIgnoringCrlf(expected.stderr, actual.stderr)) {
         const msg = try std.fmt.allocPrint(
             allocator,
             "stderr mismatch\nexpected:\n{s}\nactual:\n{s}\n",

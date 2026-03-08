@@ -422,9 +422,11 @@ pub fn build(b: *std.Build) void {
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);
         configureExternalHelperRunner(run_step, exe);
-        // Keep block markers opt-in for manual repro only. Injecting extra env
-        // into the emulator path changes the execution surface enough to create
-        // Darling-only harness failures that do not reproduce on native macOS.
+        // Diagnostic markers only write labeled stderr lines. They do not alter
+        // libc behavior, and keeping them enabled in CI makes native-only Darwin
+        // failures line up with emulator runs instead of collapsing into a blank
+        // SIGSEGV with no block context.
+        run_step.setEnvironmentVariable("ZIGLIBC_TEST_MARKERS", "1");
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -469,6 +471,7 @@ pub fn build(b: *std.Build) void {
         addArtifactArgCompat(run_step, b, system_exe);
         addArtifactArgCompat(run_step, b, zig_exe);
         configureExternalHelperRunner(run_step, zig_exe);
+        run_step.setEnvironmentVariable("ZIGLIBC_TEST_MARKERS", "1");
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
         break :blk run_step;

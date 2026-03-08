@@ -74,6 +74,7 @@ int main(void)
   printf("getenv-path:%s|", getenv("PATH") ? getenv("PATH") : "null");
 
   {
+    parity_mark("parity:block:system");
     FILE *p = parity_popen(CMD_PRINTF, "r");
     char buf[64];
     int status = -1;
@@ -86,6 +87,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:popen-path");
     FILE *p = parity_popen(CMD_PATH, "r");
     char buf[64];
     int status = -1;
@@ -98,6 +100,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:popen-exit");
     FILE *p = parity_popen(CMD_EXIT5, "r");
     int status = -1;
     if (p != NULL) {
@@ -109,6 +112,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:fopen-many");
     FILE *files[128];
     size_t count = 0;
     while (count < (sizeof(files) / sizeof(files[0]))) {
@@ -230,6 +234,7 @@ int main(void)
 
 #if LIBC_PARITY_HAVE_UTIMES
   {
+    parity_mark("parity:block:utimes");
     const char *path = "libc-parity-utimes.tmp";
     struct timeval tv[2];
     struct stat st;
@@ -258,6 +263,7 @@ int main(void)
 
 #if LIBC_PARITY_HAVE_POSIX_IO
   {
+    parity_mark("parity:block:gethostname");
     char host[256];
     memset(host, 0, sizeof(host));
     if (gethostname(host, sizeof(host)) == 0) {
@@ -268,6 +274,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:openat");
     const char *path = "libc-parity-openat.tmp";
     int fd = openat(AT_FDCWD, path, O_CREAT | O_TRUNC | O_RDWR, 0600);
     struct stat st;
@@ -286,6 +293,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:link");
     const char *src = "libc-parity-link-src.tmp";
     const char *dst = "libc-parity-link-dst.tmp";
     FILE *f = fopen(src, "w");
@@ -301,6 +309,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:fcntl");
     const char *path = "libc-parity-fcntl.tmp";
     int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
     if (fd >= 0) {
@@ -325,6 +334,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:writev");
     const char *path = "libc-parity-uio.tmp";
     struct iovec out[2];
     struct iovec in[2];
@@ -354,6 +364,7 @@ int main(void)
   }
 
   {
+    parity_mark("parity:block:pathconf");
     FILE *f = fopen("libc-parity-pathconf.tmp", "w");
     if (f != NULL) {
       long pc = pathconf(".", _PC_LINK_MAX);
