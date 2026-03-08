@@ -1,38 +1,28 @@
 #include <errno.h>
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-static void parity_mark(const char *name)
-{
-  if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) {
-    fputs(name, stderr);
-    fputc('\n', stderr);
-    fflush(stderr);
-  }
-}
+#include "test_markers.h"
 
 static void parity_handler(int sig) { (void)sig; }
 
 int main(void)
 {
   {
-    parity_mark("parity:block:signal");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:signal");
     void (*old_handler)(int) = signal(SIGINT, parity_handler);
     void (*prev_handler)(int) = signal(SIGINT, old_handler);
     printf("signal-basic:%d:%d:%d:%d|", old_handler != SIG_ERR, prev_handler == parity_handler, old_handler == SIG_DFL, prev_handler == SIG_DFL);
   }
 
   {
-    parity_mark("parity:block:strtol");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtol");
     const char *s = "abc"; char *endptr = NULL; long value; long dist;
     errno = 123; value = strtol(s, &endptr, 10); dist = (long)(endptr - s);
     printf("strtol-nodigits:%ld:%d:%ld|", value, errno, dist);
   }
 
   {
-    parity_mark("parity:block:strtod");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:strtod");
     const char *s = "abc"; char *endptr = NULL; double value; long dist;
     errno = 123; value = strtod(s, &endptr); dist = (long)(endptr - s);
     printf("strtod-nodigits:%d:%d:%ld|", value == 0.0, errno, dist);

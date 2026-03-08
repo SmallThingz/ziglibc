@@ -1,15 +1,13 @@
 #include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <time.h>
 #include "expect.h"
-
-#define PANIC_MARK(name) do { if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) { fputs(name, stderr); fputc('\n', stderr); fflush(stderr); } } while (0)
+#include "test_markers.h"
 
 int main(void)
 {
   {
-    PANIC_MARK("panic_stdio:block:stdio-file");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_stdio:block:stdio-file");
     const char *name = "panic-repl.tmp";
     const char *renamed = "panic-repl-renamed.tmp";
     FILE *f = fopen(name, "w");
@@ -29,7 +27,7 @@ int main(void)
   }
 #ifndef _WIN32
   {
-    PANIC_MARK("panic_stdio:block:fopen-many");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_stdio:block:fopen-many");
     FILE *files[256];
     size_t count = 0;
     while (count < (sizeof(files) / sizeof(files[0]))) {
@@ -44,7 +42,7 @@ int main(void)
     }
   }
 #endif
-  PANIC_MARK("panic_stdio:block:perror");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_stdio:block:perror");
   errno = ENOENT;
   perror("panic_stdio");
   puts("Success!");

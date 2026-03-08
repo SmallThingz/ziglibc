@@ -1,25 +1,23 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <time.h>
 #include "expect.h"
-
-#define PANIC_MARK(name) do { if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) { fputs(name, stderr); fputc('\n', stderr); fflush(stderr); } } while (0)
+#include "test_markers.h"
 
 int main(void)
 {
   {
-    PANIC_MARK("panic_time_core:block:clock");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_time_core:block:clock");
     clock_t c1 = clock();
     clock_t c2 = clock();
     expect(c1 >= 0);
     expect(c2 >= c1);
   }
 
-  PANIC_MARK("panic_time_core:block:difftime");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_time_core:block:difftime");
   expect(7.0 == difftime((time_t)10, (time_t)3));
 
   {
-    PANIC_MARK("panic_time_core:block:time-convert");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_time_core:block:time-convert");
     time_t t0 = 0;
     struct tm *utc = gmtime(&t0);
     struct tm *local = localtime(&t0);
@@ -32,7 +30,7 @@ int main(void)
   }
 
   {
-    PANIC_MARK("panic_time_core:block:mktime");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_time_core:block:mktime");
     struct tm tm = {0};
     tm.tm_year = 70;
     tm.tm_mon = 0;

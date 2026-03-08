@@ -1,24 +1,16 @@
 #include <errno.h>
-#include <stdio.h>
 #include <string.h>
 #ifndef _WIN32
 #include <sys/select.h>
 #include <sys/time.h>
 #include <time.h>
 #endif
-
-static void parity_mark(const char *name)
-{
-  fputs(name, stderr);
-  fputc('\n', stderr);
-  fflush(stderr);
-}
+#include "test_markers.h"
 
 int main(void)
 {
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
-  parity_mark("parity_posix_timer:block:setitimer");
+  TEST_SET_UNBUFFERED();
+  TEST_MARK_ALWAYS("parity_posix_timer:block:setitimer");
 #if LIBC_PARITY_HAVE_SETITIMER
   {
     struct itimerval val, old;
@@ -33,7 +25,7 @@ int main(void)
   printf("setitimer-zero:skip|");
 #endif
 
-  parity_mark("parity_posix_timer:block:select");
+  TEST_MARK_ALWAYS("parity_posix_timer:block:select");
 #if LIBC_PARITY_HAVE_SELECT
   {
     struct timeval tv = {0,0};
@@ -46,7 +38,7 @@ int main(void)
   printf("select-timeout:skip");
 #endif
 
-  parity_mark("parity_posix_timer:block:pselect");
+  TEST_MARK_ALWAYS("parity_posix_timer:block:pselect");
 #if LIBC_PARITY_HAVE_PSELECT
   {
     struct timespec ts = {0,0};

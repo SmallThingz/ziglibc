@@ -1,16 +1,13 @@
 #include <locale.h>
 #include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "expect.h"
-
-#define PANIC_MARK(name) do { if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) { fputs(name, stderr); fputc('\n', stderr); fflush(stderr); } } while (0)
+#include "test_markers.h"
 
 int main(void)
 {
   {
-    PANIC_MARK("panic_math_locale:block:math");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_math_locale:block:math");
     double v;
     v = acos(1.0); expect(v > -1e-12 && v < 1e-12);
     v = asin(0.0); expect(v > -1e-12 && v < 1e-12);
@@ -20,7 +17,7 @@ int main(void)
   }
 
   {
-    PANIC_MARK("panic_math_locale:block:locale");
+    TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "panic_math_locale:block:locale");
     expect(NULL != setlocale(LC_ALL, "C"));
     expect(0 == strcmp("C", setlocale(LC_ALL, NULL)));
     expect(0 == strcmp("C", setlocale(LC_ALL, "")));

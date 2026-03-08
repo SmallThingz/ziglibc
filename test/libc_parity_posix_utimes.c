@@ -1,24 +1,16 @@
 #include <errno.h>
-#include <stdio.h>
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <sys/time.h>
 #endif
 #include <unistd.h>
-
-static void parity_mark(const char *name)
-{
-  fputs(name, stderr);
-  fputc('\n', stderr);
-  fflush(stderr);
-}
+#include "test_markers.h"
 
 int main(void)
 {
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
+  TEST_SET_UNBUFFERED();
 
-  parity_mark("parity_posix_utimes:block:utimes");
+  TEST_MARK_ALWAYS("parity_posix_utimes:block:utimes");
 #if LIBC_PARITY_HAVE_UTIMES
   {
     struct timeval tv[2];

@@ -1,38 +1,28 @@
 #include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-static void parity_mark(const char *name)
-{
-  if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) {
-    fputs(name, stderr);
-    fputc('\n', stderr);
-    fflush(stderr);
-  }
-}
+#include "test_markers.h"
 
 int main(void)
 {
-  parity_mark("parity:block:system-null");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:system-null");
   printf("system-null:%d|", system(NULL) != 0);
 
-  parity_mark("parity:block:system-exit7");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:system-exit7");
   printf("system-exit7:%d|", system("exit 7"));
 
-  parity_mark("parity:block:getenv-path");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:getenv-path");
   { const char *path = getenv("PATH"); printf("getenv-path:%s|", path ? path : "(null)"); }
 
-  parity_mark("parity:block:popen-read");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:popen-read");
   { FILE *p = popen("printf popen-ok", "r"); char buf[64] = {0}; if (!p || !fgets(buf, sizeof(buf), p)) return 1; printf("popen-read:%s:%d|", buf, pclose(p)); }
 
-  parity_mark("parity:block:popen-path");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:popen-path");
   { const char *home = getenv("HOME"); if (home && home[0]) { FILE *p = popen("printf yes", "r"); char buf[16] = {0}; if (!p || !fgets(buf, sizeof(buf), p)) return 1; printf("popen-path:%s:%d|", buf, pclose(p)); } else { printf("popen-path:skip|"); } }
 
-  parity_mark("parity:block:popen-exit");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:popen-exit");
   printf("popen-exit5:%d|", pclose(popen("exit 5", "r")));
 
-  parity_mark("parity:block:fopen-many");
+  TEST_MARK_IF_ENV("ZIGLIBC_TEST_MARKERS", "parity:block:fopen-many");
   {
     FILE *files[128]; size_t count = 0;
     while (count < (sizeof(files)/sizeof(files[0]))) {
