@@ -2234,8 +2234,11 @@ fn vformatWithCVaListPtr(
         return vformat(out_written, writer, format, @ptrCast(&arg[0]));
     }
     if (comptime va_list_tag == .pointer) {
-        const va = arg.*;
-        return vformat(out_written, writer, format, @ptrCast(va));
+        // Pointer-shaped C va_list ABIs (notably Darwin arm64) still require
+        // passing the address of the va_list object to @cVaArg so the cursor
+        // advances in the caller-owned list object. Dereferencing here makes
+        // @cVaArg walk the payload address instead and crashes on native macOS.
+        return vformat(out_written, writer, format, @ptrCast(arg));
     }
     if (comptime va_list_tag == .@"struct") {
         return vformat(out_written, writer, format, @ptrCast(arg));
@@ -2487,7 +2490,7 @@ fn vscanWithCVaListPtr(reader: *FixedReader, fmt: [*:0]const u8, arg: *c.va_list
         return vscan(reader, fmt, @ptrCast(&arg[0]));
     }
     if (comptime va_list_tag == .pointer) {
-        return vscan(reader, fmt, @ptrCast(arg.*));
+        return vscan(reader, fmt, @ptrCast(arg));
     }
     if (comptime va_list_tag == .@"struct") {
         return vscan(reader, fmt, @ptrCast(arg));
