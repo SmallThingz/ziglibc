@@ -2575,50 +2575,101 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
 // --------------------------------------------------------------------------------
 // signal
 // --------------------------------------------------------------------------------
-fn cHandlerToLinux(handler: @TypeOf(@as(c.struct_sigaction, undefined).sa_handler)) ?std.os.linux.Sigaction.handler_fn {
+fn cSigactionHandlerType() type {
+    return if (comptime @hasField(c.struct_sigaction, "sa_handler"))
+        @TypeOf(@as(c.struct_sigaction, undefined).sa_handler)
+    else
+        @TypeOf(@as(c.struct_sigaction, undefined).unnamed_0.sa_handler);
+}
+
+fn cSigactionSigactionType() type {
+    return if (comptime @hasField(c.struct_sigaction, "sa_sigaction"))
+        @TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction)
+    else
+        @TypeOf(@as(c.struct_sigaction, undefined).unnamed_0.sa_sigaction);
+}
+
+fn cSigactionGetHandler(action: c.struct_sigaction) cSigactionHandlerType() {
+    return if (comptime @hasField(c.struct_sigaction, "sa_handler"))
+        action.sa_handler
+    else
+        action.unnamed_0.sa_handler;
+}
+
+fn cSigactionSetHandler(action: *c.struct_sigaction, handler: cSigactionHandlerType()) void {
+    if (comptime @hasField(c.struct_sigaction, "sa_handler")) {
+        action.sa_handler = handler;
+    } else {
+        action.unnamed_0.sa_handler = handler;
+    }
+}
+
+fn cSigactionGetSigaction(action: c.struct_sigaction) cSigactionSigactionType() {
+    return if (comptime @hasField(c.struct_sigaction, "sa_sigaction"))
+        action.sa_sigaction
+    else
+        action.unnamed_0.sa_sigaction;
+}
+
+fn cSigactionSetSigaction(action: *c.struct_sigaction, handler: cSigactionSigactionType()) void {
+    if (comptime @hasField(c.struct_sigaction, "sa_sigaction")) {
+        action.sa_sigaction = handler;
+    } else {
+        action.unnamed_0.sa_sigaction = handler;
+    }
+}
+
+fn cHandlerToLinux(handler: cSigactionHandlerType()) ?std.os.linux.Sigaction.handler_fn {
     return if (handler) |h|
         @as(?std.os.linux.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
     else
         null;
 }
 
-fn cSigactionToLinux(sigaction_fn: @TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction)) ?std.os.linux.Sigaction.sigaction_fn {
+fn cSigactionToLinux(sigaction_fn: cSigactionSigactionType()) ?std.os.linux.Sigaction.sigaction_fn {
     return if (sigaction_fn) |f|
         @as(?std.os.linux.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
     else
         null;
 }
 
-fn linuxHandlerToC(handler: ?std.os.linux.Sigaction.handler_fn) @TypeOf(@as(c.struct_sigaction, undefined).sa_handler) {
+fn linuxHandlerToC(handler: ?std.os.linux.Sigaction.handler_fn) cSigactionHandlerType() {
     return if (handler) |h|
-        @as(@TypeOf(@as(c.struct_sigaction, undefined).sa_handler), @ptrFromInt(@intFromPtr(h)))
+        @as(cSigactionHandlerType(), @ptrFromInt(@intFromPtr(h)))
     else
         null;
 }
 
-fn linuxSigactionToC(sigaction_fn: ?std.os.linux.Sigaction.sigaction_fn) @TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction) {
+fn linuxSigactionToC(sigaction_fn: ?std.os.linux.Sigaction.sigaction_fn) cSigactionSigactionType() {
     return if (sigaction_fn) |f|
-        @as(@TypeOf(@as(c.struct_sigaction, undefined).sa_sigaction), @ptrFromInt(@intFromPtr(f)))
+        @as(cSigactionSigactionType(), @ptrFromInt(@intFromPtr(f)))
     else
         null;
 }
 
 fn cSigsetToLinux(mask: c.sigset_t) std.os.linux.sigset_t {
     var out = std.os.linux.sigemptyset();
-    out[0] = @as(@TypeOf(out[0]), @intCast(mask.__signals));
+    const bits: c_ulong = if (comptime builtin.os.tag.isDarwin())
+        @as(c_ulong, @intCast(mask))
+    else
+        mask.__signals;
+    out[0] = @as(@TypeOf(out[0]), @intCast(bits));
     return out;
 }
 
 fn linuxSigsetToC(mask: std.os.linux.sigset_t) c.sigset_t {
+    if (builtin.os.tag.isDarwin()) {
+        return @as(c.sigset_t, @truncate(mask[0]));
+    }
     return .{ .__signals = @as(c_ulong, @intCast(mask[0])) };
 }
 
 fn cSigsetToDarwin(mask: c.sigset_t) std.c.sigset_t {
-    return @as(std.c.sigset_t, @truncate(mask.__signals));
+    return @as(std.c.sigset_t, @truncate(mask));
 }
 
 fn darwinSigsetToC(mask: std.c.sigset_t) c.sigset_t {
-    return .{ .__signals = @as(c_ulong, @intCast(mask)) };
+    return @as(c.sigset_t, @truncate(mask));
 }
 
 fn cPtrIsNull(ptr: anytype) bool {
@@ -2637,12 +2688,12 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
             native_act.mask = cSigsetToDarwin(new_act.sa_mask);
             native_act.flags = @as(c_uint, @bitCast(new_act.sa_flags));
             if ((native_act.flags & std.c.SA.SIGINFO) != 0) {
-                native_act.handler.sigaction = if (new_act.sa_sigaction) |f|
+                native_act.handler.sigaction = if (cSigactionGetSigaction(new_act.*)) |f|
                     @as(?std.c.Sigaction.sigaction_fn, @ptrFromInt(@intFromPtr(f)))
                 else
                     null;
             } else {
-                native_act.handler.handler = if (new_act.sa_handler) |h|
+                native_act.handler.handler = if (cSigactionGetHandler(new_act.*)) |h|
                     @as(?std.c.Sigaction.handler_fn, @ptrFromInt(@intFromPtr(h)))
                 else
                     null;
@@ -2662,17 +2713,21 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
             old_act.sa_mask = darwinSigsetToC(native_old.mask);
             old_act.sa_flags = @as(c_int, @bitCast(native_old.flags));
             if ((native_old.flags & std.c.SA.SIGINFO) != 0) {
-                old_act.sa_sigaction = if (native_old.handler.sigaction) |f|
-                    @as(@TypeOf(old_act.sa_sigaction), @ptrFromInt(@intFromPtr(f)))
+                cSigactionSetSigaction(old_act, if (native_old.handler.sigaction) |f|
+                    @as(cSigactionSigactionType(), @ptrFromInt(@intFromPtr(f)))
                 else
-                    null;
-                old_act.sa_handler = null;
+                    null);
+                if (comptime @hasField(c.struct_sigaction, "sa_handler")) {
+                    cSigactionSetHandler(old_act, null);
+                }
             } else {
-                old_act.sa_handler = if (native_old.handler.handler) |h|
-                    @as(@TypeOf(old_act.sa_handler), @ptrFromInt(@intFromPtr(h)))
+                cSigactionSetHandler(old_act, if (native_old.handler.handler) |h|
+                    @as(cSigactionHandlerType(), @ptrFromInt(@intFromPtr(h)))
                 else
-                    null;
-                old_act.sa_sigaction = null;
+                    null);
+                if (comptime @hasField(c.struct_sigaction, "sa_sigaction")) {
+                    cSigactionSetSigaction(old_act, null);
+                }
             }
         }
         return 0;
@@ -2696,9 +2751,9 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
             .flags = @as(@TypeOf(@as(std.os.linux.Sigaction, undefined).flags), @intCast(flags_bits)),
         };
         if ((flags_bits & std.os.linux.SA.SIGINFO) != 0) {
-            linux_act.handler = .{ .sigaction = cSigactionToLinux(new_act.sa_sigaction) };
+            linux_act.handler = .{ .sigaction = cSigactionToLinux(cSigactionGetSigaction(new_act.*)) };
         } else {
-            linux_act.handler = .{ .handler = cHandlerToLinux(new_act.sa_handler) };
+            linux_act.handler = .{ .handler = cHandlerToLinux(cSigactionGetHandler(new_act.*)) };
         }
         break :blk &linux_act;
     } else null;
@@ -2717,11 +2772,15 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
                 old_act.sa_flags = @as(c_int, @bitCast(old_flags_bits));
                 old_act.sa_mask = linuxSigsetToC(linux_old.mask);
                 if ((old_flags_bits & std.os.linux.SA.SIGINFO) != 0) {
-                    old_act.sa_sigaction = linuxSigactionToC(linux_old.handler.sigaction);
-                    old_act.sa_handler = null;
+                    cSigactionSetSigaction(old_act, linuxSigactionToC(linux_old.handler.sigaction));
+                    if (comptime @hasField(c.struct_sigaction, "sa_handler")) {
+                        cSigactionSetHandler(old_act, null);
+                    }
                 } else {
-                    old_act.sa_handler = linuxHandlerToC(linux_old.handler.handler);
-                    old_act.sa_sigaction = null;
+                    cSigactionSetHandler(old_act, linuxHandlerToC(linux_old.handler.handler));
+                    if (comptime @hasField(c.struct_sigaction, "sa_sigaction")) {
+                        cSigactionSetSigaction(old_act, null);
+                    }
                 }
             }
             return 0;

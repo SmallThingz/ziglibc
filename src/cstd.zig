@@ -1156,17 +1156,39 @@ export fn strerror(errnum: c_int) callconv(.c) [*:0]const u8 {
 // --------------------------------------------------------------------------------
 // signal
 // --------------------------------------------------------------------------------
+fn cSigactionHandlerType() type {
+    return if (comptime @hasField(c.struct_sigaction, "sa_handler"))
+        @TypeOf(@as(c.struct_sigaction, undefined).sa_handler)
+    else
+        @TypeOf(@as(c.struct_sigaction, undefined).unnamed_0.sa_handler);
+}
+
+fn cSigactionGetHandler(action: c.struct_sigaction) cSigactionHandlerType() {
+    return if (comptime @hasField(c.struct_sigaction, "sa_handler"))
+        action.sa_handler
+    else
+        action.unnamed_0.sa_handler;
+}
+
+fn cSigactionSetHandler(action: *c.struct_sigaction, handler: cSigactionHandlerType()) void {
+    if (comptime @hasField(c.struct_sigaction, "sa_handler")) {
+        action.sa_handler = handler;
+    } else {
+        action.unnamed_0.sa_handler = handler;
+    }
+}
+
 fn _zsignalRaw(sig: c_int, func_ptr: usize) callconv(.c) usize {
     const sig_err = @as(usize, @bitCast(@as(isize, -1)));
     if (builtin.os.tag == .windows) {
         var action = std.mem.zeroes(c.struct_sigaction);
-        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(func_ptr));
+        cSigactionSetHandler(&action, @as(cSigactionHandlerType(), @ptrFromInt(func_ptr)));
 
         var old_action = std.mem.zeroes(c.struct_sigaction);
         if (__zwindows_sigaction(sig, &action, &old_action) != 0) {
             return sig_err;
         }
-        return if (old_action.sa_handler) |h|
+        return if (cSigactionGetHandler(old_action)) |h|
             @intFromPtr(h)
         else
             0;
@@ -1177,20 +1199,20 @@ fn _zsignalRaw(sig: c_int, func_ptr: usize) callconv(.c) usize {
     }
     if (builtin.os.tag.isDarwin()) {
         var action = std.mem.zeroes(c.struct_sigaction);
-        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(func_ptr));
+        cSigactionSetHandler(&action, @as(cSigactionHandlerType(), @ptrFromInt(func_ptr)));
         action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
 
         var old_action = std.mem.zeroes(c.struct_sigaction);
         if (c.sigaction(sig, &action, &old_action) != 0) {
             return sig_err;
         }
-        return if (old_action.sa_handler) |h|
+        return if (cSigactionGetHandler(old_action)) |h|
             @intFromPtr(h)
         else
             0;
     }
     var action = std.mem.zeroes(c.struct_sigaction);
-    action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(func_ptr));
+    cSigactionSetHandler(&action, @as(cSigactionHandlerType(), @ptrFromInt(func_ptr)));
     action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
 
     var old_action: std.posix.Sigaction = undefined;

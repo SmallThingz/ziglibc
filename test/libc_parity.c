@@ -28,8 +28,13 @@
 #define parity_pclose _pclose
 #define CMD_EXIT7 "exit /b 7"
 #define CMD_EXIT5 "exit /b 5"
-#define CMD_PRINTF "set /p =popen-ok <nul"
-#define CMD_PATH "if defined PATH (set /p =yes <nul) else (set /p =no <nul)"
+/*
+ * Native cmd.exe and Wine's cmd disagree about the residual errorlevel from
+ * `set /p ... <nul>`. Force an explicit shell exit code here so parity checks
+ * exercise popen/pclose itself instead of emulator-specific shell behavior.
+ */
+#define CMD_PRINTF "(set /p =popen-ok <nul) & exit /b 0"
+#define CMD_PATH "(if defined PATH (set /p =yes <nul) else (set /p =no <nul)) & exit /b 0"
 #else
 #define parity_popen popen
 #define parity_pclose pclose
@@ -52,6 +57,8 @@ static void read_all(FILE *stream, char *buf, size_t len)
 
 int main(void)
 {
+  setvbuf(stdout, NULL, _IONBF, 0);
+
   printf("system-null:%d|", system(NULL));
 
   printf("system-exit7:%d|", system(CMD_EXIT7));

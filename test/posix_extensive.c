@@ -371,7 +371,12 @@ int main(int argc, char *argv[])
   }
 
   {
-    FILE *p = popen("set /p =popen-ok <nul", "r");
+    /*
+     * Native cmd.exe can keep a non-zero ERRORLEVEL after `set /p ... <nul>`
+     * while Wine's cmd reports success. Force a final `exit /b 0` so this test
+     * measures popen/pclose behavior rather than shell-specific status quirks.
+     */
+    FILE *p = popen("(set /p =popen-ok <nul) & exit /b 0", "r");
     char buf[64];
     expect(p != NULL);
     expect(NULL != fgets(buf, sizeof(buf), p));
@@ -380,7 +385,7 @@ int main(int argc, char *argv[])
   }
 
   {
-    FILE *p = popen("for /l %i in (1,1,1024) do @<nul set /p =x", "r");
+    FILE *p = popen("(for /l %i in (1,1,1024) do @<nul set /p =x) & exit /b 0", "r");
     char buf[8];
     expect(p != NULL);
     expect(NULL != fgets(buf, sizeof(buf), p));

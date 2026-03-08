@@ -26,7 +26,6 @@
 #define PTHREAD_SCOPE_PROCESS 1
 #define PTHREAD_SCOPE_SYSTEM 0
 
-typedef int pthread_attr_t;
 typedef int pthread_barrier_t;
 typedef int pthread_barrierattr_t;
 #ifdef __APPLE__
@@ -49,17 +48,23 @@ typedef int pthread_key_t;
 #ifdef __APPLE__
 typedef struct {
   long __sig;
+  char __opaque[56];
+} pthread_attr_t;
+typedef void *pthread_t;
+typedef struct {
+  long __sig;
   char __opaque[__ZIGLIBC_PTHREAD_MUTEX_SIZE];
 } pthread_mutex_t;
 #else
 typedef int pthread_mutex_t;
+typedef int pthread_attr_t;
+typedef int pthread_t;
 #endif
 typedef int pthread_mutexattr_t;
 typedef int pthread_once_t;
 typedef int pthread_rwlock_t;
 typedef int pthread_rwlockattr_t;
 typedef int pthread_spinlock_t;
-typedef int pthread_t;
 
 #ifdef __APPLE__
 #define _PTHREAD_MUTEX_SIG_init 0x32AAABA7L

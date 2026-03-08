@@ -35,12 +35,23 @@ void (*signal(int sig, void (*func)(int)))(int);
       long si_band;
       union sigval si_value;
     } siginfo_t;
+#ifdef __APPLE__
+    struct sigaction {
+      union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t *,void*);
+      };
+      sigset_t sa_mask;
+      int sa_flags;
+    };
+#else
     struct sigaction {
       void (*sa_handler)(int);
       sigset_t sa_mask;
       int sa_flags;
       void (*sa_sigaction)(int, siginfo_t *,void*);
     };
+#endif
     int sigaction(
         int sig,
         const struct sigaction *__zrestrict act,
