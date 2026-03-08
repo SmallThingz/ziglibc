@@ -42,15 +42,17 @@ struct termios {
 int tcgetattr(int, struct termios *);
 int tcsetattr(int fildes, int optional_actions, const struct termios *termios_p);
 
-/* I think these definitions are specific to linux but go in termios.h */
-#if 1
+#if defined(__APPLE__)
+    #define TIOCGWINSZ 0x40087468
+#else
     #define TIOCGWINSZ 0x5413
-    struct winsize {
-        unsigned short ws_row;
-        unsigned short ws_col;
-        unsigned short ws_xpixel;
-        unsigned short ws_ypixel;
-    };    
 #endif
+
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
 
 #endif /* _TERMIOS_H */

@@ -3,11 +3,27 @@ const std = @import("std");
 
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
+const ExternalRunner = enum {
+    none,
+    darling,
+    wine,
+};
+
 const RunResult = struct {
     stdout: []const u8,
     stderr: []const u8,
     term: std.process.Child.Term,
 };
+
+fn externalRunnerFromEnv() ExternalRunner {
+    // The build harness sets this only when the compared binaries themselves are
+    // foreign-target artifacts. Keep emulator-specific argument/path handling out
+    // of native parity runs entirely.
+    const value = std.process.getEnvVarOwned(arena.allocator(), "ZIGLIBC_EXTERNAL_RUNNER") catch return .none;
+    if (std.mem.eql(u8, value, "darling")) return .darling;
+    if (std.mem.eql(u8, value, "wine")) return .wine;
+    return .none;
+}
 
 fn windowsPathAlloc(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
     const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
@@ -85,6 +101,20 @@ fn normalizedChildCwd(allocator: std.mem.Allocator, dirname: []const u8) ![]cons
     return std.fs.cwd().realpathAlloc(allocator, dirname);
 }
 
+fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
+    std.fs.cwd().access(path_no_dot, .{}) catch return allocator.dupe(u8, path);
+    return std.fs.realpathAlloc(allocator, path_no_dot);
+}
+
+fn winePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try std.fmt.allocPrint(allocator, "Z:{s}", .{path});
+    for (out) |*ch| {
+        if (ch.* == '/') ch.* = '\\';
+    }
+    return out;
+}
+
 fn termEqual(a: std.process.Child.Term, b: std.process.Child.Term) bool {
     return switch (a) {
         .Exited => |code| switch (b) {
@@ -106,8 +136,59 @@ fn termEqual(a: std.process.Child.Term, b: std.process.Child.Term) bool {
     };
 }
 
+fn initChild(
+    allocator: std.mem.Allocator,
+    runner: ExternalRunner,
+    program_path: []const u8,
+    shared_args: []const []const u8,
+) !std.process.Child {
+    if (runner == .none) {
+        const normalized_program = try normalizedProgramPath(allocator, program_path);
+        var child_args = try allocator.alloc([]const u8, shared_args.len + 1);
+        child_args[0] = normalized_program;
+        @memcpy(child_args[1..], shared_args);
+        return std.process.Child.init(child_args, allocator);
+    }
+
+    const abs_program = try std.fs.realpathAlloc(allocator, program_path);
+    var child_args = try allocator.alloc([]const u8, shared_args.len + 2);
+    child_args[0] = switch (runner) {
+        .darling => "darling",
+        .wine => "wine",
+        .none => unreachable,
+    };
+    child_args[1] = switch (runner) {
+        .darling => abs_program,
+        .wine => try winePathAlloc(allocator, abs_program),
+        .none => unreachable,
+    };
+    for (shared_args, 0..) |arg, i| {
+        const mapped = try mapExistingPathAlloc(allocator, arg);
+        child_args[i + 2] = switch (runner) {
+            .darling => mapped,
+            .wine => blk: {
+                std.fs.cwd().access(if (std.mem.startsWith(u8, mapped, "./")) mapped[2..] else mapped, .{}) catch break :blk arg;
+                break :blk try winePathAlloc(allocator, mapped);
+            },
+            .none => unreachable,
+        };
+    }
+
+    var child = std.process.Child.init(child_args, allocator);
+    if (runner == .wine) {
+        const env_map = try allocator.create(std.process.EnvMap);
+        env_map.* = try std.process.getEnvMap(allocator);
+        if (env_map.get("WINEDEBUG") == null) {
+            try env_map.put("WINEDEBUG", "-all");
+        }
+        child.env_map = env_map;
+    }
+    return child;
+}
+
 fn runProgram(
     allocator: std.mem.Allocator,
+    runner: ExternalRunner,
     program_path: []const u8,
     label: []const u8,
     shared_args: []const []const u8,
@@ -121,15 +202,11 @@ fn runProgram(
     try std.fs.cwd().makeDir(dirname);
     errdefer std.fs.cwd().deleteTree(dirname) catch {};
 
-    const child_cwd = try normalizedChildCwd(allocator, dirname);
-    const normalized_program = try normalizedProgramPath(allocator, program_path);
-
-    var child_args = try allocator.alloc([]const u8, shared_args.len + 1);
-    child_args[0] = normalized_program;
-    @memcpy(child_args[1..], shared_args);
-
-    var child = std.process.Child.init(child_args, allocator);
-    child.cwd = child_cwd;
+    var child = try initChild(allocator, runner, program_path, shared_args);
+    child.cwd = switch (runner) {
+        .none => try normalizedChildCwd(allocator, dirname),
+        .darling, .wine => try std.fs.cwd().realpathAlloc(allocator, dirname),
+    };
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
@@ -155,8 +232,9 @@ pub fn main() !u8 {
         return 1;
     }
 
-    const expected = try runProgram(allocator, full_args[1], "expected", full_args[3..]);
-    const actual = try runProgram(allocator, full_args[2], "actual", full_args[3..]);
+    const runner = externalRunnerFromEnv();
+    const expected = try runProgram(allocator, runner, full_args[1], "expected", full_args[3..]);
+    const actual = try runProgram(allocator, runner, full_args[2], "actual", full_args[3..]);
 
     if (!std.mem.eql(u8, expected.stdout, actual.stdout)) {
         const msg = try std.fmt.allocPrint(

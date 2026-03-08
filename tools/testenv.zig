@@ -1,9 +1,25 @@
-/// Run the given program in a clean directory
+/// Run the given program in a clean directory.
 const builtin = @import("builtin");
 const std = @import("std");
 
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 var temp_counter: usize = 0;
+
+const ExternalRunner = enum {
+    none,
+    darling,
+    wine,
+};
+
+fn externalRunnerFromEnv() ExternalRunner {
+    // The build harness sets this only when the child binary must run under
+    // Darling/Wine. Native runs leave it unset so the helper uses plain host
+    // process execution with no emulator path rewriting.
+    const value = std.process.getEnvVarOwned(arena.allocator(), "ZIGLIBC_EXTERNAL_RUNNER") catch return .none;
+    if (std.mem.eql(u8, value, "darling")) return .darling;
+    if (std.mem.eql(u8, value, "wine")) return .wine;
+    return .none;
+}
 
 fn windowsPathAlloc(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
     const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
@@ -41,10 +57,6 @@ fn normalizeDarwinPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]c
         return allocator.dupe(u8, path_no_dot);
     }
     if (path_no_dot.len > 0 and path_no_dot[0] == '/') {
-        // Darling exposes the Linux host filesystem under /Volumes/SystemRoot, but a
-        // native macOS run needs the real absolute path untouched. Rewriting every
-        // absolute path here regresses native CI with FileNotFound as soon as the
-        // child executable or cwd lives outside Darling.
         if (pathExistsAbsolute(path_no_dot)) {
             return allocator.dupe(u8, path_no_dot);
         }
@@ -62,29 +74,107 @@ fn normalizeDarwinPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]c
     return abs;
 }
 
+fn normalizeProgramPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        const cwd = try std.process.getCwdAlloc(allocator);
+        return windowsPathAlloc(allocator, cwd, path);
+    }
+    if (builtin.os.tag.isDarwin()) {
+        return normalizeDarwinPathAlloc(allocator, path);
+    }
+    return std.fs.realpathAlloc(allocator, path);
+}
+
+fn normalizeChildCwd(allocator: std.mem.Allocator, dirname: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        const cwd = try std.process.getCwdAlloc(allocator);
+        return windowsPathAlloc(allocator, cwd, dirname);
+    }
+    if (builtin.os.tag.isDarwin()) {
+        return normalizeDarwinPathAlloc(allocator, dirname);
+    }
+    return std.fs.cwd().realpathAlloc(allocator, dirname);
+}
+
+fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
+    std.fs.cwd().access(path_no_dot, .{}) catch return allocator.dupe(u8, path);
+    return std.fs.realpathAlloc(allocator, path_no_dot);
+}
+
+fn winePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try std.fmt.allocPrint(allocator, "Z:{s}", .{path});
+    for (out) |*ch| {
+        if (ch.* == '/') ch.* = '\\';
+    }
+    return out;
+}
+
+fn initForeignRunnerChild(
+    allocator: std.mem.Allocator,
+    runner: ExternalRunner,
+    program_path: []const u8,
+    args: []const []const u8,
+) !std.process.Child {
+    const abs_program = try std.fs.realpathAlloc(allocator, program_path);
+    var mapped_args = try allocator.alloc([]const u8, args.len);
+    for (args, 0..) |arg, i| {
+        mapped_args[i] = try mapExistingPathAlloc(allocator, arg);
+    }
+
+    var child_args = try allocator.alloc([]const u8, args.len + 2);
+    child_args[0] = switch (runner) {
+        .darling => "darling",
+        .wine => "wine",
+        .none => unreachable,
+    };
+    child_args[1] = switch (runner) {
+        .darling => abs_program,
+        .wine => try winePathAlloc(allocator, abs_program),
+        .none => unreachable,
+    };
+    for (mapped_args, 0..) |arg, i| {
+        child_args[i + 2] = switch (runner) {
+            .darling => arg,
+            .wine => blk: {
+                std.fs.cwd().access(if (std.mem.startsWith(u8, arg, "./")) arg[2..] else arg, .{}) catch break :blk arg;
+                break :blk try winePathAlloc(allocator, arg);
+            },
+            .none => unreachable,
+        };
+    }
+
+    var child = std.process.Child.init(child_args, allocator);
+    if (runner == .wine) {
+        const env_map = try allocator.create(std.process.EnvMap);
+        env_map.* = try std.process.getEnvMap(allocator);
+        if (env_map.get("WINEDEBUG") == null) {
+            try env_map.put("WINEDEBUG", "-all");
+        }
+        child.env_map = env_map;
+    }
+    return child;
+}
+
 pub fn main() !u8 {
-    const full_args = try std.process.argsAlloc(arena.allocator());
+    const allocator = arena.allocator();
+    const full_args = try std.process.argsAlloc(allocator);
     if (full_args.len <= 1) {
         try std.fs.File.stderr().writeAll("Usage: testenv PROGRAM ARGS...\n");
         return 1;
     }
+
+    const runner = externalRunnerFromEnv();
     const args = full_args[1..];
-    var child_args = try arena.allocator().alloc([]const u8, args.len);
-    @memcpy(child_args, args);
-    if (builtin.os.tag == .windows) {
-        const cwd = try std.process.getCwdAlloc(arena.allocator());
-        child_args[0] = try windowsPathAlloc(arena.allocator(), cwd, args[0]);
-    } else if (builtin.os.tag.isDarwin()) {
-        child_args[0] = normalizeDarwinPathAlloc(arena.allocator(), args[0]) catch |err| {
-            std.log.err("failed to normalize darwin program path: {}", .{err});
-            return err;
-        };
-    } else {
-        child_args[0] = std.fs.realpathAlloc(arena.allocator(), args[0]) catch |err| {
-            std.log.err("realpath(program) failed: {}", .{err});
-            return err;
-        };
-    }
+    var child = switch (runner) {
+        .none => blk: {
+            var child_args = try allocator.alloc([]const u8, args.len);
+            @memcpy(child_args, args);
+            child_args[0] = try normalizeProgramPath(allocator, args[0]);
+            break :blk std.process.Child.init(child_args, allocator);
+        },
+        .darling, .wine => try initForeignRunnerChild(allocator, runner, args[0], args[1..]),
+    };
 
     const dirname = blk: {
         const base = std.fs.path.basename(args[0]);
@@ -92,7 +182,7 @@ pub fn main() !u8 {
         while (attempt < 64) : (attempt += 1) {
             const id = @atomicRmw(usize, &temp_counter, .Add, 1, .seq_cst);
             const candidate = try std.fmt.allocPrint(
-                arena.allocator(),
+                allocator,
                 "{s}-{d}-{x}-{x}.test.tmp",
                 .{
                     base,
@@ -110,19 +200,18 @@ pub fn main() !u8 {
         return error.PathAlreadyExists;
     };
     defer std.fs.cwd().deleteTree(dirname) catch {};
-    var child = std.process.Child.init(child_args, arena.allocator());
-    child.cwd = if (builtin.os.tag == .windows) blk: {
-        const cwd = try std.process.getCwdAlloc(arena.allocator());
-        break :blk try windowsPathAlloc(arena.allocator(), cwd, dirname);
-    } else if (builtin.os.tag.isDarwin()) blk: {
-        break :blk normalizeDarwinPathAlloc(arena.allocator(), dirname) catch |err| {
-            std.log.err("failed to normalize darwin cwd: {}", .{err});
+
+    child.cwd = switch (runner) {
+        .none => normalizeChildCwd(allocator, dirname) catch |err| {
+            std.log.err("failed to normalize child cwd: {}", .{err});
             return err;
-        };
-    } else std.fs.cwd().realpathAlloc(arena.allocator(), dirname) catch |err| {
-        std.log.err("realpath(cwd) failed: {}", .{err});
-        return err;
+        },
+        .darling, .wine => std.fs.cwd().realpathAlloc(allocator, dirname) catch |err| {
+            std.log.err("realpath(cwd) failed: {}", .{err});
+            return err;
+        },
     };
+
     child.spawn() catch |err| {
         std.log.err("spawn failed: {}", .{err});
         return err;

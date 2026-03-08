@@ -46,6 +46,17 @@ fn serializeForeignRun(run: *std.Build.Step.Run) void {
     foreign_run_serial = &run.step;
 }
 
+fn configureExternalHelperRunner(run: *std.Build.Step.Run, exe: *std.Build.Step.Compile) void {
+    // The helper tools (`testenv`, `parityenv`) are always built for the host.
+    // Tell them when the child program itself must be launched under an emulator
+    // so emulator-specific path/argv handling stays in the harness only.
+    switch (externalRunnerFor(exe)) {
+        .darling => run.setEnvironmentVariable("ZIGLIBC_EXTERNAL_RUNNER", "darling"),
+        .wine => run.setEnvironmentVariable("ZIGLIBC_EXTERNAL_RUNNER", "wine"),
+        .none => {},
+    }
+}
+
 fn addRunArtifactCompat(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
     return switch (externalRunnerFor(exe)) {
         .none => b.addRunArtifact(exe),
@@ -66,7 +77,11 @@ fn addRunArtifactCompat(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.
                 \\err="$(mktemp)"
                 \\darling "$abs" "${mapped[@]}" 2>"$err"
                 \\rc=$?
-                \\grep -v -E '^sig:[0-9]+$' "$err" >&2 || true
+                \\# Darling sometimes emits host-side diagnostics for ioctls it does not
+                \\# translate, even when the target program completed successfully. Filter
+                \\# only those emulator-only lines here; never change libc behavior or
+                \\# native-test expectations to compensate for emulator chatter.
+                \\grep -v -E '^(sig:[0-9]+|Passing thru unhandled ioctl 0x[0-9a-fA-F]+ on fd [0-9]+)$' "$err" >&2 || true
                 \\rm -f "$err"
                 \\[ "$rc" -eq 0 ] || [ "$rc" -eq 127 ]
                 ,
@@ -209,13 +224,13 @@ pub fn build(b: *std.Build) void {
     const test_env_exe = addExecutableCompat(b, .{
         .name = "testenv",
         .root_source_file = lazyPath(b, "tools" ++ std.fs.path.sep_str ++ "testenv.zig"),
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
     const parity_env_exe = addExecutableCompat(b, .{
         .name = "parityenv",
         .root_source_file = lazyPath(b, "tools" ++ std.fs.path.sep_str ++ "parityenv.zig"),
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
 
@@ -255,24 +270,21 @@ pub fn build(b: *std.Build) void {
         if (externalRunnerFor(exe) != .darling) {
             const run_step = addRunArtifactCompat(b, test_env_exe);
             addArtifactArgCompat(run_step, b, exe);
+            configureExternalHelperRunner(run_step, exe);
             run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
             test_step.dependOn(&run_step.step);
         }
-        // Darling corrupts argv before our macOS-target getopt_long parser can
-        // even read argv[optind]. Keep native targets covering this surface;
-        // the emulator is not a reliable signal here.
+        // Darling still corrupts argv during the GNU long-option/argp path for
+        // this binary specifically. Keep native macOS covering the surface; the
+        // emulator is useful for the broader POSIX/socket/pthread regressions,
+        // but not as a trustworthy signal for this argv-heavy GNU test.
     }
     {
         const exe = addTest("socket_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
-        if (externalRunnerFor(exe) != .darling) {
-            const run_step = addRunArtifactCompat(b, exe);
-            run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
-            test_step.dependOn(&run_step.step);
-        }
-        // Darling's socket layer is not a reliable stand-in for native Darwin.
-        // Keep this coverage on native targets instead of treating emulator
-        // failures as libc regressions.
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
     }
     {
         const exe = addExecutableCompat(b, .{
@@ -291,19 +303,19 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("kernel32");
         }
         if (externalRunnerFor(exe) != .darling) {
-            // This test uses Zig's own thread runtime to exercise our pthread
-            // mutex/cond ABI surface. Native macOS runs it fine, but Darling
-            // frequently returns 127 before `main`, which is a runner/runtime
-            // limitation rather than a libc semantic failure.
             const run_step = addRunArtifactCompat(b, exe);
             run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
             test_step.dependOn(&run_step.step);
         }
+        // Darling still falls over in Zig's threaded runtime before this test can
+        // reliably exercise `main()`. Keep native macOS covering pthread ABI
+        // behavior; the emulator remains useful for the other Darwin-target paths.
     }
     {
         const exe = addTest("fs", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -311,6 +323,7 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("format", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -343,6 +356,7 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("stdio_extensive", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -350,6 +364,7 @@ pub fn build(b: *std.Build) void {
         const exe = addTest("panic_replacements", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
@@ -359,9 +374,14 @@ pub fn build(b: *std.Build) void {
         if (externalRunnerFor(exe) != .darling) {
             const run_step = addRunArtifactCompat(b, test_env_exe);
             addArtifactArgCompat(run_step, b, exe);
+            configureExternalHelperRunner(run_step, exe);
             run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
             test_step.dependOn(&run_step.step);
         }
+        // Darling still has a non-deterministic startup/runtime fault on this
+        // large POSIX coverage binary even after the target libc paths were fixed.
+        // Keep native macOS as the source of truth for this surface; the emulator
+        // remains enabled for the narrower Darwin-target tests that are stable.
     }
     {
         const exe = addTest("getopt", b, target, optimize, libc_only_std_static, zig_start);
@@ -399,16 +419,17 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const parity_run: ?*std.Build.Step.Run = if (externalRunnerForTarget(target.result) != .darling) blk: {
+    const parity_run: ?*std.Build.Step.Run = blk: {
         const system_exe = addSystemParityProbe(b, target, optimize);
         const zig_exe = addZigParityProbe(b, target, optimize, libc_only_std_static, zig_start, libc_only_posix);
         const run_step = addRunArtifactCompat(b, parity_env_exe);
         addArtifactArgCompat(run_step, b, system_exe);
         addArtifactArgCompat(run_step, b, zig_exe);
+        configureExternalHelperRunner(run_step, zig_exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
         break :blk run_step;
-    } else null;
+    };
 
     if (supportsSetjmp(target.result)) {
         const exe = addTest("jmp", b, target, optimize, libc_only_std_static, zig_start);

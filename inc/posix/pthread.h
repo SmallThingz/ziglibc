@@ -29,10 +29,31 @@
 typedef int pthread_attr_t;
 typedef int pthread_barrier_t;
 typedef int pthread_barrierattr_t;
+#ifdef __APPLE__
+#if defined(__LP64__)
+#define __ZIGLIBC_PTHREAD_MUTEX_SIZE 56
+#define __ZIGLIBC_PTHREAD_COND_SIZE 40
+#else
+#define __ZIGLIBC_PTHREAD_MUTEX_SIZE 40
+#define __ZIGLIBC_PTHREAD_COND_SIZE 24
+#endif
+typedef struct {
+  long __sig;
+  char __opaque[__ZIGLIBC_PTHREAD_COND_SIZE];
+} pthread_cond_t;
+#else
 typedef int pthread_cond_t;
+#endif
 typedef int pthread_condattr_t;
 typedef int pthread_key_t;
+#ifdef __APPLE__
+typedef struct {
+  long __sig;
+  char __opaque[__ZIGLIBC_PTHREAD_MUTEX_SIZE];
+} pthread_mutex_t;
+#else
 typedef int pthread_mutex_t;
+#endif
 typedef int pthread_mutexattr_t;
 typedef int pthread_once_t;
 typedef int pthread_rwlock_t;
@@ -40,6 +61,17 @@ typedef int pthread_rwlockattr_t;
 typedef int pthread_spinlock_t;
 typedef int pthread_t;
 
+#ifdef __APPLE__
+#define _PTHREAD_MUTEX_SIG_init 0x32AAABA7L
+#define _PTHREAD_COND_SIG_init 0x3CB0B1BBL
+#define PTHREAD_MUTEX_INITIALIZER {_PTHREAD_MUTEX_SIG_init, {0}}
+int pthread_mutex_init(pthread_mutex_t *restrict, const pthread_mutexattr_t *restrict);
+int pthread_mutex_destroy(pthread_mutex_t *);
+int pthread_mutex_lock(pthread_mutex_t *);
+int pthread_mutex_unlock(pthread_mutex_t *);
+
+#define PTHREAD_COND_INITIALIZER {_PTHREAD_COND_SIG_init, {0}}
+#else
 #define PTHREAD_MUTEX_INITIALIZER 0
 int pthread_mutex_init(pthread_mutex_t *restrict, const pthread_mutexattr_t *restrict);
 int pthread_mutex_destroy(pthread_mutex_t *);
@@ -47,6 +79,7 @@ int pthread_mutex_lock(pthread_mutex_t *);
 int pthread_mutex_unlock(pthread_mutex_t *);
 
 #define PTHREAD_COND_INITIALIZER 0
+#endif
 int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr);
 int pthread_cond_destroy(pthread_cond_t *cond);
 int pthread_cond_wait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex);

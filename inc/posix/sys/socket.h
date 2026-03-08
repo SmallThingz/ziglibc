@@ -14,7 +14,7 @@
 #define AF_INET 2
 #define PF_INET AF_INET
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #define SOL_SOCKET 0xffff
 #define SO_KEEPALIVE 0x0008
 #define SO_SNDBUF 0x1001

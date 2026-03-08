@@ -40,6 +40,26 @@ const cstd = struct {
     extern fn __zwindows_raise_signal(sig: c_int) callconv(.c) c_int;
 };
 
+const AtomicFlag = std.atomic.Value(u32);
+
+fn spinPause() void {
+    std.Thread.yield() catch std.Thread.sleep(50 * std.time.ns_per_us);
+}
+
+const SpinLock = struct {
+    state: AtomicFlag = AtomicFlag.init(0),
+
+    fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            spinPause();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.state.store(0, .release);
+    }
+};
+
 extern "c" fn syscall(number: c_long, ...) c_long;
 extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 
@@ -115,11 +135,22 @@ const darwin_syscall = if (builtin.os.tag.isDarwin()) struct {
     const access: c_long = 33;
     const sigaction: c_long = 46;
     const ioctl: c_long = 54;
+    const recvfrom: c_long = 29;
+    const getpeername: c_long = 31;
+    const socket: c_long = 97;
+    const connect: c_long = 98;
+    const recv: c_long = 102;
+    const bind: c_long = 104;
+    const setsockopt: c_long = 105;
+    const getsockopt: c_long = 118;
+    const sendto: c_long = 133;
+    const shutdown: c_long = 134;
     const setitimer: c_long = 83;
     const getitimer: c_long = 86;
     const fcntl: c_long = 92;
     const select: c_long = 93;
     const gettimeofday: c_long = 116;
+    const getsockname: c_long = 32;
     const rename: c_long = 128;
     const utimes: c_long = 138;
     const futimes: c_long = 139;
@@ -139,7 +170,7 @@ export var optind: c_int = 1;
 export var optopt: c_int = 0;
 var optchar_index: c_int = 1;
 var fallback_umask: c.mode_t = 0o022;
-var fallback_umask_mutex: std.Thread.Mutex = .{};
+var fallback_umask_mutex: SpinLock = .{};
 var dirname_dot: [2:0]u8 = [_:0]u8{'.', 0};
 var dirname_root: [2:0]u8 = [_:0]u8{'/', 0};
 
@@ -150,7 +181,7 @@ const PopenEntry = struct {
 };
 
 const HostentState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: SpinLock = .{},
     name_buf: [256]u8 = [_]u8{0} ** 256,
     addr_buf: [4]u8 = [_]u8{0} ** 4,
     aliases: [1:null]?[*:0]u8 = .{null},
@@ -165,7 +196,7 @@ const HostentState = struct {
 };
 
 var popen_entries: [c.FOPEN_MAX]PopenEntry = [_]PopenEntry{.{}} ** c.FOPEN_MAX;
-var popen_mutex: std.Thread.Mutex = .{};
+var popen_mutex: SpinLock = .{};
 var hostent_state: HostentState = .{};
 
 // Keep synthetic socket fds inside our exported FD_SETSIZE so callers can use
@@ -178,7 +209,7 @@ const WindowsSocketEntry = struct {
     used: bool = false,
     socket: WindowsSocket = std.os.windows.ws2_32.INVALID_SOCKET,
 };
-var windows_socket_mutex: std.Thread.Mutex = .{};
+var windows_socket_mutex: SpinLock = .{};
 var windows_socket_entries: [windows_socket_slots]WindowsSocketEntry = [_]WindowsSocketEntry{.{}} ** windows_socket_slots;
 var windows_wsa_once = std.once(struct {
     fn init() void {
@@ -706,7 +737,9 @@ fn zopenAtRaw(dirfd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_i
         return -1;
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.openat, dirfd, path, oflag, create_mode);
+        const darwin_flags = translateDarwinOpenFlags(oflag);
+        if (darwin_flags == -1) return -1;
+        const rc = syscall(darwin_syscall.openat, dirfd, path, darwin_flags, create_mode);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
@@ -1040,7 +1073,10 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
 
         var spawn_errno: c_int = 0;
         const process_handle = if (mode_ch == 'r')
-            winproc.spawnShell(command, null, child_handle, child_handle, true, &spawn_errno)
+            // `_popen(..., "r")` captures stdout only. Redirecting stderr into the
+            // same pipe changes native Windows shell behavior and can perturb the
+            // observed `_pclose()` status even when the command itself succeeds.
+            winproc.spawnShell(command, null, child_handle, null, true, &spawn_errno)
         else
             winproc.spawnShell(command, child_handle, null, null, true, &spawn_errno);
         if (process_handle == null) {
@@ -1339,6 +1375,7 @@ fn rawSocketFd(fd: c_int) ?std.posix.socket_t {
 }
 
 export fn socket(domain: c_int, sock_type: c_int, protocol: c_int) callconv(.c) c_int {
+    trace.log("socket domain={} type={} protocol={}", .{ domain, sock_type, protocol });
     if (builtin.os.tag == .windows) {
         ensureWindowsSockets();
         if (!windowsWinsockReady()) return windowsWinsockUnavailable();
@@ -1353,6 +1390,14 @@ export fn socket(domain: c_int, sock_type: c_int, protocol: c_int) callconv(.c) 
             break :blk -1;
         };
     }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.socket, domain, sock_type, protocol);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(c_int, @intCast(rc));
+    }
     const sock = std.posix.socket(
         @as(u32, @intCast(domain)),
         @as(u32, @intCast(sock_type)),
@@ -1365,6 +1410,7 @@ export fn socket(domain: c_int, sock_type: c_int, protocol: c_int) callconv(.c) 
 }
 
 export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) c_int {
+    trace.log("bind fd={} addrlen={}", .{ sockfd, addrlen });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1381,6 +1427,18 @@ export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.sockle
         }
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        const name = addr orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const rc = syscall(darwin_syscall.bind, sock, name, addrlen);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.bind(sock, @ptrCast(addr orelse {
         c.errno = c.EINVAL;
         return -1;
@@ -1392,6 +1450,7 @@ export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.sockle
 }
 
 export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len: c.socklen_t) callconv(.c) c_int {
+    trace.log("connect fd={} addrlen={}", .{ sockfd, address_len });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1408,6 +1467,18 @@ export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len
         }
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        const name = address orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const rc = syscall(darwin_syscall.connect, sock, name, address_len);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.connect(sock, @ptrCast(address orelse {
         c.errno = c.EINVAL;
         return -1;
@@ -1419,6 +1490,7 @@ export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len
 }
 
 export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
+    trace.log("getsockname fd={}", .{sockfd});
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1439,6 +1511,22 @@ export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
         }
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        const name = address orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const len_ptr = address_len orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const rc = syscall(darwin_syscall.getsockname, sock, name, len_ptr);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.getsockname(sock, @ptrCast(address orelse {
         c.errno = c.EINVAL;
         return -1;
@@ -1453,6 +1541,7 @@ export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
 }
 
 export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
+    trace.log("getpeername fd={}", .{sockfd});
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1473,6 +1562,22 @@ export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
         }
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        const name = address orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const len_ptr = address_len orelse {
+            c.errno = c.EINVAL;
+            return -1;
+        };
+        const rc = syscall(darwin_syscall.getpeername, sock, name, len_ptr);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.getpeername(sock, @ptrCast(address orelse {
         c.errno = c.EINVAL;
         return -1;
@@ -1487,6 +1592,7 @@ export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
 }
 
 export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_value: ?*anyopaque, option_len: ?*c.socklen_t) callconv(.c) c_int {
+    trace.log("getsockopt fd={} level={} opt={}", .{ sockfd, level, option_name });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1508,6 +1614,14 @@ export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
         }
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.getsockopt, sock, level, option_name, out_ptr, len_ptr);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.getsockopt(sock, level, @as(u32, @intCast(option_name)), opt_buf[0..@intCast(len_ptr.*)]) catch |err| {
         c.errno = socketErrno(err);
         return -1;
@@ -1516,6 +1630,7 @@ export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
 }
 
 export fn setsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_value: ?*const anyopaque, option_len: c.socklen_t) callconv(.c) c_int {
+    trace.log("setsockopt fd={} level={} opt={} len={}", .{ sockfd, level, option_name, option_len });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1533,6 +1648,14 @@ export fn setsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
         }
         return 0;
     }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.setsockopt, sock, level, option_name, in_ptr, option_len);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return 0;
+    }
     std.posix.setsockopt(sock, level, @as(u32, @intCast(option_name)), opt_buf[0..@intCast(option_len)]) catch |err| {
         c.errno = socketErrno(err);
         return -1;
@@ -1541,6 +1664,7 @@ export fn setsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
 }
 
 export fn sendto(sockfd: c_int, message: ?*const anyopaque, len: usize, flags: c_int, dest_addr: ?*const c.struct_sockaddr, dest_len: c.socklen_t) callconv(.c) isize {
+    trace.log("sendto fd={} len={} flags={} has_dest={}", .{ sockfd, len, flags, dest_addr != null });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1568,6 +1692,22 @@ export fn sendto(sockfd: c_int, message: ?*const anyopaque, len: usize, flags: c
         }
         return @as(isize, @intCast(rc));
     }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(
+            darwin_syscall.sendto,
+            sock,
+            data_ptr,
+            len,
+            flags,
+            dest_addr,
+            dest_len,
+        );
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
+    }
     const written = std.posix.sendto(sock, data_ptr[0..len], @as(u32, @intCast(flags)), @ptrCast(dest_addr), @intCast(dest_len)) catch |err| {
         c.errno = socketErrno(err);
         return -1;
@@ -1576,6 +1716,7 @@ export fn sendto(sockfd: c_int, message: ?*const anyopaque, len: usize, flags: c
 }
 
 export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) callconv(.c) isize {
+    trace.log("recv fd={} len={} flags={}", .{ sockfd, length, flags });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1600,6 +1741,14 @@ export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) 
         }
         return @as(isize, @intCast(rc));
     }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.recvfrom, sock, buf_ptr, length, flags, @as(?*c.struct_sockaddr, null), @as(?*c.socklen_t, null));
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
+    }
     const got = std.posix.recv(sock, buf_ptr[0..length], @as(u32, @intCast(flags))) catch |err| {
         c.errno = socketErrno(err);
         return -1;
@@ -1608,6 +1757,7 @@ export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) 
 }
 
 export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) isize {
+    trace.log("recvfrom fd={} len={} flags={}", .{ sockfd, length, flags });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1639,6 +1789,14 @@ export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_i
         }
         return @as(isize, @intCast(rc));
     }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.recvfrom, sock, buf_ptr, length, flags, address, address_len);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
+            return -1;
+        }
+        return @as(isize, @intCast(rc));
+    }
     const got = std.posix.recvfrom(sock, buf_ptr[0..length], @as(u32, @intCast(flags)), @ptrCast(address), @ptrCast(address_len)) catch |err| {
         c.errno = socketErrno(err);
         return -1;
@@ -1647,6 +1805,7 @@ export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_i
 }
 
 export fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int {
+    trace.log("shutdown fd={} how={}", .{ sockfd, how });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
         return -1;
@@ -1655,6 +1814,14 @@ export fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int {
         if (!windowsWinsockReady()) return windowsWinsockUnavailable();
         if (windows_winsock_api.shutdown_fn.?(sock, how) == std.os.windows.ws2_32.SOCKET_ERROR) {
             c.errno = windowsSocketErrno();
+            return -1;
+        }
+        return 0;
+    }
+    if (builtin.os.tag.isDarwin()) {
+        const rc = syscall(darwin_syscall.shutdown, sock, how);
+        if (rc == -1) {
+            c.errno = darwin.__error().*;
             return -1;
         }
         return 0;
@@ -1979,6 +2146,9 @@ export fn isatty(fd: c_int) callconv(.c) c_int {
     }
 
     var size: c.winsize = undefined;
+    // Darwin and Linux use different `TIOCGWINSZ` request numbers. Reusing the
+    // Linux constant on Darwin regresses native macOS and Darling by sending an
+    // ioctl the target kernel/emulator does not understand.
     if (_ioctlArgPtr(fd, c.TIOCGWINSZ, &size) == 0) return 1;
     if (c.errno == errnoConst("EBADF", c.EINVAL)) {
         c.errno = errnoConst("ENOTTY", c.EINVAL);
@@ -2007,6 +2177,16 @@ const LinuxItimerval = extern struct {
     it_value: LinuxTimeval,
 };
 
+const DarwinTimeval = extern struct {
+    tv_sec: c_long,
+    tv_usec: c_int,
+};
+
+const DarwinItimerval = extern struct {
+    it_interval: DarwinTimeval,
+    it_value: DarwinTimeval,
+};
+
 fn cTimevalToLinux(tv: c.timeval) LinuxTimeval {
     return .{
         .tv_sec = @as(isize, @intCast(tv.tv_sec)),
@@ -2015,6 +2195,20 @@ fn cTimevalToLinux(tv: c.timeval) LinuxTimeval {
 }
 
 fn linuxTimevalToC(tv: LinuxTimeval) c.timeval {
+    var out: c.timeval = undefined;
+    out.tv_sec = @as(@TypeOf(out.tv_sec), @intCast(tv.tv_sec));
+    out.tv_usec = @as(@TypeOf(out.tv_usec), @intCast(tv.tv_usec));
+    return out;
+}
+
+fn cTimevalToDarwin(tv: c.timeval) DarwinTimeval {
+    return .{
+        .tv_sec = @as(c_long, @intCast(tv.tv_sec)),
+        .tv_usec = @as(c_int, @intCast(tv.tv_usec)),
+    };
+}
+
+fn darwinTimevalToC(tv: DarwinTimeval) c.timeval {
     var out: c.timeval = undefined;
     out.tv_sec = @as(@TypeOf(out.tv_sec), @intCast(tv.tv_sec));
     out.tv_usec = @as(@TypeOf(out.tv_usec), @intCast(tv.tv_usec));
@@ -2265,11 +2459,14 @@ export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.getitimer, which, value);
+        var native_value: DarwinItimerval = undefined;
+        const rc = syscall(darwin_syscall.getitimer, which, &native_value);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
         }
+        value.it_interval = darwinTimevalToC(native_value.it_interval);
+        value.it_value = darwinTimevalToC(native_value.it_value);
         return 0;
     }
     if (builtin.os.tag == .linux) {
@@ -2324,10 +2521,24 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        const rc = syscall(darwin_syscall.setitimer, which, value, avalue);
+        var native_value = DarwinItimerval{
+            .it_interval = cTimevalToDarwin(value.it_interval),
+            .it_value = cTimevalToDarwin(value.it_value),
+        };
+        var native_old: DarwinItimerval = undefined;
+        const rc = syscall(
+            darwin_syscall.setitimer,
+            which,
+            &native_value,
+            if (!cPtrIsNull(avalue)) &native_old else @as(?*DarwinItimerval, null),
+        );
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
+        }
+        if (!cPtrIsNull(avalue)) {
+            avalue.it_interval = darwinTimevalToC(native_old.it_interval);
+            avalue.it_value = darwinTimevalToC(native_old.it_value);
         }
         return 0;
     }
@@ -2823,18 +3034,55 @@ export fn readdir(dirp: *c.DIR) callconv(.c) ?*DirentStorage {
 // pthread
 // --------------------------------------------------------------------------------
 const pthread_slot_count = 64;
+const darwin_pthread_mutex_sig_init: c_long = 0x32AAABA7;
+const darwin_pthread_cond_sig_init: c_long = 0x3CB0B1BB;
 const PthreadMutexEntry = struct {
     used: bool = false,
-    mutex: std.Thread.Mutex = .{},
+    locked: AtomicFlag = AtomicFlag.init(0),
 };
 const PthreadCondEntry = struct {
     used: bool = false,
-    cond: std.Thread.Condition = .{},
+    seq: AtomicFlag = AtomicFlag.init(0),
 };
 
-var pthread_table_mutex: std.Thread.Mutex = .{};
+var pthread_table_lock: AtomicFlag = AtomicFlag.init(0);
 var pthread_mutex_entries: [pthread_slot_count]PthreadMutexEntry = [_]PthreadMutexEntry{.{}} ** pthread_slot_count;
 var pthread_cond_entries: [pthread_slot_count]PthreadCondEntry = [_]PthreadCondEntry{.{}} ** pthread_slot_count;
+
+fn pthreadOpaqueId(comptime T: type, obj: *T) c_int {
+    if (!builtin.os.tag.isDarwin()) return obj.*;
+    const storage: [*]const u8 = @ptrCast(&@field(obj.*, "__opaque"));
+    return std.mem.readInt(c_int, storage[0..@sizeOf(c_int)], .little);
+}
+
+fn setPthreadOpaqueId(comptime T: type, obj: *T, id: c_int) void {
+    if (!builtin.os.tag.isDarwin()) {
+        obj.* = id;
+        return;
+    }
+    const storage: [*]u8 = @ptrCast(&@field(obj.*, "__opaque"));
+    std.mem.writeInt(c_int, storage[0..@sizeOf(c_int)], id, .little);
+}
+
+fn resetPthreadOpaque(comptime T: type, obj: *T) void {
+    if (!builtin.os.tag.isDarwin()) {
+        obj.* = 0;
+        return;
+    }
+    const storage: [*]u8 = @ptrCast(&@field(obj.*, "__opaque"));
+    @memset(storage[0..@sizeOf(@TypeOf(@field(obj.*, "__opaque")))], 0);
+    @field(obj.*, "__sig") = 0;
+}
+
+fn lockPthreadTable() void {
+    while (pthread_table_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        spinPause();
+    }
+}
+
+fn unlockPthreadTable() void {
+    pthread_table_lock.store(0, .release);
+}
 
 fn allocPthreadSlot(comptime T: type, entries: *[pthread_slot_count]T) ?usize {
     for (entries, 0..) |*entry, i| {
@@ -2847,14 +3095,17 @@ fn allocPthreadSlot(comptime T: type, entries: *[pthread_slot_count]T) ?usize {
 }
 
 fn mutexEntryFor(mutex: *c.pthread_mutex_t, create: bool) ?*PthreadMutexEntry {
-    pthread_table_mutex.lock();
-    defer pthread_table_mutex.unlock();
-    const id = mutex.*;
+    lockPthreadTable();
+    defer unlockPthreadTable();
+    const id = pthreadOpaqueId(c.pthread_mutex_t, mutex);
     if (id == 0) {
         if (!create) return null;
         const index = allocPthreadSlot(PthreadMutexEntry, &pthread_mutex_entries) orelse return null;
-        pthread_mutex_entries[index].mutex = .{};
-        mutex.* = @as(c.pthread_mutex_t, @intCast(index + 1));
+        pthread_mutex_entries[index].locked = AtomicFlag.init(0);
+        if (builtin.os.tag.isDarwin()) {
+            @field(mutex.*, "__sig") = darwin_pthread_mutex_sig_init;
+        }
+        setPthreadOpaqueId(c.pthread_mutex_t, mutex, @as(c_int, @intCast(index + 1)));
         return &pthread_mutex_entries[index];
     }
     if (id < 0 or id > pthread_slot_count) return null;
@@ -2864,14 +3115,17 @@ fn mutexEntryFor(mutex: *c.pthread_mutex_t, create: bool) ?*PthreadMutexEntry {
 }
 
 fn condEntryFor(cond: *c.pthread_cond_t, create: bool) ?*PthreadCondEntry {
-    pthread_table_mutex.lock();
-    defer pthread_table_mutex.unlock();
-    const id = cond.*;
+    lockPthreadTable();
+    defer unlockPthreadTable();
+    const id = pthreadOpaqueId(c.pthread_cond_t, cond);
     if (id == 0) {
         if (!create) return null;
         const index = allocPthreadSlot(PthreadCondEntry, &pthread_cond_entries) orelse return null;
-        pthread_cond_entries[index].cond = .{};
-        cond.* = @as(c.pthread_cond_t, @intCast(index + 1));
+        pthread_cond_entries[index].seq = AtomicFlag.init(0);
+        if (builtin.os.tag.isDarwin()) {
+            @field(cond.*, "__sig") = darwin_pthread_cond_sig_init;
+        }
+        setPthreadOpaqueId(c.pthread_cond_t, cond, @as(c_int, @intCast(index + 1)));
         return &pthread_cond_entries[index];
     }
     if (id < 0 or id > pthread_slot_count) return null;
@@ -2881,65 +3135,86 @@ fn condEntryFor(cond: *c.pthread_cond_t, create: bool) ?*PthreadCondEntry {
 }
 
 export fn pthread_mutex_init(mutex: *c.pthread_mutex_t, attr: ?*const c.pthread_mutexattr_t) callconv(.c) c_int {
+    trace.log("pthread_mutex_init {*}", .{mutex});
     _ = attr;
     if (mutexEntryFor(mutex, true) == null) return errnoConst("ENOMEM", c.EINVAL);
     return 0;
 }
 
 export fn pthread_mutex_destroy(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
-    pthread_table_mutex.lock();
-    defer pthread_table_mutex.unlock();
-    if (mutex.* == 0) return 0;
-    if (mutex.* < 0 or mutex.* > pthread_slot_count) return c.EINVAL;
-    pthread_mutex_entries[@as(usize, @intCast(mutex.* - 1))] = .{};
-    mutex.* = 0;
+    trace.log("pthread_mutex_destroy {*}", .{mutex});
+    lockPthreadTable();
+    defer unlockPthreadTable();
+    const id = pthreadOpaqueId(c.pthread_mutex_t, mutex);
+    if (id == 0) return 0;
+    if (id < 0 or id > pthread_slot_count) return c.EINVAL;
+    if (pthread_mutex_entries[@as(usize, @intCast(id - 1))].locked.load(.acquire) != 0) {
+        return errnoConst("EBUSY", c.EINVAL);
+    }
+    pthread_mutex_entries[@as(usize, @intCast(id - 1))] = .{};
+    resetPthreadOpaque(c.pthread_mutex_t, mutex);
     return 0;
 }
 
 export fn pthread_mutex_lock(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    trace.log("pthread_mutex_lock {*}", .{mutex});
     const entry = mutexEntryFor(mutex, true) orelse return errnoConst("ENOMEM", c.EINVAL);
-    entry.mutex.lock();
+    while (entry.locked.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        spinPause();
+    }
     return 0;
 }
 
 export fn pthread_mutex_unlock(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    trace.log("pthread_mutex_unlock {*}", .{mutex});
     const entry = mutexEntryFor(mutex, false) orelse return c.EINVAL;
-    entry.mutex.unlock();
+    if (entry.locked.load(.acquire) == 0) return c.EINVAL;
+    entry.locked.store(0, .release);
     return 0;
 }
 
 export fn pthread_cond_init(cond: *c.pthread_cond_t, attr: ?*const c.pthread_condattr_t) callconv(.c) c_int {
+    trace.log("pthread_cond_init {*}", .{cond});
     _ = attr;
     if (condEntryFor(cond, true) == null) return errnoConst("ENOMEM", c.EINVAL);
     return 0;
 }
 
 export fn pthread_cond_destroy(cond: *c.pthread_cond_t) callconv(.c) c_int {
-    pthread_table_mutex.lock();
-    defer pthread_table_mutex.unlock();
-    if (cond.* == 0) return 0;
-    if (cond.* < 0 or cond.* > pthread_slot_count) return c.EINVAL;
-    pthread_cond_entries[@as(usize, @intCast(cond.* - 1))] = .{};
-    cond.* = 0;
+    trace.log("pthread_cond_destroy {*}", .{cond});
+    lockPthreadTable();
+    defer unlockPthreadTable();
+    const id = pthreadOpaqueId(c.pthread_cond_t, cond);
+    if (id == 0) return 0;
+    if (id < 0 or id > pthread_slot_count) return c.EINVAL;
+    pthread_cond_entries[@as(usize, @intCast(id - 1))] = .{};
+    resetPthreadOpaque(c.pthread_cond_t, cond);
     return 0;
 }
 
 export fn pthread_cond_wait(cond: *c.pthread_cond_t, mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+    trace.log("pthread_cond_wait cond={*} mutex={*}", .{ cond, mutex });
     const cond_entry = condEntryFor(cond, true) orelse return errnoConst("ENOMEM", c.EINVAL);
-    const mutex_entry = mutexEntryFor(mutex, true) orelse return errnoConst("ENOMEM", c.EINVAL);
-    cond_entry.cond.wait(&mutex_entry.mutex);
+    const target_seq = cond_entry.seq.load(.acquire);
+    if (pthread_mutex_unlock(mutex) != 0) return c.EINVAL;
+    while (cond_entry.seq.load(.acquire) == target_seq) {
+        spinPause();
+    }
+    if (pthread_mutex_lock(mutex) != 0) return c.EINVAL;
     return 0;
 }
 
 export fn pthread_cond_broadcast(cond: *c.pthread_cond_t) callconv(.c) c_int {
+    trace.log("pthread_cond_broadcast {*}", .{cond});
     const cond_entry = condEntryFor(cond, false) orelse return c.EINVAL;
-    cond_entry.cond.broadcast();
+    _ = cond_entry.seq.fetchAdd(1, .release);
     return 0;
 }
 
 export fn pthread_cond_signal(cond: *c.pthread_cond_t) callconv(.c) c_int {
+    trace.log("pthread_cond_signal {*}", .{cond});
     const cond_entry = condEntryFor(cond, false) orelse return c.EINVAL;
-    cond_entry.cond.signal();
+    _ = cond_entry.seq.fetchAdd(1, .release);
     return 0;
 }
 
@@ -3369,30 +3644,16 @@ export fn pselect(
         return -1;
     }
     if (builtin.os.tag.isDarwin()) {
-        if (sigmask == null) {
-            // Native Darwin callers that do not need the atomic signal-mask swap are
-            // compatible with select(). Keep this path because Darling's pselect
-            // emulation is less reliable than native macOS for the timeout-only case
-            // we exercise in CI.
-            var darwin_timeout: c.timeval = undefined;
-            const darwin_timeout_ptr: ?*c.timeval = if (timeout) |ts| blk: {
-                darwin_timeout = cTimespecToTimeval(ts.*) orelse {
-                    c.errno = c.EINVAL;
-                    return -1;
-                };
-                break :blk &darwin_timeout;
-            } else null;
-            return select(nfds, readfds, writefds, errorfds, darwin_timeout_ptr);
-        }
         if (timeout) |ts| {
             if (!cTimespecIsValid(ts.*)) {
                 c.errno = c.EINVAL;
                 return -1;
             }
         }
-        // Darwin has a real pselect(2). Falling back to select() loses the signal
-        // mask argument and the atomic mask swap, which is observably wrong even
-        // when timeout-only tests appear to pass under emulation.
+        // Darwin has a real pselect(2). Do not collapse this into select():
+        // that loses the optional signal mask argument and the atomic mask swap,
+        // which changes real native behavior even if an emulator happens to make
+        // the timeout-only case look equivalent.
         const rc = syscall(
             darwin_syscall.pselect,
             nfds,
@@ -3495,10 +3756,13 @@ export fn utimes(filename: [*:0]const u8, times: [*c]const c.timeval) callconv(.
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {
-        const fd = zopenRaw(filename, c.O_RDONLY, 0);
-        if (fd < 0) return -1;
-        defer _ = close(fd);
-        const rc = syscall(darwin_syscall.futimes, fd, times);
+        var native_times: [2]DarwinTimeval = undefined;
+        const native_ptr = if (times) |tv| blk: {
+            native_times[0] = cTimevalToDarwin(tv[0]);
+            native_times[1] = cTimevalToDarwin(tv[1]);
+            break :blk &native_times;
+        } else @as(?*[2]DarwinTimeval, null);
+        const rc = syscall(darwin_syscall.utimes, filename, native_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;

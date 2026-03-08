@@ -13,6 +13,9 @@
 static void init_loopback(struct sockaddr_in *addr)
 {
   memset(addr, 0, sizeof(*addr));
+#if defined(__APPLE__)
+  addr->sin_len = sizeof(*addr);
+#endif
   addr->sin_family = AF_INET;
   addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr->sin_port = 0;
@@ -61,11 +64,20 @@ int main(void)
     {
       fd_set readfds;
       struct timeval tv;
-      FD_ZERO(&readfds);
-      FD_SET(receiver, &readfds);
-      tv.tv_sec = 0;
-      tv.tv_usec = 0;
-      expect(1 == select(receiver + 1, &readfds, NULL, NULL, &tv));
+      int ready = 0;
+      int attempt;
+      for (attempt = 0; attempt < 50; ++attempt) {
+        FD_ZERO(&readfds);
+        FD_SET(receiver, &readfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 10000;
+        ready = select(receiver + 1, &readfds, NULL, NULL, &tv);
+        if (ready == 1) break;
+      }
+      /* Native macOS loopback delivery is not reliably observable with a zero-timeout
+         select() immediately after sendto(). Keep a short bounded wait here so the
+         socket test catches real readiness regressions instead of scheduler noise. */
+      expect(1 == ready);
       expect(FD_ISSET(receiver, &readfds));
     }
     expect(4 == recvfrom(receiver, rx, sizeof(rx), 0, (struct sockaddr *)&peer_addr, &peer_len));

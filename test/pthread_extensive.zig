@@ -5,8 +5,8 @@ const c = @cImport({
 });
 
 const State = struct {
-    mutex: c.pthread_mutex_t = c.PTHREAD_MUTEX_INITIALIZER,
-    cond: c.pthread_cond_t = c.PTHREAD_COND_INITIALIZER,
+    mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
+    cond: c.pthread_cond_t = std.mem.zeroes(c.pthread_cond_t),
     ready: bool = false,
 };
 

@@ -22,6 +22,9 @@ struct in_addr {
 #define INADDR_LOOPBACK ((in_addr_t)0x7f000001)
 
 struct sockaddr_in {
+#ifdef __APPLE__
+  uint8_t sin_len;
+#endif
   sa_family_t sin_family;
   unsigned short sin_port;
   struct in_addr sin_addr;

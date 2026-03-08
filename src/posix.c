@@ -127,13 +127,11 @@ static int zgnu_getopt_long_common(
 
 int __ziglibc_getopt_long(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
 {
-    // Keep the long-option parser in C. The Zig version matched Linux but crashed
-    // in macOS-target/Darling runs before entering user-visible logic, which is
-    // consistent with a target-specific ABI/codegen issue rather than parser
-    // semantics. Export the standard GNU names for ABI compatibility, but keep
-    // the implementation under a private alias so our own macOS-target callers
-    // do not rely on Darling resolving the public symbol back into the same
-    // image correctly.
+    // Keep the long-option parser in C. This path needs a conservative C ABI
+    // surface because the earlier Zig implementation hit target-specific ABI /
+    // codegen problems before any parser semantics were observable. Export the
+    // standard GNU names for compatibility, but keep the implementation under a
+    // private alias so the public symbol remains a thin, stable entry point.
     return zgnu_getopt_long_common(argc, argv, optstring, longopts, longindex, 0);
 }
 

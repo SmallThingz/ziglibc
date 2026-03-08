@@ -24,12 +24,22 @@ static void alarm_handler(int sig)
   timer_hits++;
 }
 
+static void debug_mark(const char *name)
+{
+  if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) {
+    fputs(name, stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+  }
+}
+
 int main(int argc, char *argv[])
 {
   (void)argc;
   (void)argv;
 
   {
+    debug_mark("posix:block:access");
     const char *name = "posix-ext.tmp";
     FILE *f = fopen(name, "w");
     expect(f != NULL);
@@ -47,6 +57,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:readwrite-errors");
     char ch;
     errno = 0;
     expect(-1 == read(-1, &ch, 1));
@@ -57,6 +68,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:dirent-single");
     const char *needle = "posix-dirent.tmp";
     FILE *f = fopen(needle, "w");
     DIR *dir;
@@ -78,6 +90,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:gethostname");
     char host[256];
     expect(0 == gethostname(host, sizeof(host)));
     expect(host[0] != '\0');
@@ -87,6 +100,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:dirname");
     char path1[] = "/usr/lib";
     char path2[] = "noslash";
     char path3[] = "/";
@@ -96,6 +110,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:time");
     time_t t = 946684800;
     struct tm *utc = gmtime(&t);
     char *asc;
@@ -112,6 +127,7 @@ int main(int argc, char *argv[])
 
 #ifndef _WIN32
   {
+    debug_mark("posix:block:stat");
     const char *name = "posix-stat.tmp";
     int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0600);
     struct stat st;
@@ -125,12 +141,14 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:umask-roundtrip");
     mode_t old = umask(022);
     mode_t prev = umask(old);
     expect(022 == prev);
   }
 
   {
+    debug_mark("posix:block:openat");
     const char *name = "posix-openat.tmp";
     int fd = openat(AT_FDCWD, name, O_CREAT | O_TRUNC | O_RDWR, 0600);
     struct stat st;
@@ -143,6 +161,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:openat-relative");
     const char *name = "posix-openat-relative.tmp";
     int dirfd = open(".", O_RDONLY);
     int fd;
@@ -159,6 +178,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:fcntl");
     const char *name = "posix-fcntl.tmp";
     int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0600);
     int flags;
@@ -180,6 +200,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:umask-create");
     mode_t old = umask(077);
     const char *name = "posix-umask.tmp";
     int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0666);
@@ -193,6 +214,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:popen-read");
     FILE *p = popen("printf popen-ok", "r");
     char buf[64];
     expect(p != NULL);
@@ -202,6 +224,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:popen-write");
     FILE *p = popen("cat > /dev/null", "w");
     expect(p != NULL);
     expect(fputs("payload\n", p) >= 0);
@@ -209,12 +232,14 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:popen-invalid");
     errno = 0;
     expect(NULL == popen("echo invalid", "x"));
     expect(EINVAL == errno);
   }
 
   {
+    debug_mark("posix:block:popen-env");
     const char *home = getenv("HOME");
     if (home != NULL && home[0] != '\0') {
       FILE *p = popen("printf %s \"$HOME\"", "r");
@@ -227,6 +252,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:link");
     const char *name = "posix-link-src.tmp";
     const char *alias = "posix-link-dst.tmp";
     struct stat st_src;
@@ -244,6 +270,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:uio");
     const char *name = "posix-writev.tmp";
     int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0600);
     struct iovec outv[2];
@@ -274,6 +301,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:dirent-multi");
     FILE *fa = fopen("posix-dirent-a.tmp", "w");
     FILE *fb = fopen("posix-dirent-b.tmp", "w");
     DIR *dir;
@@ -298,6 +326,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:pathconf");
     FILE *f = fopen("posix-pathconf.tmp", "w");
     int fd;
     expect(pathconf(".", _PC_LINK_MAX) > 0);
@@ -424,6 +453,7 @@ int main(int argc, char *argv[])
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   {
+    debug_mark("posix:block:setitimer-zero");
     struct itimerval val;
     struct itimerval old;
     memset(&val, 0, sizeof(val));
@@ -433,6 +463,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:setitimer-invalid");
     struct itimerval val;
     struct itimerval old;
     memset(&val, 0, sizeof(val));
@@ -480,6 +511,7 @@ int main(int argc, char *argv[])
 #endif
 
   {
+    debug_mark("posix:block:select-zero");
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 0;
@@ -487,6 +519,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:select-invalid");
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 0;
@@ -496,6 +529,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:pselect-zero");
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = 0;
@@ -503,6 +537,7 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:pselect-invalid");
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = 0;
@@ -538,6 +573,7 @@ int main(int argc, char *argv[])
 #endif
 
   {
+    debug_mark("posix:block:gettimeofday");
     struct timeval tv;
     expect(0 == gettimeofday(&tv, NULL));
     expect(tv.tv_usec >= 0);
@@ -545,17 +581,20 @@ int main(int argc, char *argv[])
   }
 
   {
+    debug_mark("posix:block:clock_gettime");
     struct timespec ts;
     expect(0 == clock_gettime(CLOCK_REALTIME, &ts));
     expect(ts.tv_nsec >= 0);
     expect(ts.tv_nsec < 1000000000L);
   }
 
+  debug_mark("posix:block:strcasecmp");
   expect(0 == strcasecmp("HeLLo", "hEllO"));
   expect(strcasecmp("abc", "abd") < 0);
   expect(strcasecmp("abD", "abc") > 0);
 
   {
+    debug_mark("posix:block:isatty");
     int tty = isatty(STDOUT_FILENO);
     expect(tty == 0 || tty == 1);
   }

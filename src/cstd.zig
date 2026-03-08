@@ -1156,27 +1156,20 @@ export fn strerror(errnum: c_int) callconv(.c) [*:0]const u8 {
 // --------------------------------------------------------------------------------
 // signal
 // --------------------------------------------------------------------------------
-const SignalFn = switch (builtin.zig_backend) {
-    .stage1 => fn (c_int) callconv(.c) void,
-    // `SIG_ERR` is represented as `(void (*)(int))-1`, which is intentionally
-    // not guaranteed to satisfy function-pointer alignment.
-    else => *align(1) const fn (c_int) callconv(.c) void,
-};
-
-export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
-    const sig_err = @as(?SignalFn, @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))));
+fn _zsignalRaw(sig: c_int, func_ptr: usize) callconv(.c) usize {
+    const sig_err = @as(usize, @bitCast(@as(isize, -1)));
     if (builtin.os.tag == .windows) {
         var action = std.mem.zeroes(c.struct_sigaction);
-        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(@intFromPtr(func)));
+        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(func_ptr));
 
         var old_action = std.mem.zeroes(c.struct_sigaction);
         if (__zwindows_sigaction(sig, &action, &old_action) != 0) {
             return sig_err;
         }
         return if (old_action.sa_handler) |h|
-            @as(?SignalFn, @ptrFromInt(@intFromPtr(h)))
+            @intFromPtr(h)
         else
-            null;
+            0;
     }
     if (sig < 0 or sig > std.math.maxInt(u6)) {
         errno = c.EINVAL;
@@ -1184,7 +1177,7 @@ export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
     }
     if (builtin.os.tag.isDarwin()) {
         var action = std.mem.zeroes(c.struct_sigaction);
-        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(@intFromPtr(func)));
+        action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(func_ptr));
         action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
 
         var old_action = std.mem.zeroes(c.struct_sigaction);
@@ -1192,12 +1185,12 @@ export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
             return sig_err;
         }
         return if (old_action.sa_handler) |h|
-            @as(?SignalFn, @ptrFromInt(@intFromPtr(h)))
+            @intFromPtr(h)
         else
-            null;
+            0;
     }
     var action = std.mem.zeroes(c.struct_sigaction);
-    action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(@intFromPtr(func)));
+    action.sa_handler = @as(@TypeOf(action.sa_handler), @ptrFromInt(func_ptr));
     action.sa_flags = @as(c_int, @bitCast(@as(c_uint, @intCast(std.posix.SA.RESTART))));
 
     var old_action: std.posix.Sigaction = undefined;
@@ -1206,11 +1199,19 @@ export fn signal(sig: c_int, func: SignalFn) callconv(.c) ?SignalFn {
         @ptrCast(&action),
         &old_action,
     ))) {
-        .SUCCESS => return @as(?SignalFn, @ptrCast(old_action.handler.handler)),
+        .SUCCESS => return @intFromPtr(old_action.handler.handler),
         else => |e| {
             errno = @intFromEnum(e);
             return sig_err;
         },
+    }
+}
+
+comptime {
+    if (builtin.target.ofmt == .coff) {
+        @export(&_zsignalRaw, .{ .name = "_zsignalRaw" });
+    } else {
+        @export(&_zsignalRaw, .{ .name = "_zsignalRaw", .visibility = .hidden });
     }
 }
 
