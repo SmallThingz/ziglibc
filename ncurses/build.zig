@@ -1,7 +1,7 @@
 const std = @import("std");
 const GitRepoStep = @import("../GitRepoStep.zig");
 const ProcessFileStep = @import("../ProcessFileStep.zig");
-const filecheck = @import("../filecheck.zig");
+const filecheck = @import("../tools/filecheck.zig");
 
 const NcursesPrepStep = struct {
     step: std.Build.Step,

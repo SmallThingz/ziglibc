@@ -2,9 +2,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 const GitRepoStep = @import("GitRepoStep.zig");
 const libcbuild = @import("ziglibcbuild.zig");
-const luabuild = @import("luabuild.zig");
-const awkbuild = @import("awkbuild.zig");
-const gnumakebuild = @import("gnumakebuild.zig");
+const luabuild = @import("tools/luabuild.zig");
+const awkbuild = @import("tools/awkbuild.zig");
+const gnumakebuild = @import("tools/gnumakebuild.zig");
 
 var foreign_run_serial: ?*std.Build.Step = null;
 
@@ -133,7 +133,7 @@ pub fn build(b: *std.Build) void {
     {
         const exe = addExecutableCompat(b, .{
             .name = "genheaders",
-            .root_source_file = lazyPath(b, "src" ++ std.fs.path.sep_str ++ "genheaders.zig"),
+            .root_source_file = lazyPath(b, "tools" ++ std.fs.path.sep_str ++ "genheaders.zig"),
         });
         const run = addRunArtifactCompat(b, exe);
         run.addArg(b.pathFromRoot("capi.txt"));
@@ -220,13 +220,13 @@ pub fn build(b: *std.Build) void {
 
     const test_env_exe = addExecutableCompat(b, .{
         .name = "testenv",
-        .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "testenv.zig"),
+        .root_source_file = lazyPath(b, "tools" ++ std.fs.path.sep_str ++ "testenv.zig"),
         .target = target,
         .optimize = optimize,
     });
     const parity_env_exe = addExecutableCompat(b, .{
         .name = "parityenv",
-        .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "parityenv.zig"),
+        .root_source_file = lazyPath(b, "tools" ++ std.fs.path.sep_str ++ "parityenv.zig"),
         .target = target,
         .optimize = optimize,
     });

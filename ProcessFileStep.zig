@@ -1,6 +1,6 @@
 const std = @import("std");
 const ProcessFileStep = @This();
-const filecheck = @import("filecheck.zig");
+const filecheck = @import("tools/filecheck.zig");
 
 step: std.Build.Step,
 //builder: *std.Build,
