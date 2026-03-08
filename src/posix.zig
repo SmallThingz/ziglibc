@@ -365,6 +365,26 @@ fn waitForPidStatus(pid: PopenPid) c_int {
     }
 }
 
+fn drainWindowsPipeStream(stream: *c.FILE) void {
+    if (comptime builtin.os.tag != .windows) return;
+    const fd = fileno(stream);
+    if (fd < 0) return;
+    const status_flags = winfd.getStatusFlags(fd) orelse return;
+    if ((status_flags & 0x3) != c.O_RDONLY) return;
+
+    var buf: [256]u8 = undefined;
+    while (true) {
+        var amt_read: u32 = 0;
+        if (std.os.windows.kernel32.ReadFile(stream.fd.?, &buf, buf.len, &amt_read, null) == 0) {
+            switch (std.os.windows.kernel32.GetLastError()) {
+                .BROKEN_PIPE, .HANDLE_EOF => break,
+                else => break,
+            }
+        }
+        if (amt_read == 0) break;
+    }
+}
+
 fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
     var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return false;
@@ -1138,6 +1158,13 @@ export fn pclose(stream: *c.FILE) callconv(.c) c_int {
         c.errno = c.EINVAL;
         return -1;
     };
+    if (builtin.os.tag == .windows) {
+        // Native Windows shells can surface a broken-pipe exit status if the
+        // parent closes the read end before draining the child's final writes.
+        // Drain any unread pipe data first so `_pclose`-style callers get the
+        // child exit code rather than an artifact of our teardown ordering.
+        drainWindowsPipeStream(stream);
+    }
     const close_rc = c.fclose(stream);
     const wait_rc = waitForPidStatus(pid);
     if (wait_rc == -1) return -1;

@@ -351,6 +351,15 @@ int main(int argc, char *argv[])
   }
 
   {
+    FILE *p = popen("for /l %i in (1,1,1024) do @<nul set /p =x", "r");
+    char buf[8];
+    expect(p != NULL);
+    expect(NULL != fgets(buf, sizeof(buf), p));
+    expect(buf[0] == 'x');
+    expect(0 == pclose(p));
+  }
+
+  {
     FILE *p = popen("exit /b 5", "r");
     expect(p != NULL);
     expect(5 == pclose(p));
