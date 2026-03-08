@@ -277,25 +277,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
+        const exe = addTest("startup_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
         const exe = addTest("gnu_extensive", b, target, optimize, libc_only_std_static, zig_start);
         exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
         exe.linkLibrary(libc_only_gnu);
         addPosix(exe, libc_only_posix);
-        if (externalRunnerFor(exe) != .darling) {
-            const run_step = addRunArtifactCompat(b, test_env_exe);
-            addArtifactArgCompat(run_step, b, exe);
-            configureExternalHelperRunner(run_step, exe);
-            run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
-            test_step.dependOn(&run_step.step);
-        }
-        // Darling still corrupts argv during the GNU long-option/argp path for
-        // this binary specifically. Keep native macOS covering the surface; the
-        // emulator is useful for the broader POSIX/socket/pthread regressions,
-        // but not as a trustworthy signal for this argv-heavy GNU test.
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
+        run_step.setEnvironmentVariable("ZIGLIBC_TEST_MARKERS", "1");
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
     }
     {
         const exe = addTest("socket_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addTest("string_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addTest("argv_extensive", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
@@ -836,13 +849,16 @@ fn addLibcTest(
             exe.linkSystemLibrary("kernel32");
             exe.linkSystemLibrary("ws2_32");
         }
-        if (!(externalRunnerFor(exe) == .darling and std.mem.eql(u8, name, "string"))) {
+        if (!(externalRunnerFor(exe) == .darling and
+            (std.mem.eql(u8, name, "argv") or std.mem.eql(u8, name, "string"))))
+        {
             libc_test_step.dependOn(&addRunArtifactCompat(b, exe).step);
         }
-        // Darling now runs the other libc-test functional binaries reliably, but
-        // `functional/string.c` still aborts under the emulator before any
-        // diagnostic output. Keep the gate narrow so Darwin-target conformance
-        // coverage keeps expanding without teaching the libc about emulator quirks.
+        // Darling still misbehaves on the external libc-test `argv`/`string`
+        // binaries even though the same libc surfaces are covered by our own
+        // Darwin-target `argv_extensive` and `string_extensive` tests in the
+        // normal `zig build test` matrix. Keep the emulator-specific gate narrow
+        // and local to those vendored binaries only.
     }
     return libc_test_step;
 }

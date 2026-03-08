@@ -855,16 +855,23 @@ export fn strncpy(s1: [*]u8, s2: [*:0]const u8, n: usize) callconv(.c) [*]u8 {
 //       they don't appear to be a part of any standard.
 //       not sure whether they should live in this library or a separate one
 //       see https://lwn.net/Articles/507319/
-export fn strlcpy(dst: [*]u8, src: [*:0]const u8, size: usize) callconv(.c) usize {
+export fn strlcpy(dst: ?[*]u8, src: [*:0]const u8, size: usize) callconv(.c) usize {
     trace.log("strncpy {*} {*} n={}", .{ dst, src, size });
+    // C callers may pass a null destination when `size == 0`; that is valid as
+    // long as the function only reports the source length and never dereferences
+    // `dst`. Using a non-null Zig pointer here lets the backend assume the
+    // pointer is always valid, which can turn this libc edge case into
+    // target-specific crashes that only show up on some ABIs/backends.
+    if (size == 0) return strlen(src);
+    const out = dst.?;
     var i: usize = 0;
     while (true) : (i += 1) {
         if (i == size) {
             if (size > 0)
-                dst[size - 1] = 0;
+                out[size - 1] = 0;
             return i + strlen(src + i);
         }
-        dst[i] = src[i];
+        out[i] = src[i];
         if (src[i] == 0) {
             return i;
         }

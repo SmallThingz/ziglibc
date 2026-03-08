@@ -3,11 +3,21 @@
 #include <getopt.h>
 #include <glob.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "expect.h"
 
-#define GNU_MARK(label) do { } while (0)
+static void gnu_mark(const char *label)
+{
+  if (getenv("ZIGLIBC_TEST_MARKERS") != NULL) {
+    fputs(label, stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+  }
+}
+
+#define GNU_MARK(label) gnu_mark(label)
 
 static int saw_args;
 static int saw_no_args;

@@ -111,6 +111,15 @@ fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const
     return std.fs.realpathAlloc(allocator, path_no_dot);
 }
 
+fn normalizeForeignChildCwd(allocator: std.mem.Allocator, runner: ExternalRunner, dirname: []const u8) ![]const u8 {
+    const abs = try std.fs.cwd().realpathAlloc(allocator, dirname);
+    return switch (runner) {
+        .darling => normalizeDarwinPathAlloc(allocator, abs),
+        .wine => abs,
+        .none => abs,
+    };
+}
+
 fn winePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const out = try std.fmt.allocPrint(allocator, "Z:{s}", .{path});
     for (out) |*ch| {
@@ -131,29 +140,39 @@ fn initForeignRunnerChild(
         mapped_args[i] = try mapExistingPathAlloc(allocator, arg);
     }
 
-    var child_args = try allocator.alloc([]const u8, args.len + 2);
-    child_args[0] = switch (runner) {
-        .darling => "darling",
-        .wine => "wine",
+    var child = switch (runner) {
+        .darling => blk: {
+            // Match the build-graph wrapper exactly. In CI/dev environments the
+            // usable Darling entry point can come from a shell-level wrapper,
+            // while `/usr/bin/darling` itself may be present but not runnable.
+            // Calling Darling directly from the helper would make emulator runs
+            // disagree with the build wrapper and hide real libc mismatches
+            // behind a harness-only spawn failure.
+            var child_args = try allocator.alloc([]const u8, args.len + 5);
+            child_args[0] = "bash";
+            child_args[1] = "-lc";
+            child_args[2] = "darling \"$@\"";
+            child_args[3] = "_";
+            child_args[4] = abs_program;
+            for (mapped_args, 0..) |arg, i| {
+                child_args[i + 5] = arg;
+            }
+            break :blk std.process.Child.init(child_args, allocator);
+        },
+        .wine => blk: {
+            var child_args = try allocator.alloc([]const u8, args.len + 2);
+            child_args[0] = "wine";
+            child_args[1] = try winePathAlloc(allocator, abs_program);
+            for (mapped_args, 0..) |arg, i| {
+                child_args[i + 2] = argblk: {
+                    std.fs.cwd().access(if (std.mem.startsWith(u8, arg, "./")) arg[2..] else arg, .{}) catch break :argblk arg;
+                    break :argblk try winePathAlloc(allocator, arg);
+                };
+            }
+            break :blk std.process.Child.init(child_args, allocator);
+        },
         .none => unreachable,
     };
-    child_args[1] = switch (runner) {
-        .darling => abs_program,
-        .wine => try winePathAlloc(allocator, abs_program),
-        .none => unreachable,
-    };
-    for (mapped_args, 0..) |arg, i| {
-        child_args[i + 2] = switch (runner) {
-            .darling => arg,
-            .wine => blk: {
-                std.fs.cwd().access(if (std.mem.startsWith(u8, arg, "./")) arg[2..] else arg, .{}) catch break :blk arg;
-                break :blk try winePathAlloc(allocator, arg);
-            },
-            .none => unreachable,
-        };
-    }
-
-    var child = std.process.Child.init(child_args, allocator);
     if (runner == .wine) {
         const env_map = try allocator.create(std.process.EnvMap);
         env_map.* = try std.process.getEnvMap(allocator);
@@ -215,8 +234,13 @@ pub fn main() !u8 {
             std.log.err("failed to normalize child cwd: {}", .{err});
             return err;
         },
-        .darling, .wine => std.fs.cwd().realpathAlloc(allocator, dirname) catch |err| {
-            std.log.err("realpath(cwd) failed: {}", .{err});
+        .darling, .wine => normalizeForeignChildCwd(allocator, runner, dirname) catch |err| {
+            // Darling needs a cwd in its translated namespace. Wine does not:
+            // Wine itself is the host-side spawned process, so its cwd must stay
+            // as a host path while only argv-style paths get converted to `Z:\...`.
+            // Regressing this back to a Wine path makes the host spawn fail with
+            // FileNotFound before Wine even starts.
+            std.log.err("failed to normalize foreign child cwd: {}", .{err});
             return err;
         },
     };

@@ -118,6 +118,15 @@ fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const
     return std.fs.realpathAlloc(allocator, path_no_dot);
 }
 
+fn normalizeForeignChildCwd(allocator: std.mem.Allocator, runner: ExternalRunner, dirname: []const u8) ![]const u8 {
+    const abs = try std.fs.cwd().realpathAlloc(allocator, dirname);
+    return switch (runner) {
+        .darling => normalizeDarwinPathAlloc(allocator, abs),
+        .wine => abs,
+        .none => abs,
+    };
+}
+
 fn winePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const out = try std.fmt.allocPrint(allocator, "Z:{s}", .{path});
     for (out) |*ch| {
@@ -162,30 +171,39 @@ fn initChild(
     }
 
     const abs_program = try std.fs.realpathAlloc(allocator, program_path);
-    var child_args = try allocator.alloc([]const u8, shared_args.len + 2);
-    child_args[0] = switch (runner) {
-        .darling => "darling",
-        .wine => "wine",
+    var child = switch (runner) {
+        .darling => blk: {
+            // Keep helper-driven parity runs on the same Darling resolution path
+            // as the build wrapper (`bash -lc ...`). Otherwise the helper can hit
+            // a non-runnable host binary even though the build graph uses a valid
+            // shell-level Darling wrapper, turning a harness mismatch into a fake
+            // libc parity failure.
+            var child_args = try allocator.alloc([]const u8, shared_args.len + 5);
+            child_args[0] = "bash";
+            child_args[1] = "-lc";
+            child_args[2] = "darling \"$@\"";
+            child_args[3] = "_";
+            child_args[4] = abs_program;
+            for (shared_args, 0..) |arg, i| {
+                child_args[i + 5] = try mapExistingPathAlloc(allocator, arg);
+            }
+            break :blk std.process.Child.init(child_args, allocator);
+        },
+        .wine => blk: {
+            var child_args = try allocator.alloc([]const u8, shared_args.len + 2);
+            child_args[0] = "wine";
+            child_args[1] = try winePathAlloc(allocator, abs_program);
+            for (shared_args, 0..) |arg, i| {
+                const mapped = try mapExistingPathAlloc(allocator, arg);
+                child_args[i + 2] = argblk: {
+                    std.fs.cwd().access(if (std.mem.startsWith(u8, mapped, "./")) mapped[2..] else mapped, .{}) catch break :argblk arg;
+                    break :argblk try winePathAlloc(allocator, mapped);
+                };
+            }
+            break :blk std.process.Child.init(child_args, allocator);
+        },
         .none => unreachable,
     };
-    child_args[1] = switch (runner) {
-        .darling => abs_program,
-        .wine => try winePathAlloc(allocator, abs_program),
-        .none => unreachable,
-    };
-    for (shared_args, 0..) |arg, i| {
-        const mapped = try mapExistingPathAlloc(allocator, arg);
-        child_args[i + 2] = switch (runner) {
-            .darling => mapped,
-            .wine => blk: {
-                std.fs.cwd().access(if (std.mem.startsWith(u8, mapped, "./")) mapped[2..] else mapped, .{}) catch break :blk arg;
-                break :blk try winePathAlloc(allocator, mapped);
-            },
-            .none => unreachable,
-        };
-    }
-
-    var child = std.process.Child.init(child_args, allocator);
     if (runner == .wine) {
         const env_map = try allocator.create(std.process.EnvMap);
         env_map.* = try std.process.getEnvMap(allocator);
@@ -216,7 +234,11 @@ fn runProgram(
     var child = try initChild(allocator, runner, program_path, shared_args);
     child.cwd = switch (runner) {
         .none => try normalizedChildCwd(allocator, dirname),
-        .darling, .wine => try std.fs.cwd().realpathAlloc(allocator, dirname),
+        .darling, .wine =>
+        // Darling needs a translated cwd; Wine does not. Wine is the spawned
+        // host process, so only its argv paths should be mapped to `Z:\...`
+        // while the host cwd stays as a real host path.
+        try normalizeForeignChildCwd(allocator, runner, dirname),
     };
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;

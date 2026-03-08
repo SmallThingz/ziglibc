@@ -77,6 +77,15 @@ int main(int argc, char *argv[])
     expect(0 == strcmp(dst, "hello world"));
   }
 
+  {
+    char dst[8];
+    expect(3 == strlcpy(NULL, "abc", 0));
+    expect(3 == strlcpy(dst, "abc", sizeof(dst)));
+    expect(0 == strcmp(dst, "abc"));
+    expect(6 == strlcat(dst, "123", sizeof(dst)));
+    expect(0 == strcmp(dst, "abc123"));
+  }
+
   puts("Success!");
   return 0;
 }
