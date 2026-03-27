@@ -740,7 +740,17 @@ fn ensureRepoPath(b: *std.Build, rel_path: []const u8, probe_rel_path: []const u
 
     var exit_code: u8 = undefined;
     _ = b.runAllowFail(
-        &.{ "git", "submodule", "update", "--init", "--recursive", "--", rel_path },
+        &.{
+            "git",
+            "submodule",
+            "update",
+            "--init",
+            "--depth",
+            "1",
+            "--recommend-shallow",
+            "--",
+            rel_path,
+        },
         &exit_code,
         .inherit,
     ) catch return null;

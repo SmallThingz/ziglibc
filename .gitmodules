@@ -1,12 +1,16 @@
 [submodule "dep/libc-test"]
 	path = dep/libc-test
 	url = https://github.com/kraj/libc-test
+	shallow = true
 [submodule "dep/tiny-regex-c"]
 	path = dep/tiny-regex-c
 	url = https://github.com/marler8997/tiny-regex-c
+	shallow = true
 [submodule "dep/open_posix_testsuite"]
 	path = dep/open_posix_testsuite
 	url = https://github.com/nloopa/open_posix_testsuite
+	shallow = true
 [submodule "dep/glibc-testsuite"]
 	path = dep/glibc-testsuite
 	url = https://github.com/cloudius-systems/glibc-testsuite
+	shallow = true
