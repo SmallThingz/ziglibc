@@ -38,6 +38,18 @@ const windows_signal_siginfo_bit: c_int = if (@hasDecl(c, "SA_SIGINFO"))
     @as(c_int, @bitCast(@as(c_uint, @intCast(c.SA_SIGINFO))))
 else
     0;
+const windows_generic_read: u32 = 0x8000_0000;
+const windows_generic_write: u32 = 0x4000_0000;
+const windows_file_share_read: u32 = 0x0000_0001;
+const windows_file_share_write: u32 = 0x0000_0002;
+const windows_file_share_delete: u32 = 0x0000_0004;
+const windows_open_existing: u32 = 3;
+const windows_create_new: u32 = 1;
+const windows_create_always: u32 = 2;
+const windows_open_always: u32 = 4;
+const windows_file_attribute_normal: u32 = 0x0000_0080;
+const windows_file_attribute_temporary: u32 = 0x0000_0100;
+const windows_file_flag_delete_on_close: u32 = 0x0400_0000;
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
     if (@hasDecl(c, name)) return @field(c, name);
@@ -107,8 +119,18 @@ fn zunlinkCompat(path: [*:0]const u8) c_int {
             },
         }
     }
-    if (std.c.unlink(path) == 0) return 0;
-    return -1;
+    if (builtin.os.tag == .windows) {
+        if (windows.DeleteFileA(path) != 0) return 0;
+        errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
+        return -1;
+    }
+    switch (std.posix.errno(std.posix.system.unlinkat(c.AT_FDCWD, path, 0))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 // __main appears to be a design inherited by LLVM from gcc.
@@ -133,7 +155,7 @@ const windows = struct {
         while (written < buffer.len) {
             const next_write = std.math.cast(u32, buffer.len - written) orelse std.math.maxInt(u32);
             var last_written: u32 = undefined;
-            const result = std.os.windows.kernel32.WriteFile(hFile, buffer.ptr + written, next_write, &last_written, null);
+            const result = WriteFile(hFile, buffer.ptr + written, next_write, &last_written, null);
             written += last_written; // WriteFile always sets last_written to 0 before doing anything
             if (result == 0) {
                 out_written.* = written;
@@ -152,6 +174,7 @@ const windows = struct {
         hTemplateFile: ?HANDLE,
     ) callconv(.winapi) ?HANDLE;
     pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn DeleteFileA(lpFileName: [*:0]const u8) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
     pub extern "kernel32" fn GetEnvironmentVariableA(
         lpName: [*:0]const u8,
@@ -163,6 +186,25 @@ const windows = struct {
         liDistanceToMove: std.os.windows.LARGE_INTEGER,
         lpNewFilePointer: ?*std.os.windows.LARGE_INTEGER,
         dwMoveMethod: u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn MoveFileExA(
+        lpExistingFileName: [*:0]const u8,
+        lpNewFileName: [*:0]const u8,
+        dwFlags: u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: ?*anyopaque,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: ?*u32,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: ?*const anyopaque,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: ?*u32,
+        lpOverlapped: ?*anyopaque,
     ) callconv(.winapi) std.os.windows.BOOL;
 };
 
@@ -1536,8 +1578,18 @@ export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
             },
         }
     }
-    if (std.c.rename(old, new) == 0) return 0;
-    return -1;
+    if (builtin.os.tag == .windows) {
+        if (windows.MoveFileExA(old, new, 0x1) != 0) return 0;
+        errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
+        return -1;
+    }
+    switch (std.posix.errno(std.posix.system.renameat(c.AT_FDCWD, old, c.AT_FDCWD, new))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn getchar() callconv(.c) c_int {
@@ -1602,13 +1654,13 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
         const actual_read_len = @as(u32, @intCast(@min(@as(u32, std.math.maxInt(u32)), remaining)));
         while (true) {
             var amt_read: u32 = undefined;
-            if (std.os.windows.kernel32.ReadFile(stream.fd.?, dest, actual_read_len, &amt_read, null) == 0) {
-                switch (std.os.windows.kernel32.GetLastError()) {
+            if (windows.ReadFile(stream.fd.?, dest, actual_read_len, &amt_read, null) == 0) {
+                switch (std.os.windows.GetLastError()) {
                     .OPERATION_ABORTED => continue,
                     .BROKEN_PIPE => return prefilled,
                     .HANDLE_EOF => return prefilled,
                     else => |err| {
-                        stream.errno = @intFromEnum(err);
+                        stream.errno = winfd.errnoFromWin32(err);
                         errno = stream.errno;
                         return prefilled;
                     },
@@ -1715,38 +1767,38 @@ fn fopenImpl(
 
     if (builtin.os.tag == .windows) {
         const create_disposition: u32 = switch (parsed.kind) {
-            .read => std.os.windows.OPEN_EXISTING,
-            .write => if (parsed.excl) std.os.windows.CREATE_NEW else std.os.windows.CREATE_ALWAYS,
-            .append => if (parsed.excl) std.os.windows.CREATE_NEW else std.os.windows.OPEN_ALWAYS,
+            .read => windows_open_existing,
+            .write => if (parsed.excl) windows_create_new else windows_create_always,
+            .append => if (parsed.excl) windows_create_new else windows_open_always,
         };
         var access: u32 = 0;
         if (parsed.plus or parsed.kind == .read) {
-            access |= std.os.windows.GENERIC_READ;
+            access |= windows_generic_read;
         }
         if (parsed.plus or parsed.kind != .read) {
-            access |= std.os.windows.GENERIC_WRITE;
+            access |= windows_generic_write;
         }
         const fd = windows.CreateFileA(
             filename,
             access,
-            std.os.windows.FILE_SHARE_DELETE |
-                std.os.windows.FILE_SHARE_READ |
-                std.os.windows.FILE_SHARE_WRITE,
+            windows_file_share_delete |
+                windows_file_share_read |
+                windows_file_share_write,
             null,
             create_disposition,
-            std.os.windows.FILE_ATTRIBUTE_NORMAL,
+            windows_file_attribute_normal,
             null,
         );
         if (fd == std.os.windows.INVALID_HANDLE_VALUE) {
-            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return null;
         }
         if (parsed.kind == .append) {
-            std.os.windows.SetFilePointerEx_END(fd.?, 0) catch {
+            if (windows.SetFilePointerEx(fd.?, 0, null, 2) == 0) {
                 _ = windows.CloseHandle(fd.?);
-                errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+                errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
                 return null;
-            };
+            }
         }
         const file = global.reserveFile() orelse {
             _ = windows.CloseHandle(fd.?);
@@ -1814,7 +1866,7 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
             }
         } else if (windows.CloseHandle(stream.fd.?) == 0) {
             _ = fclose(new_stream);
-            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return null;
         }
     } else {
@@ -1846,7 +1898,7 @@ export fn fclose(stream: *c.FILE) callconv(.c) c_int {
                 return c.EOF;
             }
         } else if (windows.CloseHandle(stream.fd.?) == 0) {
-            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return c.EOF;
         }
     } else {
@@ -1886,7 +1938,7 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
             else => unreachable,
         };
         if (windows.SetFilePointerEx(stream.fd.?, off, null, move_method) == 0) {
-            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             stream.errno = errno;
             return -1;
         }
@@ -1919,7 +1971,7 @@ export fn ftell(stream: *c.FILE) callconv(.c) c_long {
     if (builtin.os.tag == .windows) {
         var current: std.os.windows.LARGE_INTEGER = undefined;
         if (windows.SetFilePointerEx(stream.fd.?, 0, &current, 1) == 0) {
-            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             stream.errno = errno;
             return -1;
         }
@@ -1994,7 +2046,7 @@ export fn _fwrite_buf(ptr: [*]const u8, size: usize, stream: *c.FILE) callconv(.
     if (builtin.os.tag == .windows) {
         var written: usize = undefined;
         windows.writeAll(stream.fd.?, ptr[0..size], &written) catch {
-            stream.errno = @intFromEnum(std.os.windows.kernel32.GetLastError());
+            stream.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
         };
         return written;
     }
@@ -2626,7 +2678,7 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
         var temp_buf: [std.os.windows.MAX_PATH:0]u8 = undefined;
         const temp_len = windows.GetTempPathA(temp_buf.len, &temp_buf);
         if (temp_len == 0 or temp_len >= temp_buf.len) {
-            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return null;
         }
         var attempt_windows: usize = 0;
@@ -2642,14 +2694,14 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
 
             const fd = windows.CreateFileA(
                 &name_buf,
-                std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
-                std.os.windows.FILE_SHARE_DELETE |
-                    std.os.windows.FILE_SHARE_READ |
-                    std.os.windows.FILE_SHARE_WRITE,
+                windows_generic_read | windows_generic_write,
+                windows_file_share_delete |
+                    windows_file_share_read |
+                    windows_file_share_write,
                 null,
-                std.os.windows.CREATE_NEW,
-                std.os.windows.FILE_ATTRIBUTE_TEMPORARY |
-                    std.os.windows.FILE_FLAG_DELETE_ON_CLOSE,
+                windows_create_new,
+                windows_file_attribute_temporary |
+                    windows_file_flag_delete_on_close,
                 null,
             );
             if (fd != std.os.windows.INVALID_HANDLE_VALUE) {
@@ -2669,7 +2721,7 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
                 file.errno = 0;
                 return file;
             }
-            const win_err = std.os.windows.kernel32.GetLastError();
+            const win_err = std.os.windows.GetLastError();
             if (win_err == .FILE_EXISTS or win_err == .ALREADY_EXISTS) continue;
             errno = winfd.errnoFromWin32(win_err);
             return null;

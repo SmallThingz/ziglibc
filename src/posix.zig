@@ -85,6 +85,43 @@ extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 
 const trace = @import("trace.zig");
 
+const WinFileTime = if (builtin.os.tag == .windows) extern struct {
+    dwLowDateTime: u32,
+    dwHighDateTime: u32,
+} else struct {};
+
+const windows_generic_read: u32 = 0x8000_0000;
+const windows_generic_write: u32 = 0x4000_0000;
+const windows_file_write_attributes: u32 = 0x0000_0100;
+const windows_file_append_data: u32 = 0x0000_0004;
+const windows_file_attribute_readonly: u32 = 0x0000_0001;
+const windows_file_attribute_normal: u32 = 0x0000_0080;
+const windows_file_attribute_temporary: u32 = 0x0000_0100;
+const windows_file_flag_delete_on_close: u32 = 0x0400_0000;
+const windows_file_share_read: u32 = 0x0000_0001;
+const windows_file_share_write: u32 = 0x0000_0002;
+const windows_file_share_delete: u32 = 0x0000_0004;
+const windows_create_new: u32 = 1;
+const windows_create_always: u32 = 2;
+const windows_open_existing: u32 = 3;
+const windows_open_always: u32 = 4;
+const windows_truncate_existing: u32 = 5;
+const windows_handle_flag_inherit: u32 = 0x0000_0001;
+const windows_infinite: u32 = 0xffff_ffff;
+
+const WinByHandleFileInformation = if (builtin.os.tag == .windows) extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: WinFileTime,
+    ftLastAccessTime: WinFileTime,
+    ftLastWriteTime: WinFileTime,
+    dwVolumeSerialNumber: u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    nNumberOfLinks: u32,
+    nFileIndexHigh: u32,
+    nFileIndexLow: u32,
+} else struct {};
+
 const winapi = if (builtin.os.tag == .windows) struct {
     pub extern "kernel32" fn CreateFileA(
         lpFileName: ?[*:0]const u8,
@@ -101,9 +138,9 @@ const winapi = if (builtin.os.tag == .windows) struct {
     pub extern "kernel32" fn GetFileType(hFile: std.os.windows.HANDLE) callconv(.winapi) u32;
     pub extern "kernel32" fn GetFileInformationByHandle(
         hFile: std.os.windows.HANDLE,
-        lpFileInformation: *std.os.windows.BY_HANDLE_FILE_INFORMATION,
+        lpFileInformation: *WinByHandleFileInformation,
     ) callconv(.winapi) std.os.windows.BOOL;
-    pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+    pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *WinFileTime) callconv(.winapi) void;
     pub extern "kernel32" fn GetComputerNameA(lpBuffer: [*]u8, nSize: *u32) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?std.os.windows.HMODULE;
     pub extern "kernel32" fn GetProcAddress(hModule: ?std.os.windows.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
@@ -120,6 +157,43 @@ const winapi = if (builtin.os.tag == .windows) struct {
         lpTotalBytesAvail: ?*u32,
         lpBytesLeftThisMessage: ?*u32,
     ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn ReadFile(
+        hFile: std.os.windows.HANDLE,
+        lpBuffer: ?*anyopaque,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: ?*u32,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn WriteFile(
+        hFile: std.os.windows.HANDLE,
+        lpBuffer: ?*const anyopaque,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: ?*u32,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn CreatePipe(
+        hReadPipe: *std.os.windows.HANDLE,
+        hWritePipe: *std.os.windows.HANDLE,
+        lpPipeAttributes: ?*std.os.windows.SECURITY_ATTRIBUTES,
+        nSize: u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn SetHandleInformation(
+        hObject: std.os.windows.HANDLE,
+        dwMask: u32,
+        dwFlags: u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn ExitProcess(uExitCode: c_uint) callconv(.winapi) noreturn;
+    pub extern "kernel32" fn GetConsoleMode(
+        hConsoleHandle: std.os.windows.HANDLE,
+        lpMode: *u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn SetFileTime(
+        hFile: std.os.windows.HANDLE,
+        lpCreationTime: ?*const WinFileTime,
+        lpLastAccessTime: ?*const WinFileTime,
+        lpLastWriteTime: ?*const WinFileTime,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn DeleteFileA(lpFileName: [*:0]const u8) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
@@ -251,11 +325,8 @@ const WindowsSocketEntry = struct {
 };
 var windows_socket_mutex: SpinLock = .{};
 var windows_socket_entries: [windows_socket_slots]WindowsSocketEntry = [_]WindowsSocketEntry{.{}} ** windows_socket_slots;
-var windows_wsa_once = std.once(struct {
-    fn init() void {
-        std.os.windows.callWSAStartup() catch {};
-    }
-}.init);
+var windows_init_mutex: SpinLock = .{};
+var windows_wsa_initialized = false;
 const WinsockRawSocketFn = *const fn (af: i32, @"type": i32, protocol: i32) callconv(.winapi) WindowsSocket;
 const WinsockRawBindFn = *const fn (s: WindowsSocket, name: *const std.os.windows.ws2_32.sockaddr, namelen: i32) callconv(.winapi) i32;
 const WinsockRawConnectFn = *const fn (s: WindowsSocket, name: *const std.os.windows.ws2_32.sockaddr, namelen: i32) callconv(.winapi) i32;
@@ -296,25 +367,7 @@ const WinsockApi = struct {
     select_fn: ?WinsockRawSelectFn = null,
 };
 var windows_winsock_api: WinsockApi = .{};
-var windows_winsock_api_once = std.once(struct {
-    fn init() void {
-        const module = winapi.LoadLibraryA("ws2_32.dll") orelse return;
-        windows_winsock_api.module = module;
-        windows_winsock_api.socket_fn = @ptrCast(winapi.GetProcAddress(module, "socket") orelse return);
-        windows_winsock_api.bind_fn = @ptrCast(winapi.GetProcAddress(module, "bind") orelse return);
-        windows_winsock_api.connect_fn = @ptrCast(winapi.GetProcAddress(module, "connect") orelse return);
-        windows_winsock_api.getsockname_fn = @ptrCast(winapi.GetProcAddress(module, "getsockname") orelse return);
-        windows_winsock_api.getpeername_fn = @ptrCast(winapi.GetProcAddress(module, "getpeername") orelse return);
-        windows_winsock_api.getsockopt_fn = @ptrCast(winapi.GetProcAddress(module, "getsockopt") orelse return);
-        windows_winsock_api.setsockopt_fn = @ptrCast(winapi.GetProcAddress(module, "setsockopt") orelse return);
-        windows_winsock_api.send_fn = @ptrCast(winapi.GetProcAddress(module, "send") orelse return);
-        windows_winsock_api.sendto_fn = @ptrCast(winapi.GetProcAddress(module, "sendto") orelse return);
-        windows_winsock_api.recv_fn = @ptrCast(winapi.GetProcAddress(module, "recv") orelse return);
-        windows_winsock_api.recvfrom_fn = @ptrCast(winapi.GetProcAddress(module, "recvfrom") orelse return);
-        windows_winsock_api.shutdown_fn = @ptrCast(winapi.GetProcAddress(module, "shutdown") orelse return);
-        windows_winsock_api.select_fn = @ptrCast(winapi.GetProcAddress(module, "select") orelse return);
-    }
-}.init);
+var windows_winsock_api_initialized = false;
 
 fn registerPopenStream(stream: *c.FILE, pid: PopenPid) bool {
     popen_mutex.lock();
@@ -344,8 +397,32 @@ fn unregisterPopenStream(stream: *c.FILE) ?PopenPid {
 
 fn ensureWindowsSockets() void {
     if (comptime builtin.os.tag != .windows) return;
-    windows_wsa_once.call();
-    windows_winsock_api_once.call();
+    windows_init_mutex.lock();
+    defer windows_init_mutex.unlock();
+
+    if (!windows_wsa_initialized) {
+        var wsa_data: std.os.windows.ws2_32.WSADATA = undefined;
+        _ = std.os.windows.ws2_32.WSAStartup(0x0202, &wsa_data);
+        windows_wsa_initialized = true;
+    }
+    if (!windows_winsock_api_initialized) {
+        const module = winapi.LoadLibraryA("ws2_32.dll") orelse return;
+        windows_winsock_api.module = module;
+        windows_winsock_api.socket_fn = @ptrCast(winapi.GetProcAddress(module, "socket") orelse return);
+        windows_winsock_api.bind_fn = @ptrCast(winapi.GetProcAddress(module, "bind") orelse return);
+        windows_winsock_api.connect_fn = @ptrCast(winapi.GetProcAddress(module, "connect") orelse return);
+        windows_winsock_api.getsockname_fn = @ptrCast(winapi.GetProcAddress(module, "getsockname") orelse return);
+        windows_winsock_api.getpeername_fn = @ptrCast(winapi.GetProcAddress(module, "getpeername") orelse return);
+        windows_winsock_api.getsockopt_fn = @ptrCast(winapi.GetProcAddress(module, "getsockopt") orelse return);
+        windows_winsock_api.setsockopt_fn = @ptrCast(winapi.GetProcAddress(module, "setsockopt") orelse return);
+        windows_winsock_api.send_fn = @ptrCast(winapi.GetProcAddress(module, "send") orelse return);
+        windows_winsock_api.sendto_fn = @ptrCast(winapi.GetProcAddress(module, "sendto") orelse return);
+        windows_winsock_api.recv_fn = @ptrCast(winapi.GetProcAddress(module, "recv") orelse return);
+        windows_winsock_api.recvfrom_fn = @ptrCast(winapi.GetProcAddress(module, "recvfrom") orelse return);
+        windows_winsock_api.shutdown_fn = @ptrCast(winapi.GetProcAddress(module, "shutdown") orelse return);
+        windows_winsock_api.select_fn = @ptrCast(winapi.GetProcAddress(module, "select") orelse return);
+        windows_winsock_api_initialized = true;
+    }
 }
 
 fn windowsWinsockReady() bool {
@@ -404,9 +481,9 @@ fn closeWindowsSocket(fd: c_int) c_int {
     defer windows_socket_mutex.unlock();
     const entry = &windows_socket_entries[@as(usize, @intCast(index))];
     if (!entry.used) return errnoConst("EBADF", c.EINVAL);
-    std.os.windows.closesocket(entry.socket) catch {
+    if (std.os.windows.ws2_32.closesocket(entry.socket) == std.os.windows.ws2_32.SOCKET_ERROR) {
         return errnoConst("EIO", c.EINVAL);
-    };
+    }
     entry.* = .{};
     return 0;
 }
@@ -446,8 +523,8 @@ fn drainWindowsPipeStream(stream: *c.FILE) void {
     var buf: [256]u8 = undefined;
     while (true) {
         var amt_read: u32 = 0;
-        if (std.os.windows.kernel32.ReadFile(stream.fd.?, &buf, buf.len, &amt_read, null) == 0) {
-            switch (std.os.windows.kernel32.GetLastError()) {
+        if (winapi.ReadFile(stream.fd.?, &buf, buf.len, &amt_read, null) == 0) {
+            switch (std.os.windows.GetLastError()) {
                 .BROKEN_PIPE, .HANDLE_EOF => break,
                 else => break,
             }
@@ -747,8 +824,8 @@ fn zwriteRaw(fd: c_int, buf: [*]const u8, nbyte: usize) isize {
             const remaining = nbyte - total_written;
             const next_len: u32 = @intCast(@min(remaining, @as(usize, std.math.maxInt(u32))));
             var did_write: u32 = 0;
-            if (std.os.windows.kernel32.WriteFile(handle, buf + total_written, next_len, &did_write, null) == 0) {
-                c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+            if (winapi.WriteFile(handle, buf + total_written, next_len, &did_write, null) == 0) {
+                c.errno = switch (std.os.windows.GetLastError()) {
                     .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
                     .ACCESS_DENIED => c.EACCES,
                     else => errnoConst("EIO", c.EINVAL),
@@ -787,8 +864,8 @@ fn zreadRaw(fd: c_int, buf: [*]u8, len: usize) isize {
         };
         const next_len: u32 = @intCast(@min(len, @as(usize, std.math.maxInt(u32))));
         var did_read: u32 = 0;
-        if (std.os.windows.kernel32.ReadFile(handle, buf, next_len, &did_read, null) == 0) {
-            c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+        if (winapi.ReadFile(handle, buf, next_len, &did_read, null) == 0) {
+            c.errno = switch (std.os.windows.GetLastError()) {
                 .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
                 .BROKEN_PIPE, .HANDLE_EOF => 0,
                 else => errnoConst("EIO", c.EINVAL),
@@ -855,45 +932,45 @@ fn zopenRaw(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int {
     if (builtin.os.tag == .windows) {
         const accmode = oflag & 0x3;
         var desired_access: u32 = switch (accmode) {
-            c.O_RDONLY => std.os.windows.GENERIC_READ,
-            c.O_WRONLY => std.os.windows.GENERIC_WRITE,
-            c.O_RDWR => std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
+            c.O_RDONLY => windows_generic_read,
+            c.O_WRONLY => windows_generic_write,
+            c.O_RDWR => windows_generic_read | windows_generic_write,
             else => {
                 c.errno = c.EINVAL;
                 return -1;
             },
         };
-        if ((oflag & c.O_APPEND) != 0) desired_access |= std.os.windows.FILE_APPEND_DATA;
+        if ((oflag & c.O_APPEND) != 0) desired_access |= windows_file_append_data;
 
         const creation_disposition: u32 = blk: {
             const creat = (oflag & c.O_CREAT) != 0;
             const excl = (oflag & c.O_EXCL) != 0;
             const trunc = (oflag & c.O_TRUNC) != 0;
-            if (creat and excl) break :blk std.os.windows.CREATE_NEW;
-            if (creat and trunc) break :blk std.os.windows.CREATE_ALWAYS;
-            if (creat) break :blk std.os.windows.OPEN_ALWAYS;
-            if (trunc) break :blk std.os.windows.TRUNCATE_EXISTING;
-            break :blk std.os.windows.OPEN_EXISTING;
+            if (creat and excl) break :blk windows_create_new;
+            if (creat and trunc) break :blk windows_create_always;
+            if (creat) break :blk windows_open_always;
+            if (trunc) break :blk windows_truncate_existing;
+            break :blk windows_open_existing;
         };
 
         const attributes: u32 = if ((oflag & c.O_CREAT) != 0 and (create_mode & 0o222) == 0)
-            std.os.windows.FILE_ATTRIBUTE_READONLY
+            windows_file_attribute_readonly
         else
-            std.os.windows.FILE_ATTRIBUTE_NORMAL;
+            windows_file_attribute_normal;
 
         const handle = winapi.CreateFileA(
             path,
             desired_access,
-            std.os.windows.FILE_SHARE_DELETE |
-                std.os.windows.FILE_SHARE_READ |
-                std.os.windows.FILE_SHARE_WRITE,
+            windows_file_share_delete |
+                windows_file_share_read |
+                windows_file_share_write,
             null,
             creation_disposition,
             attributes,
             null,
         );
         if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
 
@@ -1279,19 +1356,19 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
 
         var read_handle: std.os.windows.HANDLE = undefined;
         var write_handle: std.os.windows.HANDLE = undefined;
-        std.os.windows.CreatePipe(&read_handle, &write_handle, &security) catch {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+        if (winapi.CreatePipe(&read_handle, &write_handle, &security, 0) == 0) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return null;
-        };
+        }
 
         const parent_handle = if (mode_ch == 'r') read_handle else write_handle;
         const child_handle = if (mode_ch == 'r') write_handle else read_handle;
-        std.os.windows.SetHandleInformation(parent_handle, std.os.windows.HANDLE_FLAG_INHERIT, 0) catch {
+        if (winapi.SetHandleInformation(parent_handle, windows_handle_flag_inherit, 0) == 0) {
             _ = winapi.CloseHandle(read_handle);
             _ = winapi.CloseHandle(write_handle);
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return null;
-        };
+        }
 
         var spawn_errno: c_int = 0;
         const process_handle = if (mode_ch == 'r')
@@ -1540,26 +1617,26 @@ fn socketErrno(err: anyerror) c_int {
 fn windowsSocketErrno() c_int {
     if (comptime builtin.os.tag != .windows) return errnoConst("ENOSYS", c.EINVAL);
     return switch (std.os.windows.ws2_32.WSAGetLastError()) {
-        .WSAEACCES => c.EACCES,
-        .WSAEADDRINUSE => errnoConst("EADDRINUSE", c.EINVAL),
-        .WSAEADDRNOTAVAIL => errnoConst("EADDRNOTAVAIL", c.EINVAL),
-        .WSAEAFNOSUPPORT => errnoConst("EAFNOSUPPORT", c.EINVAL),
-        .WSAEWOULDBLOCK => errnoConst("EWOULDBLOCK", c.EAGAIN),
-        .WSAECONNREFUSED => errnoConst("ECONNREFUSED", c.EINVAL),
-        .WSAECONNRESET => errnoConst("ECONNRESET", c.EINVAL),
-        .WSAETIMEDOUT => errnoConst("ETIMEDOUT", c.EINVAL),
-        .WSAEINPROGRESS => errnoConst("EINPROGRESS", c.EINVAL),
-        .WSAEALREADY => errnoConst("EALREADY", c.EINVAL),
-        .WSAEISCONN => errnoConst("EISCONN", c.EINVAL),
-        .WSAENOTCONN => errnoConst("ENOTCONN", c.EINVAL),
-        .WSAENOTSOCK => errnoConst("ENOTSOCK", c.EINVAL),
-        .WSAEMSGSIZE => errnoConst("EMSGSIZE", c.EINVAL),
-        .WSAEINVAL => c.EINVAL,
-        .WSAENOPROTOOPT => errnoConst("ENOPROTOOPT", c.EINVAL),
-        .WSAEPROTONOSUPPORT => errnoConst("EPROTONOSUPPORT", c.EINVAL),
-        .WSAESOCKTNOSUPPORT => errnoConst("ESOCKTNOSUPPORT", c.EINVAL),
-        .WSAEOPNOTSUPP => errnoConst("EOPNOTSUPP", c.EINVAL),
-        .WSAENETDOWN, .WSAENOBUFS => c.ENOMEM,
+        .EACCES => c.EACCES,
+        .EADDRINUSE => errnoConst("EADDRINUSE", c.EINVAL),
+        .EADDRNOTAVAIL => errnoConst("EADDRNOTAVAIL", c.EINVAL),
+        .EAFNOSUPPORT => errnoConst("EAFNOSUPPORT", c.EINVAL),
+        .EWOULDBLOCK => errnoConst("EWOULDBLOCK", c.EAGAIN),
+        .ECONNREFUSED => errnoConst("ECONNREFUSED", c.EINVAL),
+        .ECONNRESET => errnoConst("ECONNRESET", c.EINVAL),
+        .ETIMEDOUT => errnoConst("ETIMEDOUT", c.EINVAL),
+        .EINPROGRESS => errnoConst("EINPROGRESS", c.EINVAL),
+        .EALREADY => errnoConst("EALREADY", c.EINVAL),
+        .EISCONN => errnoConst("EISCONN", c.EINVAL),
+        .ENOTCONN => errnoConst("ENOTCONN", c.EINVAL),
+        .ENOTSOCK => errnoConst("ENOTSOCK", c.EINVAL),
+        .EMSGSIZE => errnoConst("EMSGSIZE", c.EINVAL),
+        .EINVAL => c.EINVAL,
+        .ENOPROTOOPT => errnoConst("ENOPROTOOPT", c.EINVAL),
+        .EPROTONOSUPPORT => errnoConst("EPROTONOSUPPORT", c.EINVAL),
+        .ESOCKTNOSUPPORT => errnoConst("ESOCKTNOSUPPORT", c.EINVAL),
+        .EOPNOTSUPP => errnoConst("EOPNOTSUPP", c.EINVAL),
+        .ENETDOWN, .ENOBUFS => c.ENOMEM,
         else => errnoConst("EIO", c.EINVAL),
     };
 }
@@ -2251,7 +2328,7 @@ export fn gethostname(name: [*]u8, namelen: usize) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         var size: u32 = @intCast(@min(namelen, @as(usize, std.math.maxInt(u32))));
         if (winapi.GetComputerNameA(name, &size) == 0) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
         if (@as(usize, size) < namelen) name[@intCast(size)] = 0;
@@ -2272,7 +2349,7 @@ export fn gethostname(name: [*]u8, namelen: usize) callconv(.c) c_int {
 export fn link(path1: [*:0]const u8, path2: [*:0]const u8) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         if (winapi.CreateHardLinkA(path2, path1, null) == 0) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
         return 0;
@@ -2297,55 +2374,22 @@ export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
         }
     }
     if (builtin.os.tag == .windows) {
-        std.posix.unlinkZ(path) catch |err| {
-            if (err == error.AccessDenied) {
-                const attrs = winapi.GetFileAttributesA(path);
-                if (attrs != std.os.windows.INVALID_FILE_ATTRIBUTES and
-                    (attrs & std.os.windows.FILE_ATTRIBUTE_READONLY) != 0)
+        if (winapi.DeleteFileA(path) != 0) return 0;
+        const first_err = std.os.windows.GetLastError();
+        if (first_err == .ACCESS_DENIED) {
+            const attrs = winapi.GetFileAttributesA(path);
+            if (attrs != std.os.windows.INVALID_FILE_ATTRIBUTES and
+                (attrs & windows_file_attribute_readonly) != 0)
+            {
+                if (winapi.SetFileAttributesA(path, attrs & ~@as(u32, windows_file_attribute_readonly)) != 0 and
+                    winapi.DeleteFileA(path) != 0)
                 {
-                    if (winapi.SetFileAttributesA(path, attrs & ~@as(u32, std.os.windows.FILE_ATTRIBUTE_READONLY)) != 0) {
-                        std.posix.unlinkZ(path) catch |retry_err| {
-                            c.errno = switch (retry_err) {
-                                error.AccessDenied => c.EACCES,
-                                error.PermissionDenied => c.EPERM,
-                                error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-                                error.FileSystem => errnoConst("EIO", c.EINVAL),
-                                error.IsDir => errnoConst("EISDIR", c.EINVAL),
-                                error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-                                error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-                                error.FileNotFound => c.ENOENT,
-                                error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
-                                error.SystemResources => c.ENOMEM,
-                                error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-                                error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
-                                error.NetworkNotFound => c.ENOENT,
-                                else => errnoConst("EIO", c.EINVAL),
-                            };
-                            return -1;
-                        };
-                        return 0;
-                    }
+                    return 0;
                 }
             }
-            c.errno = switch (err) {
-                error.AccessDenied => c.EACCES,
-                error.PermissionDenied => c.EPERM,
-                error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-                error.FileSystem => errnoConst("EIO", c.EINVAL),
-                error.IsDir => errnoConst("EISDIR", c.EINVAL),
-                error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-                error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-                error.FileNotFound => c.ENOENT,
-                error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
-                error.SystemResources => c.ENOMEM,
-                error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-                error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
-                error.NetworkNotFound => c.ENOENT,
-                else => errnoConst("EIO", c.EINVAL),
-            };
-            return -1;
-        };
-        return 0;
+        }
+        c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
+        return -1;
     }
 
     if (builtin.os.tag == .linux) {
@@ -2358,26 +2402,13 @@ export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
         }
     }
 
-    std.posix.unlinkZ(path) catch |err| {
-        c.errno = switch (err) {
-            error.AccessDenied => c.EACCES,
-            error.PermissionDenied => c.EPERM,
-            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-            error.FileSystem => errnoConst("EIO", c.EINVAL),
-            error.IsDir => errnoConst("EISDIR", c.EINVAL),
-            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-            error.FileNotFound => c.ENOENT,
-            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
-            error.SystemResources => c.ENOMEM,
-            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
-            error.NetworkNotFound => c.ENOENT,
-            else => errnoConst("EIO", c.EINVAL),
-        };
-        return -1;
-    };
-    return 0;
+    switch (os.errno(os.system.unlinkat(c.AT_FDCWD, path, 0))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn sleep(seconds: c_uint) callconv(.c) c_uint {
@@ -2388,7 +2419,7 @@ export fn sleep(seconds: c_uint) callconv(.c) c_uint {
 
 export fn _exit(status: c_int) callconv(.c) noreturn {
     if (builtin.os.tag == .windows) {
-        std.os.windows.kernel32.ExitProcess(@as(c_uint, @bitCast(status)));
+        winapi.ExitProcess(@as(c_uint, @bitCast(status)));
     }
     if (builtin.os.tag == .wasi) {
         std.os.wasi.proc_exit(status);
@@ -2406,8 +2437,8 @@ export fn isatty(fd: c_int) callconv(.c) c_int {
             return 0;
         };
         var mode: u32 = 0;
-        if (std.os.windows.kernel32.GetConsoleMode(handle, &mode) != 0) return 1;
-        c.errno = switch (std.os.windows.kernel32.GetLastError()) {
+        if (winapi.GetConsoleMode(handle, &mode) != 0) return 1;
+        c.errno = switch (std.os.windows.GetLastError()) {
             .INVALID_HANDLE => errnoConst("EBADF", c.EINVAL),
             else => errnoConst("ENOTTY", c.EINVAL),
         };
@@ -2472,11 +2503,11 @@ fn cTimevalToDarwin(tv: c.timeval) DarwinTimeval {
     };
 }
 
-fn windowsFileTimeToUnix100ns(ft: std.os.windows.FILETIME) u64 {
+fn windowsFileTimeToUnix100ns(ft: WinFileTime) u64 {
     return (@as(u64, ft.dwHighDateTime) << 32) | @as(u64, ft.dwLowDateTime);
 }
 
-fn windowsFileTimeToUnixSec(ft: std.os.windows.FILETIME) i64 {
+fn windowsFileTimeToUnixSec(ft: WinFileTime) i64 {
     const ticks_100ns = windowsFileTimeToUnix100ns(ft);
     const unix_epoch_100ns: u64 = 11644473600 * 10_000_000;
     const unix_100ns = if (ticks_100ns > unix_epoch_100ns) ticks_100ns - unix_epoch_100ns else 0;
@@ -2484,7 +2515,7 @@ fn windowsFileTimeToUnixSec(ft: std.os.windows.FILETIME) i64 {
 }
 
 fn currentWindowsUnixTime() struct { sec: i64, usec: i64, nsec: i64 } {
-    var ft: std.os.windows.FILETIME = undefined;
+    var ft: WinFileTime = undefined;
     winapi.GetSystemTimeAsFileTime(&ft);
     const ticks_100ns = windowsFileTimeToUnix100ns(ft);
     const unix_epoch_100ns: u64 = 11644473600 * 10_000_000;
@@ -2528,7 +2559,7 @@ fn cTimespecToTimeval(ts: c.timespec) ?c.timeval {
     };
 }
 
-fn windowsTimevalToFileTime(tv: c.timeval) ?std.os.windows.FILETIME {
+fn windowsTimevalToFileTime(tv: c.timeval) ?WinFileTime {
     if (!cTimevalIsValid(tv)) return null;
     const sec_100ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_sec)), 10_000_000) catch return null;
     const usec_100ns = std.math.mul(u64, @as(u64, @intCast(tv.tv_usec)), 10) catch return null;
@@ -3142,19 +3173,19 @@ export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         const attrs = winapi.GetFileAttributesA(path);
         if (attrs == std.os.windows.INVALID_FILE_ATTRIBUTES) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
 
         const writable = (@as(c_uint, @intCast(mode)) & 0o222) != 0;
         var new_attrs = attrs;
         if (writable) {
-            new_attrs &= ~@as(u32, std.os.windows.FILE_ATTRIBUTE_READONLY);
+            new_attrs &= ~@as(u32, windows_file_attribute_readonly);
         } else {
-            new_attrs |= std.os.windows.FILE_ATTRIBUTE_READONLY;
+            new_attrs |= windows_file_attribute_readonly;
         }
         if (winapi.SetFileAttributesA(path, new_attrs) == 0) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
         return 0;
@@ -3296,7 +3327,7 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
 
         const file_type = winapi.GetFileType(handle);
         if (file_type == 0) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
 
@@ -3306,12 +3337,12 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
             return 0;
         }
 
-        var info: std.os.windows.BY_HANDLE_FILE_INFORMATION = undefined;
+        var info: WinByHandleFileInformation = undefined;
         if (winapi.GetFileInformationByHandle(handle, &info) == 0) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
-        const readonly = (info.dwFileAttributes & std.os.windows.FILE_ATTRIBUTE_READONLY) != 0;
+        const readonly = (info.dwFileAttributes & windows_file_attribute_readonly) != 0;
         const size: u64 = (@as(u64, info.nFileSizeHigh) << 32) | @as(u64, info.nFileSizeLow);
         const inode: u64 = (@as(u64, info.nFileIndexHigh) << 32) | @as(u64, info.nFileIndexLow);
 
@@ -3718,18 +3749,24 @@ export fn pthread_cond_signal(cond: *c.pthread_cond_t) callconv(.c) c_int {
 // --------------------------------------------------------------------------------
 export fn basename(path: ?[*:0]u8) callconv(.c) [*:0]u8 {
     trace.log("basename {f}", .{trace.fmtStr(path)});
-    const path_slice = std.mem.span(path orelse return @as([*:0]u8, @ptrFromInt(@intFromPtr("."))));
-    const name = std.fs.path.basename(path_slice);
-    const mut_ptr = @as([*:0]u8, @ptrFromInt(@intFromPtr(name.ptr)));
-    if (name.len == 0) {
-        if (path_slice.ptr[0] == '/') {
-            path_slice.ptr[1] = 0;
-            return path_slice.ptr;
-        }
-        return @as([*:0]u8, @ptrFromInt(@intFromPtr(".")));
+    const buf = path orelse return @as([*:0]u8, @ptrFromInt(@intFromPtr(".")));
+    if (buf[0] == 0) return @as([*:0]u8, @ptrFromInt(@intFromPtr(".")));
+
+    var end = std.mem.len(buf);
+    while (end > 1 and buf[end - 1] == '/') : (end -= 1) {}
+
+    if (end == 1 and buf[0] == '/') {
+        buf[1] = 0;
+        return buf;
     }
-    if (mut_ptr[name.len] != 0) mut_ptr[name.len] = 0;
-    return mut_ptr;
+
+    var start = end;
+    while (start > 0 and buf[start - 1] != '/') : (start -= 1) {}
+    while (start < end and buf[start] == '/') : (start += 1) {}
+
+    if (start == end) return @as([*:0]u8, @ptrFromInt(@intFromPtr(".")));
+    buf[end] = 0;
+    return buf + start;
 }
 
 export fn dirname(path: ?[*:0]u8) callconv(.c) [*:0]u8 {
@@ -3875,7 +3912,7 @@ fn windowsHandleReadable(handle: std.os.windows.HANDLE) ?bool {
             if (winapi.PeekNamedPipe(handle, null, 0, null, &available, null) != 0) {
                 return available != 0;
             }
-            const win_err = std.os.windows.kernel32.GetLastError();
+            const win_err = std.os.windows.GetLastError();
             if (win_err == .BROKEN_PIPE) return true;
             c.errno = winfd.errnoFromWin32(win_err);
             return null;
@@ -4213,22 +4250,22 @@ export fn utimes(filename: [*:0]const u8, times: [*c]const c.timeval) callconv(.
     if (builtin.os.tag == .windows) {
         const handle = winapi.CreateFileA(
             filename,
-            std.os.windows.FILE_WRITE_ATTRIBUTES,
-            std.os.windows.FILE_SHARE_READ | std.os.windows.FILE_SHARE_WRITE | std.os.windows.FILE_SHARE_DELETE,
+            windows_file_write_attributes,
+            windows_file_share_read | windows_file_share_write | windows_file_share_delete,
             null,
-            std.os.windows.OPEN_EXISTING,
-            std.os.windows.FILE_ATTRIBUTE_NORMAL,
+            windows_open_existing,
+            windows_file_attribute_normal,
             null,
         );
         if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
         }
         defer _ = winapi.CloseHandle(handle.?);
 
-        var access_time: std.os.windows.FILETIME = undefined;
-        var write_time: std.os.windows.FILETIME = undefined;
-        var current_time: std.os.windows.FILETIME = undefined;
+        var access_time: WinFileTime = undefined;
+        var write_time: WinFileTime = undefined;
+        var current_time: WinFileTime = undefined;
         const access_ptr, const write_ptr = if (times) |tv| blk: {
             access_time = windowsTimevalToFileTime(tv[0]) orelse {
                 c.errno = c.EINVAL;
@@ -4244,10 +4281,10 @@ export fn utimes(filename: [*:0]const u8, times: [*c]const c.timeval) callconv(.
             break :blk .{ &current_time, &current_time };
         };
 
-        std.os.windows.SetFileTime(handle.?, null, access_ptr, write_ptr) catch {
-            c.errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+        if (winapi.SetFileTime(handle.?, null, access_ptr, write_ptr) == 0) {
+            c.errno = winfd.errnoFromWin32(std.os.windows.GetLastError());
             return -1;
-        };
+        }
         return 0;
     }
     if (builtin.os.tag.isDarwin()) {

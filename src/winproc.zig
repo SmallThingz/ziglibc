@@ -7,6 +7,21 @@ const c = @cImport({
 });
 
 const windows = std.os.windows;
+const windows_infinite: u32 = 0xffff_ffff;
+
+extern "kernel32" fn WaitForSingleObject(
+    hHandle: windows.HANDLE,
+    dwMilliseconds: u32,
+) callconv(.winapi) u32;
+extern "kernel32" fn GetExitCodeProcess(
+    hProcess: windows.HANDLE,
+    lpExitCode: *windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetEnvironmentVariableA(
+    lpName: [*:0]const u8,
+    lpBuffer: ?[*]u8,
+    nSize: u32,
+) callconv(.winapi) u32;
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
     if (@hasDecl(c, name)) return @field(c, name);
@@ -19,7 +34,13 @@ pub fn hasShell() bool {
 }
 
 fn shellPathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "COMSPEC") catch try allocator.dupe(u8, "cmd.exe");
+    const needed = GetEnvironmentVariableA("COMSPEC", null, 0);
+    if (needed == 0) return allocator.dupe(u8, "cmd.exe");
+    const buf = try allocator.alloc(u8, needed);
+    defer allocator.free(buf);
+    const written = GetEnvironmentVariableA("COMSPEC", buf.ptr, @intCast(buf.len));
+    if (written == 0 or written >= buf.len) return allocator.dupe(u8, "cmd.exe");
+    return allocator.dupe(u8, buf[0..written]);
 }
 
 fn shellCommandLineAllocZ(allocator: std.mem.Allocator, shell_path: []const u8, command: [*:0]const u8) ![:0]u16 {
@@ -70,9 +91,9 @@ pub fn spawnShell(
         startup.hStdError = stderr_handle orelse params.hStdError;
     }
 
-    var process_info: windows.PROCESS_INFORMATION = undefined;
+    var process_info: windows.PROCESS.INFORMATION = undefined;
     if (windows.kernel32.CreateProcessW(
-        shell_path_w.ptr,
+        null,
         @ptrCast(command_line_w.ptr),
         null,
         null,
@@ -83,7 +104,7 @@ pub fn spawnShell(
         &startup,
         &process_info,
     ) == 0) {
-        err_out.* = winfd.errnoFromWin32(windows.kernel32.GetLastError());
+        err_out.* = winfd.errnoFromWin32(windows.GetLastError());
         return null;
     }
 
@@ -94,15 +115,15 @@ pub fn spawnShell(
 pub fn waitProcessStatus(process_handle: windows.HANDLE) c_int {
     if (comptime builtin.os.tag != .windows) return -1;
 
-    windows.WaitForSingleObject(process_handle, windows.INFINITE) catch {
-        c.errno = winfd.errnoFromWin32(windows.kernel32.GetLastError());
+    if (WaitForSingleObject(process_handle, windows_infinite) == 0xffff_ffff) {
+        c.errno = winfd.errnoFromWin32(windows.GetLastError());
         windows.CloseHandle(process_handle);
         return -1;
-    };
+    }
 
     var exit_code: windows.DWORD = 0;
-    if (windows.kernel32.GetExitCodeProcess(process_handle, &exit_code) == 0) {
-        c.errno = winfd.errnoFromWin32(windows.kernel32.GetLastError());
+    if (GetExitCodeProcess(process_handle, &exit_code) == 0) {
+        c.errno = winfd.errnoFromWin32(windows.GetLastError());
         windows.CloseHandle(process_handle);
         return -1;
     }

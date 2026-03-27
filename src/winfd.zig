@@ -194,7 +194,7 @@ pub fn setFdFlags(fd: c_int, fd_flags: c_int) c_int {
     const handle = handleFromFdLocked(fd) orelse return errnoConst("EBADF", c.EINVAL);
     const inherit: u32 = if ((fd_flags & c.FD_CLOEXEC) != 0) 0 else handle_flag_inherit;
     if (SetHandleInformation(handle, handle_flag_inherit, inherit) == 0) {
-        return errnoFromWin32(windows.kernel32.GetLastError());
+        return errnoFromWin32(windows.GetLastError());
     }
 
     if (fd >= 0 and fd <= 2) {
@@ -223,7 +223,7 @@ pub fn dupFd(fd: c_int, min_fd: c_int) c_int {
         0,
         duplicate_same_access,
     ) == 0) {
-        return -errnoFromWin32(windows.kernel32.GetLastError());
+        return -errnoFromWin32(windows.GetLastError());
     }
 
     const status_flags = if (fd >= 0 and fd <= 2)
@@ -248,7 +248,7 @@ pub fn closeFd(fd: c_int) c_int {
 
     const handle = handleFromFdLocked(fd) orelse return errnoConst("EBADF", c.EINVAL);
     if (CloseHandle(handle) == 0) {
-        return errnoFromWin32(windows.kernel32.GetLastError());
+        return errnoFromWin32(windows.GetLastError());
     }
 
     if (fd >= 0 and fd <= 2) {

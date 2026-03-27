@@ -126,6 +126,9 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
     if (include_gnu) {
         addIncludePathCompat(lib, relpath(builder, "inc" ++ std.fs.path.sep_str ++ "gnu"));
     }
+    if (opt.target.result.os.tag == .windows) {
+        lib.root_module.linkSystemLibrary("ws2_32", .{});
+    }
     return lib;
 }
 
