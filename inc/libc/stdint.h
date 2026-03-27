@@ -83,9 +83,22 @@ typedef uint64_t uint_fast64_t;
 #define UINT_FAST32_MAX UINT32_MAX
 #define UINT_FAST64_MAX UINT64_MAX
 
+#define INT8_C(v) v
+#define INT16_C(v) v
+#define INT32_C(v) v
+#define INT64_C(v) v##LL
+
+#define UINT8_C(v) v
+#define UINT16_C(v) v
+#define UINT32_C(v) v##U
+#define UINT64_C(v) v##ULL
+
 typedef long long intmax_t;
 typedef unsigned long long uintmax_t;
 typedef struct { intmax_t quot, rem; } imaxdiv_t;
+
+#define INTMAX_C(v) v##LL
+#define UINTMAX_C(v) v##ULL
 
 #if __STDC_VERSION__ >= 199901L
     typedef _zig_isize intptr_t;

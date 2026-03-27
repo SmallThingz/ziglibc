@@ -98,6 +98,20 @@ int main(int argc, char *argv[])
   }
 
   {
+    FILE *buffered = fopen("stdio-buffered-pos.txt", "w+");
+    char buf[4];
+    expect(buffered != NULL);
+    expect(6 == fwrite("abcdef", 1, 6, buffered));
+    expect(0 == fseek(buffered, 0, SEEK_SET));
+    expect(3 == fread(buf, 1, 3, buffered));
+    expect(3 == ftell(buffered));
+    expect(0 == fseek(buffered, 0, SEEK_CUR));
+    expect('d' == fgetc(buffered));
+    expect(4 == ftell(buffered));
+    expect(0 == fclose(buffered));
+  }
+
+  {
     FILE *eof_file = fopen("stdio-clearerr.txt", "w+");
     char ch;
     expect(eof_file != NULL);

@@ -230,6 +230,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(libc_only_gnu);
 
     const test_step = b.step("test", "Run unit tests");
+    const bench_stdio_step = b.step("bench-stdio", "Run stdio microbenchmarks");
 
     const test_env_exe = addExecutableCompat(b, .{
         .name = "testenv",
@@ -243,6 +244,26 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+
+    {
+        const exe = addExecutableCompat(b, .{
+            .name = "stdio_bench",
+            .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "stdio_bench.c"),
+            .target = target,
+            .optimize = optimize,
+        });
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        linkLibraryCompat(exe, libc_only_std_static);
+        linkLibraryCompat(exe, libc_only_posix);
+        linkLibraryCompat(exe, zig_start);
+        if (target.result.os.tag == .windows) {
+            linkSystemLibraryCompat(exe, "ntdll");
+            linkSystemLibraryCompat(exe, "kernel32");
+        }
+        const run_step = addRunArtifactCompat(b, exe);
+        bench_stdio_step.dependOn(&run_step.step);
+    }
 
     inline for (.{ std.Target.Query{ .cpu_arch = .x86_64, .os_tag = .macos }, std.Target.Query{ .cpu_arch = .aarch64, .os_tag = .macos } }) |abi_query| {
         const abi_target = b.resolveTargetQuery(abi_query);
