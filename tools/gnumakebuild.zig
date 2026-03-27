@@ -109,7 +109,7 @@ pub fn addGnuMake(
     addIncludePathCompat(exe, lazyPath(b, "inc/gnu"));
     addIncludePathCompat(exe, lazyPath(b, "inc/alloca"));
     linkLibraryCompat(exe, libc_only_std_static);
-   linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_start);
     linkLibraryCompat(exe, zig_posix);
     // Static helper libraries do not currently propagate system-library
     // dependencies for downstream executables.

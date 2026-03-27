@@ -97,7 +97,7 @@ fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
                 self.path,
                 self.sha,
             });
-                std.process.exit(1);
+            std.process.exit(1);
         }
 
         {

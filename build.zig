@@ -686,16 +686,41 @@ fn supportsSetjmp(target: std.Target) bool {
     };
 }
 
-fn requireRepoPath(b: *std.Build, rel_path: []const u8) []const u8 {
+fn findRepoPath(b: *std.Build, rel_path: []const u8) ?[]const u8 {
     const abs_path = b.pathFromRoot(rel_path);
     std.Io.Dir.accessAbsolute(b.graph.io, abs_path, .{}) catch {
-        std.debug.panic(
-            "required dependency repository '{s}' is missing; run `git submodule update --init --recursive`",
-            .{rel_path},
-        );
+        return null;
     };
     return abs_path;
 }
+
+const MissingRepoStep = struct {
+    step: std.Build.Step,
+    rel_path: []const u8,
+
+    fn create(b: *std.Build, step_name: []const u8, rel_path: []const u8) *std.Build.Step {
+        const result = b.allocator.create(MissingRepoStep) catch @panic("OOM");
+        result.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = step_name,
+                .owner = b,
+                .makeFn = make,
+            }),
+            .rel_path = rel_path,
+        };
+        return &result.step;
+    }
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *MissingRepoStep = @fieldParentPtr("step", step);
+        std.debug.panic(
+            "required dependency repository '{s}' is missing; run `git submodule update --init --recursive`",
+            .{self.rel_path},
+        );
+    }
+};
 
 fn addPosix(artifact: *std.Build.Step.Compile, zig_posix: *std.Build.Step.Compile) void {
     linkLibraryCompat(artifact, zig_posix);
