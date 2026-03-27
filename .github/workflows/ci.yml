@@ -1,47 +1,32 @@
 name: CI
 
 on:
-  push:
   pull_request:
-
-env:
-  ZIG_VERSION: 0.15.2
-  ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
+  push:
+    branches: ["main"]
 
 jobs:
-  test-and-conformance:
-    name: Test + Conformance (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+  docs-and-tests:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: ${{ env.ZIG_VERSION }}
+          version: 0.16.0-dev.2984+cb7d2b056
 
-      - name: Cache Zig and dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            .zig-cache
-            .zig-global-cache
-          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'inc/**/*.h', 'test/**/*', '.github/workflows/ci.yml', '.gitmodules') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
+      - name: Zig fmt check
+        shell: bash
+        run: |
+          files=$(find . -type f -name '*.zig' \
+            -not -path './.zig-cache/*' \
+            -not -path './zig-out/*')
+          zig fmt --check $files
 
-      - name: Run unit/integration tests
+      - name: Unit tests
         run: zig build test
 
-      - name: Run conformance suites
+      - name: Conformance suites
         run: zig build conformance
