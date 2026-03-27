@@ -333,6 +333,21 @@ pub fn build(b: *std.Build) void {
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
+    const string_more_extensive_run = blk: {
+        const exe = addTestSource("string_more_extensive", "string_more_extensive.c", b, target, optimize, libc_only_std_static, zig_start);
+        addPosix(exe, libc_only_posix);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+        break :blk run_step;
+    };
+    const memory_extensive_run = blk: {
+        const exe = addTestSource("memory_extensive", "memory_extensive.c", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+        break :blk run_step;
+    };
     {
         const exe = addTest("argv_extensive", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, exe);
@@ -383,6 +398,15 @@ pub fn build(b: *std.Build) void {
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
+    const format_more_extensive_run = blk: {
+        const exe = addTestSource("format_more_extensive", "format_more_extensive.c", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = addRunArtifactCompat(b, test_env_exe);
+        addArtifactArgCompat(run_step, b, exe);
+        configureExternalHelperRunner(run_step, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+        break :blk run_step;
+    };
     {
         const exe = addTest("types", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, exe);
@@ -408,6 +432,13 @@ pub fn build(b: *std.Build) void {
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
     }
+    const stdlib_more_extensive_run = blk: {
+        const exe = addTestSource("stdlib_more_extensive", "stdlib_more_extensive.c", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+        break :blk run_step;
+    };
     {
         const exe = addTest("stdio_extensive", b, target, optimize, libc_only_std_static, zig_start);
         const run_step = addRunArtifactCompat(b, test_env_exe);
@@ -594,6 +625,10 @@ pub fn build(b: *std.Build) void {
         conformance_step.dependOn(austin_group_tests_step);
     }
     conformance_step.dependOn(&header_conformance_run.step);
+    conformance_step.dependOn(&string_more_extensive_run.step);
+    conformance_step.dependOn(&memory_extensive_run.step);
+    conformance_step.dependOn(&format_more_extensive_run.step);
+    conformance_step.dependOn(&stdlib_more_extensive_run.step);
     if (parity_run) |run_step| {
         conformance_step.dependOn(&run_step.step);
     }
