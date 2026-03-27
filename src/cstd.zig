@@ -425,30 +425,6 @@ export fn strsignal(sig: c_int) callconv(.c) [*:0]u8 {
     return @as([*:0]u8, @ptrCast(&global.tmp_strerror_buffer));
 }
 
-fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
-    if (comptime builtin.os.tag != .linux) return false;
-    const file = compat.openFileAbsolute("/proc/self/environ", .{}) catch return false;
-    defer compat.closeFile(file);
-    const len = compat.readFileShort(file, buf) catch return false;
-
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < len) {
-        if (count + 1 >= ptr_cap) return false;
-        const begin = i;
-        while (i < len and buf[i] != 0) : (i += 1) {}
-        if (i == len) {
-            if (len == buf.len) return false;
-            buf[i] = 0;
-        }
-        ptrs[count] = @as([*:0]u8, @ptrCast(buf.ptr + begin));
-        count += 1;
-        i += 1;
-    }
-    ptrs[count] = null;
-    return true;
-}
-
 export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
     trace.log("system {f}", .{trace.fmtStr(string)});
     if (builtin.os.tag == .windows) {
@@ -502,7 +478,7 @@ export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
         if (builtin.os.tag == .linux) {
             var env_buf: [32768]u8 = undefined;
             var env_ptrs = [_:null]?[*:0]u8{null} ** 1024;
-            if (populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
+            if (compat.populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
                 _ = std.posix.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
             }
         } else if (builtin.os.tag.isDarwin()) {
@@ -2138,6 +2114,14 @@ const FormatLength = enum {
     size,
 };
 
+const FormatFlags = packed struct {
+    left_adjust: bool = false,
+    plus_sign: bool = false,
+    space_sign: bool = false,
+    alternate_form: bool = false,
+    zero_pad: bool = false,
+};
+
 const FormatWriter = union(enum) {
     stream: *c.FILE,
     bounded: struct {
@@ -2172,6 +2156,25 @@ const FormatWriter = union(enum) {
             },
         };
     }
+
+    fn appendSlice(self: *FormatWriter, out_written: *usize, bytes: []const u8) bool {
+        const written = self.write(bytes);
+        out_written.* += written;
+        return written == bytes.len;
+    }
+
+    fn appendByte(self: *FormatWriter, out_written: *usize, byte: u8) bool {
+        const buf = [_]u8{byte};
+        return self.appendSlice(out_written, &buf);
+    }
+
+    fn appendRepeated(self: *FormatWriter, out_written: *usize, byte: u8, count: usize) bool {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (!self.appendByte(out_written, byte)) return false;
+        }
+        return true;
+    }
 };
 
 fn stringPrintLen(s: [*:0]const u8, precision: usize) usize {
@@ -2182,6 +2185,116 @@ fn stringPrintLen(s: [*:0]const u8, precision: usize) usize {
 
 fn isFormatFlag(ch: u8) bool {
     return ch == '-' or ch == '+' or ch == ' ' or ch == '#' or ch == '0';
+}
+
+fn parseFormatNumber(fmt_slice: []const u8, index: *usize) ?usize {
+    if (index.* >= fmt_slice.len or fmt_slice[index.*] < '0' or fmt_slice[index.*] > '9') return null;
+    var value: usize = 0;
+    while (index.* < fmt_slice.len and fmt_slice[index.*] >= '0' and fmt_slice[index.*] <= '9') : (index.* += 1) {
+        value = value * 10 + (fmt_slice[index.*] - '0');
+    }
+    return value;
+}
+
+fn formatNumericValueZero(raw: []const u8) bool {
+    for (raw) |ch| {
+        if (ch == '-') continue;
+        if (ch != '0') return false;
+    }
+    return true;
+}
+
+fn writeFormattedField(
+    writer: *FormatWriter,
+    out_written: *usize,
+    prefix: []const u8,
+    body: []const u8,
+    width: ?usize,
+    left_adjust: bool,
+    pad: u8,
+) bool {
+    const total_len = prefix.len + body.len;
+    const pad_len = if (width) |min_width| (if (min_width > total_len) min_width - total_len else 0) else 0;
+
+    if (!left_adjust and pad == ' ') {
+        if (!writer.appendRepeated(out_written, ' ', pad_len)) return false;
+    }
+    if (!writer.appendSlice(out_written, prefix)) return false;
+    if (!left_adjust and pad == '0') {
+        if (!writer.appendRepeated(out_written, '0', pad_len)) return false;
+    }
+    if (!writer.appendSlice(out_written, body)) return false;
+    if (left_adjust) {
+        if (!writer.appendRepeated(out_written, ' ', pad_len)) return false;
+    }
+    return true;
+}
+
+fn writeFormattedInt(
+    writer: *FormatWriter,
+    out_written: *usize,
+    raw: []const u8,
+    is_signed: bool,
+    is_zero: bool,
+    prefix_nonzero: []const u8,
+    precision: i32,
+    width: ?usize,
+    flags: FormatFlags,
+) bool {
+    var sign_prefix: []const u8 = "";
+    var digits = raw;
+    if (is_signed) {
+        if (raw.len != 0 and raw[0] == '-') {
+            sign_prefix = "-";
+            digits = raw[1..];
+        } else if (flags.plus_sign) {
+            sign_prefix = "+";
+        } else if (flags.space_sign) {
+            sign_prefix = " ";
+        }
+    }
+
+    var alt_prefix: []const u8 = "";
+    if (prefix_nonzero.len != 0 and !is_zero) {
+        alt_prefix = prefix_nonzero;
+    }
+
+    if (precision == 0 and is_zero) {
+        digits = "";
+    }
+
+    const digit_width = if (precision >= 0)
+        @max(digits.len, @as(usize, @intCast(precision)))
+    else
+        digits.len;
+    const zero_from_precision = digit_width - digits.len;
+
+    var zero_from_width: usize = 0;
+    const wants_zero_width = flags.zero_pad and !flags.left_adjust and precision < 0;
+    if (wants_zero_width) {
+        const min_width = width orelse 0;
+        const prefix_len = sign_prefix.len + alt_prefix.len;
+        if (min_width > prefix_len + digits.len) {
+            zero_from_width = min_width - prefix_len - digits.len;
+        }
+    }
+
+    const total_zeroes = zero_from_precision + zero_from_width;
+    const body_len = total_zeroes + digits.len;
+    const total_len = sign_prefix.len + alt_prefix.len + body_len;
+    const pad_spaces = if (width) |min_width| (if (min_width > total_len) min_width - total_len else 0) else 0;
+
+    if (!flags.left_adjust) {
+        if (!writer.appendRepeated(out_written, ' ', pad_spaces)) return false;
+    }
+    if (!writer.appendSlice(out_written, sign_prefix)) return false;
+    if (!writer.appendSlice(out_written, alt_prefix)) return false;
+    if (!writer.appendRepeated(out_written, '0', total_zeroes)) return false;
+    if (!writer.appendSlice(out_written, digits)) return false;
+    if (flags.left_adjust) {
+        if (!writer.appendRepeated(out_written, ' ', pad_spaces)) return false;
+    }
+    return true;
 }
 
 fn vaArgWindows(args: *c.va_list, comptime T: type) T {
@@ -2227,12 +2340,36 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
         i = next_percent + 1;
         if (i >= fmt_slice.len) return false;
 
-        if (isFormatFlag(fmt_slice[i])) return false;
+        var flags = FormatFlags{};
+        while (i < fmt_slice.len and isFormatFlag(fmt_slice[i])) : (i += 1) {
+            switch (fmt_slice[i]) {
+                '-' => flags.left_adjust = true,
+                '+' => flags.plus_sign = true,
+                ' ' => flags.space_sign = true,
+                '#' => flags.alternate_form = true,
+                '0' => flags.zero_pad = true,
+                else => unreachable,
+            }
+        }
+        if (flags.left_adjust) flags.zero_pad = false;
+        if (flags.plus_sign) flags.space_sign = false;
+        if (i >= fmt_slice.len) return false;
 
+        var width: ?usize = null;
         if (fmt_slice[i] == '*') {
-            return false;
-        } else if (fmt_slice[i] >= '0' and fmt_slice[i] <= '9') {
-            return false;
+            const raw_width = vaArgCompat(args, c_int);
+            if (raw_width < 0) {
+                flags.left_adjust = true;
+                flags.zero_pad = false;
+                width = @as(usize, @intCast(-raw_width));
+            } else {
+                width = @as(usize, @intCast(raw_width));
+            }
+            i += 1;
+            if (i >= fmt_slice.len) return false;
+        } else {
+            width = parseFormatNumber(fmt_slice, &i);
+            if (i >= fmt_slice.len) return false;
         }
 
         const precision_none: i32 = -1;
@@ -2242,11 +2379,10 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
             if (i >= fmt_slice.len) return false;
             if (fmt_slice[i] == '*') {
                 precision = vaArgCompat(args, c_int);
+                if (precision < 0) precision = precision_none;
                 i += 1;
-            } else if (fmt_slice[i] >= '0' and fmt_slice[i] <= '9') {
-                return false;
             } else {
-                return false;
+                precision = @as(i32, @intCast(parseFormatNumber(fmt_slice, &i) orelse 0));
             }
             if (i >= fmt_slice.len) return false;
         }
@@ -2277,6 +2413,11 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
         }
 
         switch (fmt_slice[i]) {
+            '%' => {
+                if (spec_length != .none) return false;
+                const pad: u8 = if (flags.zero_pad and !flags.left_adjust) '0' else ' ';
+                if (!writeFormattedField(writer, out_written, "", "%", width, flags.left_adjust, pad)) return false;
+            },
             's' => {
                 if (spec_length != .none) return false;
                 const maybe_s = vaArgCompat(args, ?[*:0]const u8);
@@ -2285,20 +2426,16 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                     std.mem.len(s)
                 else
                     stringPrintLen(s, @intCast(precision));
-                const written = writer.write(s[0..len]);
-                out_written.* += written;
-                if (written != len) return false;
+                if (!writeFormattedField(writer, out_written, "", s[0..len], width, flags.left_adjust, ' ')) return false;
             },
             'c' => {
                 if (spec_length != .none or precision != precision_none) return false;
                 const value = vaArgCompat(args, c_int);
                 const ch = [_]u8{@intCast(value & 0xff)};
-                const written = writer.write(&ch);
-                out_written.* += written;
-                if (written != 1) return false;
+                const pad: u8 = if (flags.zero_pad and !flags.left_adjust) '0' else ' ';
+                if (!writeFormattedField(writer, out_written, "", &ch, width, flags.left_adjust, pad)) return false;
             },
             'd', 'i' => {
-                if (precision != precision_none) return false;
                 var buf: [100]u8 = undefined;
                 const len = switch (spec_length) {
                     .none => formatIntCompat(&buf, vaArgCompat(args, c_int), 10),
@@ -2308,13 +2445,24 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                     .long_long => formatIntCompat(&buf, vaArgCompat(args, c_longlong), 10),
                     .size => formatIntCompat(&buf, vaArgCompat(args, isize), 10),
                 };
-                const written = writer.write(buf[0..len]);
-                out_written.* += written;
-                if (written != len) return false;
+                if (!writeFormattedInt(
+                    writer,
+                    out_written,
+                    buf[0..len],
+                    true,
+                    formatNumericValueZero(buf[0..len]),
+                    "",
+                    precision,
+                    width,
+                    flags,
+                )) return false;
             },
-            'u', 'x', 'X' => |specifier| {
-                if (precision != precision_none) return false;
-                const base: u8 = if (specifier == 'u') 10 else 16;
+            'u', 'o', 'x', 'X' => |specifier| {
+                const base: u8 = switch (specifier) {
+                    'u' => 10,
+                    'o' => 8,
+                    else => 16,
+                };
                 var buf: [100]u8 = undefined;
                 const uppercase = specifier == 'X';
                 const len = switch (spec_length) {
@@ -2325,21 +2473,24 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                     .long_long => formatIntCaseCompat(&buf, vaArgCompat(args, c_ulonglong), base, uppercase),
                     .size => formatIntCaseCompat(&buf, vaArgCompat(args, usize), base, uppercase),
                 };
-                const written = writer.write(buf[0..len]);
-                out_written.* += written;
-                if (written != len) return false;
+                const raw = buf[0..len];
+                const is_zero = formatNumericValueZero(raw);
+                const prefix = switch (specifier) {
+                    'x' => if (flags.alternate_form) "0x" else "",
+                    'X' => if (flags.alternate_form) "0X" else "",
+                    'o' => if (flags.alternate_form) "0" else "",
+                    else => "",
+                };
+                if (!writeFormattedInt(writer, out_written, raw, false, is_zero, prefix, precision, width, flags)) return false;
             },
             'p' => {
-                if (spec_length != .none or precision != precision_none) return false;
+                if (spec_length != .none) return false;
                 const ptr_value = @intFromPtr(vaArgCompat(args, ?*const anyopaque) orelse @as(?*const anyopaque, null));
-                var buf: [2 + (@sizeOf(usize) * 2)]u8 = undefined;
-                buf[0] = '0';
-                buf[1] = 'x';
-                const hex_len = formatIntCompat(buf[2..], ptr_value, 16);
-                const total_len = 2 + hex_len;
-                const written = writer.write(buf[0..total_len]);
-                out_written.* += written;
-                if (written != total_len) return false;
+                var buf: [@sizeOf(usize) * 2]u8 = undefined;
+                const hex_len = formatIntCompat(&buf, ptr_value, 16);
+                var ptr_flags = flags;
+                ptr_flags.alternate_form = false;
+                if (!writeFormattedInt(writer, out_written, buf[0..hex_len], false, ptr_value == 0, "0x", precision, width, ptr_flags)) return false;
             },
             else => return false,
         }

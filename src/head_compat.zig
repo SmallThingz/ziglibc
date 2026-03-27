@@ -43,6 +43,32 @@ pub fn readFileShort(file: std.Io.File, buffer: []u8) !usize {
     return reader.interface.readSliceShort(buffer);
 }
 
+pub fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag != .linux) return false;
+
+    const file = openFileAbsolute("/proc/self/environ", .{}) catch return false;
+    defer closeFile(file);
+    const len = readFileShort(file, buf) catch return false;
+
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < len) {
+        if (count + 1 >= ptr_cap) return false;
+        const begin = i;
+        while (i < len and buf[i] != 0) : (i += 1) {}
+        if (i == len) {
+            if (len == buf.len) return false;
+            buf[i] = 0;
+        }
+        ptrs[count] = @as([*:0]u8, @ptrCast(buf.ptr + begin));
+        count += 1;
+        i += 1;
+    }
+    ptrs[count] = null;
+    return true;
+}
+
 pub const Mutex = struct {
     inner: std.Io.Mutex = .init,
 

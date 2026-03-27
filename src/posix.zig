@@ -533,30 +533,6 @@ fn drainWindowsPipeStream(stream: *c.FILE) void {
     }
 }
 
-fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
-    if (comptime builtin.os.tag != .linux) return false;
-    const file = compat.openFileAbsolute("/proc/self/environ", .{}) catch return false;
-    defer compat.closeFile(file);
-    const len = compat.readFileShort(file, buf) catch return false;
-
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < len) {
-        if (count + 1 >= ptr_cap) return false;
-        const begin = i;
-        while (i < len and buf[i] != 0) : (i += 1) {}
-        if (i == len) {
-            if (len == buf.len) return false;
-            buf[i] = 0;
-        }
-        ptrs[count] = @as([*:0]u8, @ptrCast(buf.ptr + begin));
-        count += 1;
-        i += 1;
-    }
-    ptrs[count] = null;
-    return true;
-}
-
 /// Returns some information through these globals
 ///    extern char *optarg;
 ///    extern int opterr, optind, optopt;
@@ -1454,7 +1430,7 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
         if (builtin.os.tag == .linux) {
             var env_buf: [32768]u8 = undefined;
             var env_ptrs = [_:null]?[*:0]u8{null} ** 1024;
-            if (populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
+                if (compat.populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
                 _ = os.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
             }
         } else if (builtin.os.tag.isDarwin()) {
