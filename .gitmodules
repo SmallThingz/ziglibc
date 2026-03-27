@@ -1,6 +1,6 @@
 [submodule "dep/libc-test"]
 	path = dep/libc-test
-	url = git://nsz.repo.hu:49100/repo/libc-test
+	url = https://github.com/kraj/libc-test
 [submodule "dep/tiny-regex-c"]
 	path = dep/tiny-regex-c
 	url = https://github.com/marler8997/tiny-regex-c

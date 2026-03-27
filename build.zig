@@ -686,12 +686,66 @@ fn supportsSetjmp(target: std.Target) bool {
     };
 }
 
-fn findRepoPath(b: *std.Build, rel_path: []const u8) ?[]const u8 {
+fn findRepoPathWithProbe(b: *std.Build, rel_path: []const u8, probe_rel_path: []const u8) ?[]const u8 {
     const abs_path = b.pathFromRoot(rel_path);
-    std.Io.Dir.accessAbsolute(b.graph.io, abs_path, .{}) catch {
+    const probe_abs_path = b.pathResolve(&.{ abs_path, probe_rel_path });
+    std.Io.Dir.accessAbsolute(b.graph.io, probe_abs_path, .{}) catch {
         return null;
     };
     return abs_path;
+}
+
+fn requestedAnyStep(step_names: []const []const u8) bool {
+    if (@import("builtin").os.tag != .linux) return false;
+
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/cmdline", .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer _ = std.posix.system.close(fd);
+
+    var argv_storage: [64 * 1024]u8 = undefined;
+    const argv_len = std.posix.read(fd, &argv_storage) catch return false;
+    const argv_blob = argv_storage[0..argv_len];
+
+    var index: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, argv_blob, 0);
+    while (it.next()) |arg| : (index += 1) {
+        // build_runner argv:
+        // 0 build runner exe
+        // 1 zig exe
+        // 2 zig lib dir
+        // 3 build root
+        // 4 local cache
+        // 5 global cache
+        if (index < 6) continue;
+        for (step_names) |step_name| {
+            if (std.mem.eql(u8, arg, step_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn shouldAutoInitConformanceRepos() bool {
+    return requestedAnyStep(&.{
+        "conformance",
+        "libc-test",
+        "re-tests",
+        "glibc-check",
+        "posix-test-suite",
+        "austin-group-tests",
+    });
+}
+
+fn ensureRepoPath(b: *std.Build, rel_path: []const u8, probe_rel_path: []const u8) ?[]const u8 {
+    if (findRepoPathWithProbe(b, rel_path, probe_rel_path)) |abs_path| return abs_path;
+    if (!shouldAutoInitConformanceRepos()) return null;
+
+    var exit_code: u8 = undefined;
+    _ = b.runAllowFail(
+        &.{ "git", "submodule", "update", "--init", "--recursive", "--", rel_path },
+        &exit_code,
+        .inherit,
+    ) catch return null;
+
+    return findRepoPathWithProbe(b, rel_path, probe_rel_path);
 }
 
 const MissingRepoStep = struct {
@@ -715,7 +769,7 @@ const MissingRepoStep = struct {
     fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
         _ = options;
         const self: *MissingRepoStep = @fieldParentPtr("step", step);
-        std.debug.panic(
+        return step.fail(
             "required dependency repository '{s}' is missing; run `git submodule update --init --recursive`",
             .{self.rel_path},
         );
@@ -863,7 +917,7 @@ fn addGlibcCheck(
     }
 
     const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "glibc-testsuite";
-    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+    const repo_path = ensureRepoPath(b, repo_rel_path, "rt/tst-clock.c") orelse {
         glibc_check_step.dependOn(MissingRepoStep.create(b, "missing glibc-testsuite dependency", repo_rel_path));
         return glibc_check_step;
     };
@@ -903,7 +957,7 @@ fn addPosixTestSuite(
     }
 
     const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "open_posix_testsuite";
-    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+    const repo_path = ensureRepoPath(b, repo_rel_path, "conformance/interfaces/clock_gettime/1-1.c") orelse {
         posix_test_suite_step.dependOn(MissingRepoStep.create(b, "missing open_posix_testsuite dependency", repo_rel_path));
         return posix_test_suite_step;
     };
@@ -953,7 +1007,7 @@ fn addAustinGroupTests(
     }
 
     const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "libc-test";
-    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+    const repo_path = ensureRepoPath(b, repo_rel_path, "src/functional/strftime.c") orelse {
         austin_group_tests_step.dependOn(MissingRepoStep.create(b, "missing libc-test dependency", repo_rel_path));
         return austin_group_tests_step;
     };
@@ -1001,7 +1055,7 @@ fn addLibcTest(
 ) *std.Build.Step {
     const libc_test_step = b.step("libc-test", "run tests from the libc-test project");
     const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "libc-test";
-    const libc_test_path = findRepoPath(b, repo_rel_path) orelse {
+    const libc_test_path = ensureRepoPath(b, repo_rel_path, "src/api/main.c") orelse {
         libc_test_step.dependOn(MissingRepoStep.create(b, "missing libc-test dependency", repo_rel_path));
         return libc_test_step;
     };
@@ -1073,7 +1127,7 @@ fn addTinyRegexCTests(
         return re_step;
     }
     const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "tiny-regex-c";
-    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+    const repo_path = ensureRepoPath(b, repo_rel_path, "re.c") orelse {
         re_step.dependOn(MissingRepoStep.create(b, "missing tiny-regex-c dependency", repo_rel_path));
         return re_step;
     };

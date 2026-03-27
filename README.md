@@ -4,7 +4,7 @@
 
 ## Status
 
-- Builds with Zig `0.15.2`.
+- Builds with Zig `0.16.0-dev`.
 - `zig build test` passes on:
   - Linux native
   - macOS targets executed through `darling`
@@ -18,13 +18,26 @@
 
 ## Repository Setup
 
-Conformance sources are tracked as git submodules. Initialize them before running the test or conformance steps:
+Conformance sources are tracked as git submodules under `dep/`.
+
+Normal project tests do not require them.
+
+Conformance steps auto-initialize any missing conformance submodules on Linux when you invoke:
+
+- `zig build conformance`
+- `zig build libc-test`
+- `zig build glibc-check`
+- `zig build posix-test-suite`
+- `zig build austin-group-tests`
+- `zig build re-tests`
+
+If you want everything present up front, you can still initialize them manually:
 
 ```sh
 git submodule update --init --recursive
 ```
 
-The conformance-related submodules live under `dep/`:
+The conformance-related submodules are:
 
 - `dep/libc-test`
 - `dep/tiny-regex-c`
