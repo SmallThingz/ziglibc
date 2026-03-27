@@ -1,10 +1,8 @@
 const std = @import("std");
 
-var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-const arena = arena_instance.allocator();
-
-pub fn main() !u8 {
-    const all_args = try std.process.argsAlloc(arena);
+pub fn main(init: std.process.Init) !u8 {
+    const arena = init.arena.allocator();
+    const all_args = try init.minimal.args.toSlice(arena);
 
     if (all_args.len <= 1) {
         std.debug.print("Usage: genheaders CAPI_TXT_FILE\n", .{});
@@ -17,7 +15,7 @@ pub fn main() !u8 {
     }
     const capi_filename = args[0];
     std.log.info("reading api from '{s}'...", .{capi_filename});
-    const contents = try std.fs.cwd().readFileAlloc(arena, capi_filename, std.math.maxInt(usize));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(init.io, capi_filename, arena, .unlimited);
 
     var parser = Parser.init(arena, capi_filename, contents);
     try parser.genHeaders();
@@ -106,7 +104,7 @@ fn parseDefinition(
                 error_reporter.report(line_offset, "'define {s}' has a name but missing a value", .{name});
                 return ReportedError.Reported;
             }
-            const value = std.mem.trimRight(u8, remaining_line[value_start..], " ");
+            const value = std.mem.trim(u8, remaining_line[value_start..], " ");
             const def = try allocator.create(Definition);
             def.* = .{
                 .headers = &[_][]const u8{},

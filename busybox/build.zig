@@ -24,12 +24,13 @@ const BusyboxPrepStep = struct {
         _ = options;
         const self: *BusyboxPrepStep = @fieldParentPtr("step", step);
         const b = self.builder;
+        const io = b.graph.io;
 
-        var src_dir = try std.fs.cwd().openDir(b.pathJoin(&.{ b.build_root.path.?, "busybox" }), .{});
-        defer src_dir.close();
-        var dst_dir = try std.fs.cwd().openDir(self.repo_path, .{});
-        defer dst_dir.close();
-        try src_dir.copyFile("busybox_1_35_0.config", dst_dir, ".config", .{});
+        var src_dir = try std.Io.Dir.cwd().openDir(io, b.pathJoin(&.{ b.build_root.path.?, "busybox" }), .{});
+        defer src_dir.close(io);
+        var dst_dir = try std.Io.Dir.cwd().openDir(io, self.repo_path, .{});
+        defer dst_dir.close(io);
+        try src_dir.copyFile("busybox_1_35_0.config", dst_dir, ".config", io, .{});
     }
 };
 
@@ -66,19 +67,19 @@ pub fn add(
     addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
         "-std=c99",
     });
-    exe.addIncludePath(lazyPath(b, b.pathJoin(&.{ repo_path, "include" })));
+    addIncludePathCompat(exe, lazyPath(b, b.pathJoin(&.{ repo_path, "include" })));
 
-    exe.addIncludePath(lazyPath(b, "inc/libc"));
-    exe.addIncludePath(lazyPath(b, "inc/posix"));
-    exe.addIncludePath(lazyPath(b, "inc/linux"));
-    exe.linkLibrary(libc_only_std_static);
-    //exe.linkLibrary(zig_start);
-    exe.linkLibrary(zig_posix);
+    addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/linux"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    //linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_posix);
     // Static helper libraries do not currently propagate system-library
     // dependencies for downstream executables.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
 
     const step = b.step("busybox", "build busybox and it's applets");
@@ -110,11 +111,27 @@ fn addCSourceFilesCompat(
     flags: []const []const u8,
 ) void {
     for (files) |file| {
-        step.addCSourceFile(.{
+        addCSourceFileCompat(step, .{
             .file = lazyPath(step.step.owner, file),
             .flags = flags,
         });
     }
+}
+
+fn addCSourceFileCompat(step: *std.Build.Step.Compile, source: std.Build.Module.CSourceFile) void {
+    step.root_module.addCSourceFile(source);
+}
+
+fn addIncludePathCompat(step: *std.Build.Step.Compile, path: std.Build.LazyPath) void {
+    step.root_module.addIncludePath(path);
+}
+
+fn linkLibraryCompat(step: *std.Build.Step.Compile, lib: *std.Build.Step.Compile) void {
+    step.root_module.linkLibrary(lib);
+}
+
+fn linkSystemLibraryCompat(step: *std.Build.Step.Compile, name: []const u8) void {
+    step.root_module.linkSystemLibrary(name, .{});
 }
 
 fn lazyPath(b: *std.Build, path: []const u8) std.Build.LazyPath {

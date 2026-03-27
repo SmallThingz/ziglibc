@@ -45,17 +45,17 @@ pub fn addAwk(
         "-std=c11",
     });
 
-    exe.addIncludePath(lazyPath(b, "inc/libc"));
-    exe.addIncludePath(lazyPath(b, "inc/posix"));
-    exe.addIncludePath(lazyPath(b, "inc/gnu"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
-    exe.linkLibrary(zig_posix);
+    addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/gnu"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_posix);
     // Static helper libraries do not currently propagate system-library
     // dependencies for downstream executables.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
 
     const step = b.step("awk", "build awk");
@@ -87,11 +87,27 @@ fn addCSourceFilesCompat(
     flags: []const []const u8,
 ) void {
     for (files) |file| {
-        step.addCSourceFile(.{
+        addCSourceFileCompat(step, .{
             .file = lazyPath(step.step.owner, file),
             .flags = flags,
         });
     }
+}
+
+fn addCSourceFileCompat(step: *std.Build.Step.Compile, source: std.Build.Module.CSourceFile) void {
+    step.root_module.addCSourceFile(source);
+}
+
+fn addIncludePathCompat(step: *std.Build.Step.Compile, path: std.Build.LazyPath) void {
+    step.root_module.addIncludePath(path);
+}
+
+fn linkLibraryCompat(step: *std.Build.Step.Compile, lib: *std.Build.Step.Compile) void {
+    step.root_module.linkLibrary(lib);
+}
+
+fn linkSystemLibraryCompat(step: *std.Build.Step.Compile, name: []const u8) void {
+    step.root_module.linkSystemLibrary(name, .{});
 }
 
 fn lazyPath(b: *std.Build, path: []const u8) std.Build.LazyPath {

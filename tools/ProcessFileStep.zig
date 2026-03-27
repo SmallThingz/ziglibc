@@ -37,24 +37,29 @@ pub fn create(b: *std.Build, opt: struct {
 fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const self: *ProcessFileStep = @fieldParentPtr("step", step);
+    const io = step.owner.graph.io;
 
-    if (try filecheck.leftFileIsNewer(self.out_filename, self.in_filename)) {
+    if (try filecheck.leftFileIsNewer(io, self.out_filename, self.in_filename)) {
         return;
     }
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const content = std.fs.cwd().readFileAlloc(arena.allocator(), self.in_filename, std.math.maxInt(usize)) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const content = cwd.readFileAlloc(io, self.in_filename, arena.allocator(), .unlimited) catch |err| {
         std.log.err("failed to read file '{s}' to process ({s})", .{ self.in_filename, @errorName(err) });
         std.process.exit(0xff);
     };
     const tmp_filename = try std.fmt.allocPrint(arena.allocator(), "{s}.processing", .{self.out_filename});
     {
-        var out_file = try std.fs.cwd().createFile(tmp_filename, .{});
-        defer out_file.close();
-        try process(self.subs, out_file, content);
+        var out_file = try cwd.createFile(io, tmp_filename, .{});
+        defer out_file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = out_file.writer(io, &buffer);
+        try process(self.subs, &writer.interface, content);
+        try writer.flush();
     }
-    try std.fs.cwd().rename(tmp_filename, self.out_filename);
+    try cwd.rename(tmp_filename, cwd, self.out_filename, io);
 }
 
 fn process(subs: []const Sub, writer: anytype, content: []const u8) !void {

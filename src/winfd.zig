@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const compat = @import("head_compat.zig");
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -36,7 +37,7 @@ const max_extra_fds = 256;
 const handle_flag_inherit = 0x0000_0001;
 const duplicate_same_access = 0x0000_0002;
 
-var mutex: std.Thread.Mutex = .{};
+var mutex: compat.Mutex = .{};
 var entries: [max_extra_fds]Entry = [_]Entry{.{}} ** max_extra_fds;
 var stdio_closed: [3]bool = [_]bool{false} ** 3;
 var stdio_status_flags: [3]c_int = .{ c.O_RDONLY, c.O_WRONLY, c.O_WRONLY };

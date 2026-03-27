@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const os = std.posix;
+const compat = @import("head_compat.zig");
 const winfd = @import("winfd.zig");
 const winproc = @import("winproc.zig");
 
@@ -55,12 +56,14 @@ const cstd = struct {
         timeout: ?*const c.timespec,
         sigmask: ?*const c.sigset_t,
     ) callconv(.c) c_int;
+    extern fn _zlinux_stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int;
+    extern fn _zlinux_fstat(fd: c_int, buf: *c.struct_stat) callconv(.c) c_int;
 };
 
 const AtomicFlag = std.atomic.Value(u32);
 
 fn spinPause() void {
-    std.Thread.yield() catch std.Thread.sleep(50 * std.time.ns_per_us);
+    std.Thread.yield() catch compat.sleepNs(50 * std.time.ns_per_us);
 }
 
 const SpinLock = struct {
@@ -455,9 +458,9 @@ fn drainWindowsPipeStream(stream: *c.FILE) void {
 
 fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
-    var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return false;
-    defer file.close();
-    const len = file.readAll(buf) catch return false;
+    const file = compat.openFileAbsolute("/proc/self/environ", .{}) catch return false;
+    defer compat.closeFile(file);
+    const len = compat.readFileShort(file, buf) catch return false;
 
     var count: usize = 0;
     var i: usize = 0;
@@ -1229,7 +1232,7 @@ fn randToFilenameChar(r: u8) u8 {
 fn randomizeTempFilename(slice: *[6]u8) void {
     var randoms: [6]u8 = undefined;
     {
-        const timestamp = std.time.nanoTimestamp();
+        const timestamp = compat.nanoTimestamp();
         var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.math.maxInt(u64) & timestamp)));
         prng.random().bytes(&randoms);
     }
@@ -1489,23 +1492,13 @@ export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
         return cstd._zdarwin_access(path, amode);
     }
     const mode: u32 = @intCast(amode);
-    std.posix.accessZ(path, mode) catch |err| {
-        c.errno = switch (err) {
-            error.AccessDenied => c.EACCES,
-            error.PermissionDenied => c.EPERM,
-            error.FileNotFound => c.ENOENT,
-            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-            error.InputOutput => errnoConst("EIO", c.EINVAL),
-            error.SystemResources => c.ENOMEM,
-            error.BadPathName, error.InvalidUtf8, error.InvalidWtf8 => c.EINVAL,
-            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-            else => errnoConst("EIO", c.EINVAL),
-        };
-        return -1;
-    };
-    return 0;
+    switch (os.errno(std.os.linux.access(path, mode))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 fn socketErrno(err: anyerror) c_int {
@@ -1608,15 +1601,18 @@ export fn socket(domain: c_int, sock_type: c_int, protocol: c_int) callconv(.c) 
         }
         return @as(c_int, @intCast(rc));
     }
-    const sock = std.posix.socket(
+    const rc = std.os.linux.socket(
         @as(u32, @intCast(domain)),
         @as(u32, @intCast(sock_type)),
         @as(u32, @intCast(protocol)),
-    ) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
-    };
-    return @as(c_int, @intCast(sock));
+    );
+    switch (os.errno(rc)) {
+        .SUCCESS => return @as(c_int, @intCast(rc)),
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) c_int {
@@ -1649,14 +1645,17 @@ export fn bind(sockfd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.sockle
         }
         return 0;
     }
-    std.posix.bind(sock, @ptrCast(addr orelse {
+    const name = addr orelse {
         c.errno = c.EINVAL;
         return -1;
-    }), @intCast(addrlen)) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
     };
-    return 0;
+    switch (os.errno(std.os.linux.bind(sock, @ptrCast(name), @intCast(addrlen)))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len: c.socklen_t) callconv(.c) c_int {
@@ -1689,14 +1688,17 @@ export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len
         }
         return 0;
     }
-    std.posix.connect(sock, @ptrCast(address orelse {
+    const name = address orelse {
         c.errno = c.EINVAL;
         return -1;
-    }), @intCast(address_len)) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
     };
-    return 0;
+    switch (os.errno(std.os.linux.connect(sock, @ptrCast(name), @intCast(address_len)))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
@@ -1737,17 +1739,21 @@ export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
         }
         return 0;
     }
-    std.posix.getsockname(sock, @ptrCast(address orelse {
+    const name = address orelse {
         c.errno = c.EINVAL;
-        return -1;
-    }), @ptrCast(address_len orelse {
-        c.errno = c.EINVAL;
-        return -1;
-    })) catch |err| {
-        c.errno = socketErrno(err);
         return -1;
     };
-    return 0;
+    const len_ptr = address_len orelse {
+        c.errno = c.EINVAL;
+        return -1;
+    };
+    switch (os.errno(std.os.linux.getsockname(sock, @ptrCast(name), @ptrCast(len_ptr)))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
@@ -1839,11 +1845,13 @@ export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_val
         }
         return 0;
     }
-    std.posix.getsockopt(sock, level, @as(u32, @intCast(option_name)), opt_buf[0..@intCast(len_ptr.*)]) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
-    };
-    return 0;
+    switch (os.errno(std.os.linux.getsockopt(sock, level, @as(u32, @intCast(option_name)), opt_buf, @ptrCast(len_ptr)))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn setsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_value: ?*const anyopaque, option_len: c.socklen_t) callconv(.c) c_int {
@@ -1932,11 +1940,14 @@ export fn sendto(sockfd: c_int, message: ?*const anyopaque, len: usize, flags: c
         }
         return @as(isize, @intCast(rc));
     }
-    const written = std.posix.sendto(sock, data_ptr[0..len], @as(u32, @intCast(flags)), @ptrCast(dest_addr), @intCast(dest_len)) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
-    };
-    return @as(isize, @intCast(written));
+    const rc = std.os.linux.sendto(sock, data_ptr, len, @as(u32, @intCast(flags)), @ptrCast(dest_addr), @intCast(dest_len));
+    switch (os.errno(rc)) {
+        .SUCCESS => return @as(isize, @intCast(rc)),
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) callconv(.c) isize {
@@ -1981,11 +1992,14 @@ export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) 
         }
         return @as(isize, @intCast(rc));
     }
-    const got = std.posix.recv(sock, buf_ptr[0..length], @as(u32, @intCast(flags))) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
-    };
-    return @as(isize, @intCast(got));
+    const rc = std.os.linux.recvfrom(sock, buf_ptr, length, @as(u32, @intCast(flags)), null, null);
+    switch (os.errno(rc)) {
+        .SUCCESS => return @as(isize, @intCast(rc)),
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) isize {
@@ -2037,11 +2051,14 @@ export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_i
         }
         return @as(isize, @intCast(rc));
     }
-    const got = std.posix.recvfrom(sock, buf_ptr[0..length], @as(u32, @intCast(flags)), @ptrCast(address), @ptrCast(address_len)) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
-    };
-    return @as(isize, @intCast(got));
+    const rc = std.os.linux.recvfrom(sock, buf_ptr, length, @as(u32, @intCast(flags)), @ptrCast(address), @ptrCast(address_len));
+    switch (os.errno(rc)) {
+        .SUCCESS => return @as(isize, @intCast(rc)),
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int {
@@ -2066,20 +2083,22 @@ export fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int {
         }
         return 0;
     }
-    const mode: std.posix.ShutdownHow = switch (how) {
-        c.SHUT_RD => .recv,
-        c.SHUT_WR => .send,
-        c.SHUT_RDWR => .both,
+    const mode: c_int = switch (how) {
+        c.SHUT_RD => c.SHUT_RD,
+        c.SHUT_WR => c.SHUT_WR,
+        c.SHUT_RDWR => c.SHUT_RDWR,
         else => {
             c.errno = c.EINVAL;
             return -1;
         },
     };
-    std.posix.shutdown(sock, mode) catch |err| {
-        c.errno = socketErrno(err);
-        return -1;
-    };
-    return 0;
+    switch (os.errno(std.os.linux.shutdown(sock, mode))) {
+        .SUCCESS => return 0,
+        else => |e| {
+            c.errno = @intFromEnum(e);
+            return -1;
+        },
+    }
 }
 
 export fn htonl(hostlong: c.in_addr_t) callconv(.c) c.in_addr_t {
@@ -2329,6 +2348,16 @@ export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
         return 0;
     }
 
+    if (builtin.os.tag == .linux) {
+        switch (os.errno(std.os.linux.unlink(path))) {
+            .SUCCESS => return 0,
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+
     std.posix.unlinkZ(path) catch |err| {
         c.errno = switch (err) {
             error.AccessDenied => c.EACCES,
@@ -2353,7 +2382,7 @@ export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
 
 export fn sleep(seconds: c_uint) callconv(.c) c_uint {
     if (seconds == 0) return 0;
-    std.Thread.sleep(@as(u64, seconds) * std.time.ns_per_s);
+    compat.sleepNs(@as(u64, seconds) * std.time.ns_per_s);
     return 0;
 }
 
@@ -2512,8 +2541,8 @@ fn windowsTimevalToFileTime(tv: c.timeval) ?std.os.windows.FILETIME {
 }
 
 const WindowsItimerState = struct {
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: compat.Mutex = .{},
+    cond: compat.Condition = .{},
     thread_started: bool = false,
     armed: bool = false,
     deadline_ns: u64 = 0,
@@ -2529,7 +2558,7 @@ const DarwinTimebaseState = struct {
 };
 var darwin_timebase: DarwinTimebaseState = .{};
 const DarwinItimerState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     value: c.itimerval = std.mem.zeroes(c.itimerval),
 };
 var darwin_itimer: DarwinItimerState = .{};
@@ -2537,7 +2566,7 @@ var darwin_itimer: DarwinItimerState = .{};
 fn windowsCurrentItimerLocked() c.itimerval {
     var value = std.mem.zeroes(c.itimerval);
     if (!windows_itimer.armed) return value;
-    const now_ns = @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+    const now_ns = @as(u64, @intCast(@max(@as(i128, 0), compat.nanoTimestamp())));
     const remaining_ns = if (windows_itimer.deadline_ns > now_ns) windows_itimer.deadline_ns - now_ns else 0;
     value.it_value = nsToCTimeval(remaining_ns);
     value.it_interval = nsToCTimeval(windows_itimer.interval_ns);
@@ -2553,7 +2582,7 @@ fn windowsItimerThread() void {
             windows_itimer.cond.wait(&windows_itimer.mutex);
         }
 
-        const now_ns = @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+        const now_ns = @as(u64, @intCast(@max(@as(i128, 0), compat.nanoTimestamp())));
         if (windows_itimer.deadline_ns > now_ns) {
             const wait_ns = windows_itimer.deadline_ns - now_ns;
             windows_itimer.cond.timedWait(&windows_itimer.mutex, wait_ns) catch {};
@@ -2697,7 +2726,7 @@ export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {
         tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(now.usec));
         return 0;
     }
-    const ns = std.time.nanoTimestamp();
+    const ns = compat.nanoTimestamp();
     tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(@divFloor(ns, std.time.ns_per_s)));
     tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(@divFloor(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)));
     return 0;
@@ -2771,7 +2800,7 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
             windows_itimer.deadline_ns = 0;
             windows_itimer.interval_ns = 0;
         } else {
-            const now_ns = @as(u64, @intCast(@max(@as(i128, 0), std.time.nanoTimestamp())));
+            const now_ns = @as(u64, @intCast(@max(@as(i128, 0), compat.nanoTimestamp())));
             windows_itimer.armed = true;
             windows_itimer.deadline_ns = now_ns + value_ns;
             windows_itimer.interval_ns = interval_ns;
@@ -3029,7 +3058,7 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 
     var linux_old: std.os.linux.Sigaction = undefined;
     const rc = std.os.linux.sigaction(
-        @as(u8, @intCast(sig)),
+        @as(std.os.linux.SIG, @enumFromInt(sig)),
         linux_act_ptr,
         if (!cPtrIsNull(oact)) &linux_old else null,
     );
@@ -3070,24 +3099,41 @@ export fn stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int {
         if (fd < 0) return -1;
         defer _ = close(fd);
         return fstat(fd, buf);
-    }
-
-    // `stat()` is a pathname query, not `open()+fstat()`. The shortcut happened to
-    // pass under Darling, but native macOS diverged in CI and truncated the
-    // `utimes` parity test because pathname lookup semantics and openability are
-    // not equivalent. Keep POSIX targets on a real pathname stat so Darwin and
-    // Linux both observe the same file metadata that the system libc does.
-    var stat_buf: os.Stat = undefined;
-    const fstatat_sym = if (@hasDecl(os.system, "fstatat64")) os.system.fstatat64 else os.system.fstatat;
-    switch (os.errno(fstatat_sym(os.AT.FDCWD, path, &stat_buf, 0))) {
-        .SUCCESS => {
-            copyPosixStatToC(buf, stat_buf);
-            return 0;
-        },
-        else => |e| {
-            c.errno = @intFromEnum(e);
-            return -1;
-        },
+    } else if (builtin.os.tag == .linux) {
+        var statx_buf: std.os.linux.Statx = undefined;
+        switch (os.errno(std.os.linux.statx(
+            c.AT_FDCWD,
+            path,
+            0,
+            std.os.linux.STATX.BASIC_STATS,
+            &statx_buf,
+        ))) {
+            .SUCCESS => {
+                copyLinuxStatxToC(buf, statx_buf);
+                return 0;
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    } else {
+        // `stat()` is a pathname query, not `open()+fstat()`. The shortcut happened to
+        // pass under Darling, but native macOS diverged in CI and truncated the
+        // `utimes` parity test because pathname lookup semantics and openability are
+        // not equivalent. Keep POSIX targets on a real pathname stat so Darwin and
+        // Linux both observe the same file metadata that the system libc does.
+        var stat_buf: os.Stat = undefined;
+        switch (os.errno(std.posix.system.fstatat(c.AT_FDCWD, path, &stat_buf, 0))) {
+            .SUCCESS => {
+                copyPosixStatToC(buf, stat_buf);
+                return 0;
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
     }
 }
 
@@ -3113,12 +3159,7 @@ export fn chmod(path: [*:0]const u8, mode: c.mode_t) callconv(.c) c_int {
         }
         return 0;
     }
-    const rc = os.system.fchmodat(
-        os.AT.FDCWD,
-        path,
-        @as(std.posix.mode_t, @intCast(mode)),
-        0,
-    );
+    const rc = std.os.linux.fchmodat(os.AT.FDCWD, path, @as(std.posix.mode_t, @intCast(mode)));
     switch (os.errno(rc)) {
         .SUCCESS => return 0,
         else => |e| {
@@ -3147,6 +3188,38 @@ fn timespecNanoseconds(ts: anytype) c_long {
 fn writeCTimespec(dst: *c.struct_timespec, src: anytype) void {
     dst.tv_sec = @as(@TypeOf(dst.tv_sec), @intCast(timespecSeconds(src)));
     dst.tv_nsec = @as(@TypeOf(dst.tv_nsec), @intCast(timespecNanoseconds(src)));
+}
+
+fn linuxMakeDev(major: u32, minor: u32) u64 {
+    return (@as(u64, minor & 0xff))
+        | (@as(u64, major) << 8)
+        | (@as(u64, minor & ~@as(u32, 0xff)) << 12)
+        | (@as(u64, major & ~@as(u32, 0xfff)) << 32);
+}
+
+fn copyLinuxStatxToC(buf: *c.struct_stat, statx_buf: std.os.linux.Statx) void {
+    buf.* = std.mem.zeroes(c.struct_stat);
+    buf.st_dev = @as(@TypeOf(buf.st_dev), @intCast(linuxMakeDev(statx_buf.dev_major, statx_buf.dev_minor)));
+    buf.st_ino = @as(@TypeOf(buf.st_ino), @intCast(statx_buf.ino));
+    buf.st_mode = @as(@TypeOf(buf.st_mode), @intCast(statx_buf.mode));
+    buf.st_nlink = @as(@TypeOf(buf.st_nlink), @intCast(statx_buf.nlink));
+    buf.st_uid = @as(@TypeOf(buf.st_uid), @intCast(statx_buf.uid));
+    buf.st_gid = @as(@TypeOf(buf.st_gid), @intCast(statx_buf.gid));
+    buf.st_rdev = @as(@TypeOf(buf.st_rdev), @intCast(linuxMakeDev(statx_buf.rdev_major, statx_buf.rdev_minor)));
+    buf.st_blksize = @as(@TypeOf(buf.st_blksize), @intCast(statx_buf.blksize));
+    buf.st_blocks = @as(@TypeOf(buf.st_blocks), @intCast(statx_buf.blocks));
+    buf.st_size = @as(@TypeOf(buf.st_size), @intCast(statx_buf.size));
+    buf.st_atime = @as(@TypeOf(buf.st_atime), @intCast(statx_buf.atime.sec));
+    buf.st_mtime = @as(@TypeOf(buf.st_mtime), @intCast(statx_buf.mtime.sec));
+    buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(statx_buf.ctime.sec));
+    if (@hasField(c.struct_stat, "st_atim")) {
+        buf.st_atim.tv_sec = @as(@TypeOf(buf.st_atim.tv_sec), @intCast(statx_buf.atime.sec));
+        buf.st_atim.tv_nsec = @as(@TypeOf(buf.st_atim.tv_nsec), @intCast(statx_buf.atime.nsec));
+        buf.st_mtim.tv_sec = @as(@TypeOf(buf.st_mtim.tv_sec), @intCast(statx_buf.mtime.sec));
+        buf.st_mtim.tv_nsec = @as(@TypeOf(buf.st_mtim.tv_nsec), @intCast(statx_buf.mtime.nsec));
+        buf.st_ctim.tv_sec = @as(@TypeOf(buf.st_ctim.tv_sec), @intCast(statx_buf.ctime.sec));
+        buf.st_ctim.tv_nsec = @as(@TypeOf(buf.st_ctim.tv_nsec), @intCast(statx_buf.ctime.nsec));
+    }
 }
 
 fn copyPosixStatToC(buf: *c.struct_stat, stat_buf: os.Stat) void {
@@ -3253,42 +3326,63 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
         buf.st_ctime = @as(@TypeOf(buf.st_ctime), @intCast(windowsFileTimeToUnixSec(info.ftCreationTime)));
         return 0;
     }
-    var stat_buf: os.Stat = undefined;
-    if (builtin.os.tag.isDarwin()) {
+    if (builtin.os.tag == .linux) {
+        var statx_buf: std.os.linux.Statx = undefined;
+        const empty_path: [*:0]const u8 = "";
+        switch (os.errno(std.os.linux.statx(
+            fd,
+            empty_path,
+            std.os.linux.AT.EMPTY_PATH,
+            std.os.linux.STATX.BASIC_STATS,
+            &statx_buf,
+        ))) {
+            .SUCCESS => {
+                copyLinuxStatxToC(buf, statx_buf);
+                return 0;
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    } else {
+        var stat_buf: os.Stat = undefined;
+        if (builtin.os.tag.isDarwin()) {
         // Keep Darwin on the fixed-arity libsyscall stub instead of the generic
         // variadic `syscall()` bridge. Native Apple Silicon surfaced a real
         // `fstat` corruption bug there that Darling did not reproduce. Apple's
         // syscall maps route both macOS architectures through `___fstat64`;
         // `@"fstat$INODE64"` is just the public x86_64 alias for the same stub.
-        if (builtin.cpu.arch == .x86_64) {
-            switch (os.errno(darwin.@"fstat$INODE64"(fd, &stat_buf))) {
-                .SUCCESS => {
-                    copyPosixStatToC(buf, stat_buf);
-                    return 0;
-                },
-                else => |e| {
-                    c.errno = @intFromEnum(e);
+            if (builtin.cpu.arch == .x86_64) {
+                switch (os.errno(darwin.@"fstat$INODE64"(fd, &stat_buf))) {
+                    .SUCCESS => {
+                        copyPosixStatToC(buf, stat_buf);
+                        return 0;
+                    },
+                    else => |e| {
+                        c.errno = @intFromEnum(e);
+                        return -1;
+                    },
+                }
+            } else {
+                if (cstd._zdarwin_fstat64(fd, &stat_buf) != 0) {
                     return -1;
-                },
+                }
+                copyPosixStatToC(buf, stat_buf);
+                return 0;
             }
-        } else {
-            if (cstd._zdarwin_fstat64(fd, &stat_buf) != 0) {
+        }
+        switch (os.errno(std.posix.system.fstat(fd, &stat_buf))) {
+            .SUCCESS => {
+                copyPosixStatToC(buf, stat_buf);
+                return 0;
+            },
+            else => |e| {
+                c.errno = @intFromEnum(e);
                 return -1;
-            }
-            copyPosixStatToC(buf, stat_buf);
-            return 0;
+            },
         }
     }
-    switch (os.errno(os.system.fstat(fd, &stat_buf))) {
-        .SUCCESS => {},
-        else => |e| {
-            c.errno = @intFromEnum(e);
-            return -1;
-        },
-    }
-
-    copyPosixStatToC(buf, stat_buf);
-    return 0;
 }
 
 export fn umask(mode: c.mode_t) callconv(.c) c.mode_t {
@@ -3320,8 +3414,8 @@ const DirentStorage = extern struct {
 };
 
 const DirImpl = struct {
-    dir: std.fs.Dir,
-    iter: std.fs.Dir.Iterator,
+    dir: std.Io.Dir,
+    iter: std.Io.Dir.Iterator,
     entry: DirentStorage = std.mem.zeroes(DirentStorage),
 };
 
@@ -3341,22 +3435,22 @@ fn dirImplFromOpaque(dirp: *c.DIR) *DirImpl {
     return @ptrCast(@alignCast(dirp));
 }
 
-fn openDirPath(dir_name: [*:0]const u8) !std.fs.Dir {
+fn openDirPath(dir_name: [*:0]const u8) !std.Io.Dir {
     const path = std.mem.span(dir_name);
-    const opts = std.fs.Dir.OpenOptions{ .iterate = true };
+    const opts = std.Io.Dir.OpenOptions{ .iterate = true };
     if (std.fs.path.isAbsolute(path)) {
-        return std.fs.openDirAbsolute(path, opts);
+        return compat.openDirAbsolute(path, opts);
     }
-    return std.fs.cwd().openDir(path, opts);
+    return compat.cwd().openDir(compat.io(), path, opts);
 }
 
 export fn opendir(dir_name: [*:0]const u8) callconv(.c) ?*c.DIR {
-    var dir = openDirPath(dir_name) catch |err| {
+    const dir = openDirPath(dir_name) catch |err| {
         c.errno = fsErrno(err);
         return null;
     };
     const impl = std.heap.page_allocator.create(DirImpl) catch {
-        dir.close();
+        dir.close(compat.io());
         c.errno = c.ENOMEM;
         return null;
     };
@@ -3378,12 +3472,12 @@ export fn fdopendir(fd: c_int) callconv(.c) ?*c.DIR {
             return null;
         }
     else
-        @as(std.fs.Dir.Handle, @intCast(fd));
+        @as(std.Io.Dir.Handle, @intCast(fd));
     const impl = std.heap.page_allocator.create(DirImpl) catch {
         c.errno = c.ENOMEM;
         return null;
     };
-    var dir: std.fs.Dir = .{ .fd = handle };
+    const dir: std.Io.Dir = .{ .handle = handle };
     impl.* = .{
         .dir = dir,
         .iter = dir.iterate(),
@@ -3393,14 +3487,14 @@ export fn fdopendir(fd: c_int) callconv(.c) ?*c.DIR {
 
 export fn closedir(dirp: *c.DIR) callconv(.c) c_int {
     const impl = dirImplFromOpaque(dirp);
-    impl.dir.close();
+    impl.dir.close(compat.io());
     std.heap.page_allocator.destroy(impl);
     return 0;
 }
 
 export fn readdir(dirp: *c.DIR) callconv(.c) ?*DirentStorage {
     const impl = dirImplFromOpaque(dirp);
-    const next = impl.iter.next() catch |err| {
+    const next = impl.iter.next(compat.io()) catch |err| {
         c.errno = fsErrno(err);
         return null;
     };
@@ -3414,9 +3508,18 @@ export fn readdir(dirp: *c.DIR) callconv(.c) ?*DirentStorage {
 
     impl.entry.d_ino = 0;
     if (builtin.os.tag != .windows) {
-        const stat_info = std.posix.fstatat(impl.dir.fd, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch null;
-        if (stat_info) |st| {
-            impl.entry.d_ino = @as(c.ino_t, @intCast(st.ino));
+        var st: c.struct_stat = undefined;
+        if (builtin.os.tag == .linux) {
+            const rc = std.os.linux.syscall4(
+                .fstatat64,
+                @as(usize, @bitCast(@as(isize, impl.dir.handle))),
+                @intFromPtr(entry.name.ptr),
+                @intFromPtr(&st),
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
+            );
+            if (os.errno(rc) == .SUCCESS) {
+                impl.entry.d_ino = @as(c.ino_t, @intCast(st.st_ino));
+            }
         }
     }
     return &impl.entry;
@@ -3902,7 +4005,7 @@ export fn select(
                 c.errno = c.EINVAL;
                 return -1;
             };
-            if (total_ns != 0) std.Thread.sleep(total_ns);
+            if (total_ns != 0) compat.sleepNs(total_ns);
             to.tv_sec = 0;
             to.tv_usec = 0;
             return 0;
@@ -3937,7 +4040,7 @@ export fn select(
                 return -1;
             };
         } else null;
-        const start_ns = if (timeout_ns != null) std.time.nanoTimestamp() else 0;
+        const start_ns = if (timeout_ns != null) compat.nanoTimestamp() else 0;
 
         while (true) {
             if (readfds) |rf| rf.* = read_template;
@@ -3963,7 +4066,7 @@ export fn select(
             }
 
             if (timeout_ns) |limit_ns| {
-                const elapsed_ns = @as(u64, @intCast(@max(0, std.time.nanoTimestamp() - start_ns)));
+                const elapsed_ns = @as(u64, @intCast(@max(0, compat.nanoTimestamp() - start_ns)));
                 if (elapsed_ns >= limit_ns) {
                     if (readfds) |rf| FD_ZERO(rf);
                     if (writefds) |wf| FD_ZERO(wf);
@@ -3975,9 +4078,9 @@ export fn select(
                     return 0;
                 }
                 const remaining_ns = limit_ns - elapsed_ns;
-                std.Thread.sleep(@min(remaining_ns, std.time.ns_per_ms));
+                compat.sleepNs(@min(remaining_ns, std.time.ns_per_ms));
             } else {
-                std.Thread.sleep(std.time.ns_per_ms);
+                compat.sleepNs(std.time.ns_per_ms);
             }
         }
     }
@@ -4041,7 +4144,7 @@ export fn pselect(
                 c.errno = c.EINVAL;
                 return -1;
             };
-            if (total_ns != 0) std.Thread.sleep(total_ns);
+            if (total_ns != 0) compat.sleepNs(total_ns);
             return 0;
         } else {
             c.errno = errnoConst("ENOSYS", c.EINVAL);

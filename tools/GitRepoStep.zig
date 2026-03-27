@@ -83,8 +83,9 @@ fn hasDependency(step: *const std.Build.Step, dep_candidate: *const std.Build.St
 fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const self: *GitRepoStep = @fieldParentPtr("step", step);
+    const io = self.step.owner.graph.io;
 
-    std.fs.accessAbsolute(self.path, .{}) catch {
+    std.Io.Dir.accessAbsolute(io, self.path, .{}) catch {
         const branch_args = if (self.branch) |b| &[2][]const u8{ " -b ", b } else &[2][]const u8{ "", "" };
         if (!self.fetch_enabled) {
             std.debug.print("Error: git repository '{s}' does not exist\n", .{self.path});
@@ -133,26 +134,29 @@ fn checkSha(self: GitRepoStep) !void {
         return;
 
     const result: union(enum) { failed: anyerror, output: []const u8 } = blk: {
-        const result = std.process.Child.run(.{
-            .allocator = self.step.owner.allocator,
-            .argv = &[_][]const u8{
+        const result = std.process.run(self.step.owner.allocator, self.step.owner.graph.io, .{
+            .argv = &.{
                 "git",
                 "-C",
                 self.path,
                 "rev-parse",
                 "HEAD",
             },
-            .cwd = self.step.owner.build_root.path,
+            .cwd = .{ .path = self.step.owner.build_root.path.? },
         }) catch |e| break :blk .{ .failed = e };
-        try std.fs.File.stderr().writeAll(result.stderr);
+        const io = self.step.owner.graph.io;
+        var stderr_buf: [1024]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
+        try stderr_writer.interface.writeAll(result.stderr);
+        try stderr_writer.flush();
         switch (result.term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code == 0) break :blk .{ .output = result.stdout };
                 break :blk .{ .failed = error.GitProcessNonZeroExit };
             },
-            .Signal => break :blk .{ .failed = error.GitProcessFailedWithSignal },
-            .Stopped => break :blk .{ .failed = error.GitProcessWasStopped },
-            .Unknown => break :blk .{ .failed = error.GitProcessFailed },
+            .signal => break :blk .{ .failed = error.GitProcessFailedWithSignal },
+            .stopped => break :blk .{ .failed = error.GitProcessWasStopped },
+            .unknown => break :blk .{ .failed = error.GitProcessFailed },
         }
     };
     switch (result) {
@@ -160,7 +164,7 @@ fn checkSha(self: GitRepoStep) !void {
             return self.sha_check.reportFail("failed to retreive sha for repository '{s}': {s}", .{ self.name, @errorName(err) });
         },
         .output => |output| {
-            if (!std.mem.eql(u8, std.mem.trimRight(u8, output, "\n\r"), self.sha)) {
+            if (!std.mem.eql(u8, std.mem.trim(u8, output, "\n\r"), self.sha)) {
                 return self.sha_check.reportFail("repository '{s}' sha does not match\nexpected: {s}\nactual  : {s}\n", .{ self.name, self.sha, output });
             }
         },
@@ -168,33 +172,24 @@ fn checkSha(self: GitRepoStep) !void {
 }
 
 fn run(builder: *std.Build, argv: []const []const u8) !void {
-    {
-        var msg = std.array_list.Managed(u8).init(builder.allocator);
-        defer msg.deinit();
-        const writer = msg.writer();
-        var prefix: []const u8 = "";
-        for (argv) |arg| {
-            try writer.print("{s}\"{s}\"", .{ prefix, arg });
-            prefix = " ";
-        }
-        std.log.info("[RUN] {s}", .{msg.items});
+    std.log.info("[RUN] {s}", .{argv[0]});
+    for (argv[1..]) |arg| {
+        std.log.info("       \"{s}\"", .{arg});
     }
 
-    var child = std.process.Child.init(argv, builder.allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.cwd = builder.build_root.path;
-
-    try child.spawn();
-    const result = try child.wait();
-    switch (result) {
-        .Exited => |code| if (code != 0) {
+    const result = try std.process.run(builder.allocator, builder.graph.io, .{
+        .argv = argv,
+        .cwd = .{ .path = builder.build_root.path.? },
+        .stdout_limit = .nothing,
+        .stderr_limit = .nothing,
+    });
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
             std.log.err("git clone failed with exit code {}", .{code});
             std.process.exit(0xff);
         },
         else => {
-            std.log.err("git clone failed with: {}", .{result});
+            std.log.err("git clone failed with: {}", .{result.term});
             std.process.exit(0xff);
         },
     }

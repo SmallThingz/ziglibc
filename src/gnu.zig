@@ -5,6 +5,7 @@ const c = @cImport({
     @cInclude("stdlib.h");
 });
 const std = @import("std");
+const compat = @import("head_compat.zig");
 
 fn errnoConst(comptime name: []const u8, fallback: c_int) c_int {
     if (@hasDecl(c, name)) return @field(c, name);
@@ -95,17 +96,17 @@ export fn glob(
     const base_pat = if (slash_index) |idx| pattern_slice[idx + 1 ..] else pattern_slice;
 
     var dir = (if (std.fs.path.isAbsolute(dir_path))
-        std.fs.openDirAbsolute(dir_path, .{ .iterate = true })
+        compat.openDirAbsolute(dir_path, .{ .iterate = true })
     else
-        std.fs.cwd().openDir(dir_path, .{ .iterate = true })) catch return 0;
-    defer dir.close();
+        compat.cwd().openDir(compat.io(), dir_path, .{ .iterate = true })) catch return 0;
+    defer dir.close(compat.io());
 
     var iter = dir.iterate();
-    var matches: std.ArrayListUnmanaged([*:0]u8) = .{};
+    var matches: std.ArrayListUnmanaged([*:0]u8) = .empty;
     defer matches.deinit(std.heap.page_allocator);
 
     while (true) {
-        const entry = (iter.next() catch break) orelse break;
+        const entry = (iter.next(compat.io()) catch break) orelse break;
         if (!wildcardMatch(entry.name, base_pat)) continue;
         const full = if (slash_index) |_|
             std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue

@@ -93,21 +93,21 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "cstd", include_cstd);
     if (include_cstd) {
-        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "printf.c"), .flags = &c_flags });
-        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "scanf.c"), .flags = &c_flags });
-        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "signal.c"), .flags = &c_flags });
-        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "strto.c"), .flags = &c_flags });
+        addCSourceFileCompat(lib, .{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "printf.c"), .flags = &c_flags });
+        addCSourceFileCompat(lib, .{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "scanf.c"), .flags = &c_flags });
+        addCSourceFileCompat(lib, .{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "signal.c"), .flags = &c_flags });
+        addCSourceFileCompat(lib, .{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "strto.c"), .flags = &c_flags });
     }
     const include_posix = switch (opt.variant) {
         .only_posix, .only_gnu, .full => true,
         else => false,
     };
     if (include_cstd or include_posix) {
-        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "errno.c"), .flags = &c_flags });
+        addCSourceFileCompat(lib, .{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "errno.c"), .flags = &c_flags });
     }
     modules_options.addOption(bool, "posix", include_posix);
     if (include_posix) {
-        lib.addCSourceFile(.{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "posix.c"), .flags = &c_flags });
+        addCSourceFileCompat(lib, .{ .file = relpath(builder, "src" ++ std.fs.path.sep_str ++ "posix.c"), .flags = &c_flags });
     }
     const include_linux = switch (opt.variant) {
         .only_linux, .full => true,
@@ -115,8 +115,8 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "linux", include_linux);
     if (include_cstd or include_posix) {
-        lib.addIncludePath(relpath(builder, "inc" ++ std.fs.path.sep_str ++ "libc"));
-        lib.addIncludePath(relpath(builder, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        addIncludePathCompat(lib, relpath(builder, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(lib, relpath(builder, "inc" ++ std.fs.path.sep_str ++ "posix"));
     }
     const include_gnu = switch (opt.variant) {
         .only_gnu, .full => true,
@@ -124,9 +124,21 @@ pub fn addLibc(builder: *std.Build, opt: ZigLibcOptions) *CompileStep {
     };
     modules_options.addOption(bool, "gnu", include_gnu);
     if (include_gnu) {
-        lib.addIncludePath(relpath(builder, "inc" ++ std.fs.path.sep_str ++ "gnu"));
+        addIncludePathCompat(lib, relpath(builder, "inc" ++ std.fs.path.sep_str ++ "gnu"));
     }
     return lib;
+}
+
+fn addCSourceFileCompat(step: *CompileStep, source: std.Build.Module.CSourceFile) void {
+    step.root_module.addCSourceFile(source);
+}
+
+fn addIncludePathCompat(step: *CompileStep, path: std.Build.LazyPath) void {
+    step.root_module.addIncludePath(path);
+}
+
+fn linkLibraryCompat(step: *CompileStep, lib: *CompileStep) void {
+    step.root_module.linkLibrary(lib);
 }
 
 fn addStaticLibraryCompat(

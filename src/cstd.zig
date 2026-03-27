@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const compat = @import("head_compat.zig");
 const winfd = @import("winfd.zig");
 const winproc = @import("winproc.zig");
 
@@ -97,26 +98,17 @@ fn zunlinkCompat(path: [*:0]const u8) c_int {
         }
     }
 
-    std.posix.unlinkZ(path) catch |err| {
-        errno = switch (err) {
-            error.AccessDenied => c.EACCES,
-            error.PermissionDenied => c.EPERM,
-            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-            error.FileSystem => errnoConst("EIO", c.EINVAL),
-            error.IsDir => errnoConst("EISDIR", c.EINVAL),
-            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-            error.FileNotFound => c.ENOENT,
-            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
-            error.SystemResources => c.ENOMEM,
-            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
-            error.NetworkNotFound => c.ENOENT,
-            else => errnoConst("EIO", c.EINVAL),
-        };
-        return -1;
-    };
-    return 0;
+    if (builtin.os.tag == .linux) {
+        switch (std.posix.errno(std.os.linux.unlink(path))) {
+            .SUCCESS => return 0,
+            else => |e| {
+                errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+    if (std.c.unlink(path) == 0) return 0;
+    return -1;
 }
 
 // __main appears to be a design inherited by LLVM from gcc.
@@ -166,10 +158,16 @@ const windows = struct {
         lpBuffer: ?[*]u8,
         nSize: u32,
     ) callconv(.winapi) u32;
+    pub extern "kernel32" fn SetFilePointerEx(
+        hFile: HANDLE,
+        liDistanceToMove: std.os.windows.LARGE_INTEGER,
+        lpNewFilePointer: ?*std.os.windows.LARGE_INTEGER,
+        dwMoveMethod: u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
 };
 
 const windows_signal_count = 32;
-var windows_signal_mutex: std.Thread.Mutex = .{};
+var windows_signal_mutex: compat.Mutex = .{};
 var windows_sigactions: [windows_signal_count]c.struct_sigaction =
     [_]c.struct_sigaction{std.mem.zeroes(c.struct_sigaction)} ** windows_signal_count;
 
@@ -291,7 +289,7 @@ export fn atexit(func: ExitFunc) c_int {
 
 export fn abort() callconv(.c) noreturn {
     trace.log("abort", .{});
-    std.posix.abort();
+    compat.abort();
 }
 
 export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
@@ -311,10 +309,10 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     }
 
     if (builtin.os.tag == .linux) {
-        var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return null;
-        defer file.close();
+        const file = compat.openFileAbsolute("/proc/self/environ", .{}) catch return null;
+        defer compat.closeFile(file);
         var src: [32768]u8 = undefined;
-        const src_len = file.readAll(&src) catch return null;
+        const src_len = compat.readFileShort(file, &src) catch return null;
 
         var i: usize = 0;
         while (i < src_len) {
@@ -387,9 +385,9 @@ export fn strsignal(sig: c_int) callconv(.c) [*:0]u8 {
 
 fn populateLinuxExecEnviron(buf: []u8, ptrs: [*:null]?[*:0]u8, ptr_cap: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
-    var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return false;
-    defer file.close();
-    const len = file.readAll(buf) catch return false;
+    const file = compat.openFileAbsolute("/proc/self/environ", .{}) catch return false;
+    defer compat.closeFile(file);
+    const len = compat.readFileShort(file, buf) catch return false;
 
     var count: usize = 0;
     var i: usize = 0;
@@ -1261,7 +1259,7 @@ fn _zsignalRaw(sig: c_int, func_ptr: usize) callconv(.c) usize {
 
     var old_action: std.posix.Sigaction = undefined;
     switch (std.posix.errno(std.posix.system.sigaction(
-        @as(u6, @intCast(sig)),
+        @as(std.os.linux.SIG, @enumFromInt(sig)),
         @ptrCast(&action),
         &old_action,
     ))) {
@@ -1289,9 +1287,7 @@ const global = struct {
     var clock_start_ns: i128 = 0;
     var clock_started = false;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .MutexType = std.Thread.Mutex,
-    }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
 
     var strtok_ptr: ?[*:0]u8 = undefined;
 
@@ -1306,7 +1302,7 @@ const global = struct {
         },
     };
     const RemainderState = struct {
-        bytes: std.ArrayListUnmanaged(u8) = .{},
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
         index: usize = 0,
     };
     const file_page_len = 64;
@@ -1326,10 +1322,10 @@ const global = struct {
     }
 
     var static_file_page: FilePage = initStaticFilePage();
-    var dynamic_file_pages: std.ArrayListUnmanaged(*FilePage) = .{};
-    var file_pages_mutex = std.Thread.Mutex{};
+    var dynamic_file_pages: std.ArrayListUnmanaged(*FilePage) = .empty;
+    var file_pages_mutex = compat.Mutex{};
     var remainder_states: std.AutoHashMapUnmanaged(usize, RemainderState) = .empty;
-    var remainder_mutex = std.Thread.Mutex{};
+    var remainder_mutex = compat.Mutex{};
     var tmpnam_counter: u32 = 0;
     var tmpfile_counter: u32 = 0;
 
@@ -1455,11 +1451,11 @@ const global = struct {
     var localtime_tm: c.tm = std.mem.zeroes(c.tm);
     var asctime_buf: [26:0]u8 = [_:0]u8{0} ** 26;
 
-    var atexit_mutex = std.Thread.Mutex{};
+    var atexit_mutex = compat.Mutex{};
     var atexit_started = false;
     // `atexit` storage is contiguous today; chunking would only be a future
     // allocation/perf improvement.
-    var atexit_funcs: std.ArrayListUnmanaged(ExitFunc) = .{};
+    var atexit_funcs: std.ArrayListUnmanaged(ExitFunc) = .empty;
 
     var decimal_point = [_:0]u8{'.'};
     var thousands_sep = [_:0]u8{};
@@ -1518,29 +1514,7 @@ export fn __zreserveFile() callconv(.c) ?*c.FILE {
 
 export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
     trace.log("remove {f}", .{trace.fmtStr(filename)});
-    if (builtin.os.tag.isDarwin()) {
-        return zunlinkCompat(filename);
-    }
-    std.posix.unlinkZ(filename) catch |err| {
-        errno = switch (err) {
-            error.AccessDenied => c.EACCES,
-            error.PermissionDenied => c.EPERM,
-            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-            error.FileSystem => errnoConst("EIO", c.EINVAL),
-            error.IsDir => errnoConst("EISDIR", c.EINVAL),
-            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-            error.FileNotFound => c.ENOENT,
-            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
-            error.SystemResources => c.ENOMEM,
-            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
-            error.NetworkNotFound => c.ENOENT,
-            else => errnoConst("EIO", c.EINVAL),
-        };
-        return -1;
-    };
-    return 0;
+    return zunlinkCompat(filename);
 }
 
 export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
@@ -1553,33 +1527,17 @@ export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
         }
         return 0;
     }
-    std.posix.renameZ(old, new) catch |err| {
-        errno = switch (err) {
-            error.AccessDenied => c.EACCES,
-            error.PermissionDenied => c.EPERM,
-            error.FileBusy => errnoConst("EBUSY", c.EINVAL),
-            error.DiskQuota => errnoConst("EDQUOT", errnoConst("ENOSPC", c.ENOMEM)),
-            error.IsDir => errnoConst("EISDIR", c.EINVAL),
-            error.SymLinkLoop => errnoConst("ELOOP", c.EINVAL),
-            error.LinkQuotaExceeded => errnoConst("EMLINK", c.EINVAL),
-            error.NameTooLong => errnoConst("ENAMETOOLONG", c.EINVAL),
-            error.FileNotFound => c.ENOENT,
-            error.NotDir => errnoConst("ENOTDIR", c.EINVAL),
-            error.SystemResources => c.ENOMEM,
-            error.NoSpaceLeft => errnoConst("ENOSPC", c.ENOMEM),
-            error.PathAlreadyExists => c.EEXIST,
-            error.ReadOnlyFileSystem => errnoConst("EROFS", c.EPERM),
-            error.RenameAcrossMountPoints => errnoConst("EXDEV", c.EINVAL),
-            error.InvalidUtf8, error.InvalidWtf8, error.BadPathName => c.EINVAL,
-            error.NoDevice => errnoConst("ENODEV", c.EINVAL),
-            error.SharingViolation, error.PipeBusy => errnoConst("EBUSY", c.EINVAL),
-            error.NetworkNotFound => c.ENOENT,
-            error.AntivirusInterference => c.EACCES,
-            else => errnoConst("EIO", c.EINVAL),
-        };
-        return -1;
-    };
-    return 0;
+    if (builtin.os.tag == .linux) {
+        switch (std.posix.errno(std.os.linux.rename(old, new))) {
+            .SUCCESS => return 0,
+            else => |e| {
+                errno = @intFromEnum(e);
+                return -1;
+            },
+        }
+    }
+    if (std.c.rename(old, new) == 0) return 0;
+    return -1;
 }
 
 export fn getchar() callconv(.c) c_int {
@@ -1904,32 +1862,50 @@ export fn fclose(stream: *c.FILE) callconv(.c) c_int {
 export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_int {
     trace.log("fseek {*} offset={} whence={}", .{ stream, offset, whence });
     const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
-    const seek_result = switch (whence) {
+    const off: i64 = switch (whence) {
         c.SEEK_SET => blk: {
             if (offset < 0) {
                 errno = c.EINVAL;
                 stream.errno = errno;
                 return -1;
             }
-            break :blk std.posix.lseek_SET(fd, @as(u64, @intCast(offset)));
+            break :blk @intCast(offset);
         },
-        c.SEEK_CUR => std.posix.lseek_CUR(fd, @as(i64, @intCast(offset))),
-        c.SEEK_END => std.posix.lseek_END(fd, @as(i64, @intCast(offset))),
+        c.SEEK_CUR, c.SEEK_END => @intCast(offset),
         else => {
             errno = c.EINVAL;
             stream.errno = errno;
             return -1;
         },
     };
-    seek_result catch |e| {
-        errno = switch (e) {
-            error.Unseekable => errnoConst("ESPIPE", c.EINVAL),
-            error.AccessDenied => c.EACCES,
-            else => errnoConst("EIO", c.EINVAL),
+    if (builtin.os.tag == .windows) {
+        const move_method: u32 = switch (whence) {
+            c.SEEK_SET => 0,
+            c.SEEK_CUR => 1,
+            c.SEEK_END => 2,
+            else => unreachable,
         };
-        stream.errno = errno;
-        return -1;
-    };
+        if (windows.SetFilePointerEx(stream.fd.?, off, null, move_method) == 0) {
+            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            stream.errno = errno;
+            return -1;
+        }
+    } else if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.lseek(fd, off, @intCast(whence));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |e| {
+                errno = @intFromEnum(e);
+                stream.errno = errno;
+                return -1;
+            },
+        }
+    } else {
+        if (std.c.lseek(fd, off, whence) < 0) {
+            stream.errno = errno;
+            return -1;
+        }
+    }
     stream.eof = 0;
     stream.errno = 0;
     entryFromFile(stream).unread_valid = false;
@@ -1939,15 +1915,32 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
 
 export fn ftell(stream: *c.FILE) callconv(.c) c_long {
     const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
-    var offset = std.posix.lseek_CUR_get(fd) catch |e| {
-        errno = switch (e) {
-            error.Unseekable => errnoConst("ESPIPE", c.EINVAL),
-            error.AccessDenied => c.EACCES,
-            else => errnoConst("EIO", c.EINVAL),
-        };
-        stream.errno = errno;
-        return -1;
-    };
+    var offset: i64 = undefined;
+    if (builtin.os.tag == .windows) {
+        var current: std.os.windows.LARGE_INTEGER = undefined;
+        if (windows.SetFilePointerEx(stream.fd.?, 0, &current, 1) == 0) {
+            errno = winfd.errnoFromWin32(std.os.windows.kernel32.GetLastError());
+            stream.errno = errno;
+            return -1;
+        }
+        offset = current;
+    } else if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.lseek(fd, 0, c.SEEK_CUR);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => offset = @bitCast(rc),
+            else => |e| {
+                errno = @intFromEnum(e);
+                stream.errno = errno;
+                return -1;
+            },
+        }
+    } else {
+        offset = std.c.lseek(fd, 0, c.SEEK_CUR);
+        if (offset < 0) {
+            stream.errno = errno;
+            return -1;
+        }
+    }
     if (entryFromFile(stream).unread_valid and offset > 0) {
         offset -= 1;
     }
@@ -3068,7 +3061,7 @@ export fn localeconv() callconv(.c) *c.lconv {
 // time
 // --------------------------------------------------------------------------------
 export fn clock() callconv(.c) c.clock_t {
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = compat.nanoTimestamp();
     if (!global.clock_started) {
         global.clock_start_ns = now_ns;
         global.clock_started = true;
@@ -3112,7 +3105,7 @@ export fn mktime(timeptr: *c.tm) callconv(.c) c.time_t {
 
 export fn time(timer: ?*c.time_t) callconv(.c) c.time_t {
     trace.log("time {*}", .{timer});
-    const now_zig = std.time.timestamp();
+    const now_zig = compat.timestamp();
     const now = @as(c.time_t, @intCast(std.math.boolMask(c.time_t, true) & now_zig));
     if (timer) |_| {
         timer.?.* = now;
@@ -3749,7 +3742,7 @@ fn setjmp_fallback(env: c.jmp_buf) callconv(.c) c_int {
 fn longjmp_fallback(env: c.jmp_buf, val: c_int) callconv(.c) noreturn {
     _ = env;
     _ = val;
-    std.posix.abort();
+    compat.abort();
 }
 comptime {
     if (has_x86_64_setjmp_asm) {

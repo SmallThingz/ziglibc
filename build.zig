@@ -252,9 +252,9 @@ pub fn build(b: *std.Build) void {
             .target = abi_target,
             .optimize = optimize,
         });
-        abi_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-        abi_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-        abi_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
+        addIncludePathCompat(abi_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(abi_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        addIncludePathCompat(abi_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
         test_step.dependOn(&abi_exe.step);
     }
 
@@ -294,8 +294,8 @@ pub fn build(b: *std.Build) void {
     }
     {
         const exe = addTest("gnu_extensive", b, target, optimize, libc_only_std_static, zig_start);
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
-        exe.linkLibrary(libc_only_gnu);
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
+        linkLibraryCompat(exe, libc_only_gnu);
         addPosix(exe, libc_only_posix);
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);
@@ -330,14 +330,14 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-        exe.linkLibrary(libc_only_std_static);
-        exe.linkLibrary(zig_start);
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        linkLibraryCompat(exe, libc_only_std_static);
+        linkLibraryCompat(exe, zig_start);
         addPosix(exe, libc_only_posix);
         if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ntdll");
-            exe.linkSystemLibrary("kernel32");
+            linkSystemLibraryCompat(exe, "ntdll");
+            linkSystemLibraryCompat(exe, "kernel32");
         }
         if (externalRunnerFor(exe) == .none and target.result.os.tag != .macos) {
             const run_step = addRunArtifactCompat(b, exe);
@@ -419,12 +419,12 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                 });
                 addCSourceFilesCompat(win_exe, &.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &.{});
-                win_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-                win_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-                win_exe.linkLibrary(libc_only_std_static);
-                win_exe.linkLibrary(zig_start);
-                win_exe.linkSystemLibrary("ntdll");
-                win_exe.linkSystemLibrary("kernel32");
+                addIncludePathCompat(win_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+                addIncludePathCompat(win_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+                linkLibraryCompat(win_exe, libc_only_std_static);
+                linkLibraryCompat(win_exe, zig_start);
+                linkSystemLibraryCompat(win_exe, "ntdll");
+                linkSystemLibraryCompat(win_exe, "kernel32");
                 break :blk win_exe;
             }
         else
@@ -538,8 +538,8 @@ pub fn build(b: *std.Build) void {
     }
     if (target.result.os.tag == .linux) {
         const exe = addTest("alloca_extensive", b, target, optimize, libc_only_std_static, zig_start);
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "linux"));
-        exe.linkLibrary(libc_only_linux);
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "linux"));
+        linkLibraryCompat(exe, libc_only_linux);
         const run_step = addRunArtifactCompat(b, exe);
         run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
         test_step.dependOn(&run_step.step);
@@ -619,7 +619,7 @@ fn supportsSetjmp(target: std.Target) bool {
 
 fn requireRepoPath(b: *std.Build, rel_path: []const u8) []const u8 {
     const abs_path = b.pathFromRoot(rel_path);
-    std.fs.accessAbsolute(abs_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(b.graph.io, abs_path, .{}) catch {
         std.debug.panic(
             "required dependency repository '{s}' is missing; run `git submodule update --init --recursive`",
             .{rel_path},
@@ -629,10 +629,10 @@ fn requireRepoPath(b: *std.Build, rel_path: []const u8) []const u8 {
 }
 
 fn addPosix(artifact: *std.Build.Step.Compile, zig_posix: *std.Build.Step.Compile) void {
-    artifact.linkLibrary(zig_posix);
-    artifact.addIncludePath(lazyPath(artifact.step.owner, "inc" ++ std.fs.path.sep_str ++ "posix"));
+    linkLibraryCompat(artifact, zig_posix);
+    addIncludePathCompat(artifact, lazyPath(artifact.step.owner, "inc" ++ std.fs.path.sep_str ++ "posix"));
     if (artifact.root_module.resolved_target.?.result.os.tag == .windows) {
-        artifact.linkSystemLibrary("ws2_32");
+        linkSystemLibraryCompat(artifact, "ws2_32");
     }
 }
 
@@ -663,14 +663,14 @@ fn addTestSource(
         .optimize = optimize,
     });
     addCSourceFilesCompat(exe, &.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &.{});
-    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
+    addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
     // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
     return exe;
 }
@@ -721,8 +721,8 @@ fn addParityProbeCommon(
     };
     addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ "test", source_name })}, flags[0..]);
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
     return exe;
 }
@@ -735,7 +735,7 @@ fn addSystemParityProbe(
     optimize: anytype,
 ) *std.Build.Step.Compile {
     const exe = addParityProbeCommon(b, name, source_name, target, optimize);
-    exe.linkLibC();
+    linkLibCCompat(exe);
     return exe;
 }
 
@@ -750,10 +750,10 @@ fn addZigParityProbe(
     libc_only_posix: *std.Build.Step.Compile,
 ) *std.Build.Step.Compile {
     const exe = addParityProbeCommon(b, name, source_name, target, optimize);
-    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-    exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
+    addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
     addPosix(exe, libc_only_posix);
     return exe;
 }
@@ -779,11 +779,11 @@ fn addGlibcCheck(
             .optimize = optimize,
         });
         addCSourceFilesCompat(exe, &.{b.pathJoin(&.{ repo_path, src })}, &.{"-D_GNU_SOURCE"});
-        exe.addIncludePath(lazyPath(b, repo_path));
-        exe.linkLibC();
+        addIncludePathCompat(exe, lazyPath(b, repo_path));
+        linkLibCCompat(exe);
         if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ntdll");
-            exe.linkSystemLibrary("kernel32");
+            linkSystemLibraryCompat(exe, "ntdll");
+            linkSystemLibraryCompat(exe, "kernel32");
         }
         glibc_check_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
@@ -820,16 +820,16 @@ fn addPosixTestSuite(
             "-D_POSIX_C_SOURCE=200112L",
             "-D_XOPEN_SOURCE=600",
         });
-        exe.addIncludePath(lazyPath(b, include_path));
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-        exe.linkLibrary(libc_only_std_static);
-        exe.linkLibrary(zig_start);
-        exe.linkLibrary(libc_only_posix);
+        addIncludePathCompat(exe, lazyPath(b, include_path));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        linkLibraryCompat(exe, libc_only_std_static);
+        linkLibraryCompat(exe, zig_start);
+        linkLibraryCompat(exe, libc_only_posix);
         if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ntdll");
-            exe.linkSystemLibrary("kernel32");
-            exe.linkSystemLibrary("ws2_32");
+            linkSystemLibraryCompat(exe, "ntdll");
+            linkSystemLibraryCompat(exe, "kernel32");
+            linkSystemLibraryCompat(exe, "ws2_32");
         }
         posix_test_suite_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
@@ -868,16 +868,16 @@ fn addAustinGroupTests(
             "-Dsetenv(a,b,c)=0",
         });
         addCSourceFilesCompat(exe, common_src, &.{});
-        exe.addIncludePath(lazyPath(b, common_inc_path));
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-        exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-        exe.linkLibrary(libc_only_std_static);
-        exe.linkLibrary(zig_start);
-        exe.linkLibrary(libc_only_posix);
+        addIncludePathCompat(exe, lazyPath(b, common_inc_path));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        linkLibraryCompat(exe, libc_only_std_static);
+        linkLibraryCompat(exe, zig_start);
+        linkLibraryCompat(exe, libc_only_posix);
         if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ntdll");
-            exe.linkSystemLibrary("kernel32");
-            exe.linkSystemLibrary("ws2_32");
+            linkSystemLibraryCompat(exe, "ntdll");
+            linkSystemLibraryCompat(exe, "kernel32");
+            linkSystemLibraryCompat(exe, "ws2_32");
         }
         austin_group_tests_step.dependOn(&addRunArtifactCompat(b, exe).step);
     }
@@ -904,7 +904,7 @@ fn addLibcTest(
             .target = target,
             .optimize = optimize,
         });
-        lib.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(lib, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
         libc_test_step.dependOn(&lib.step);
     }
     const libc_inc_path = b.pathJoin(&.{ libc_test_path, "src", "common" });
@@ -929,17 +929,17 @@ fn addLibcTest(
                 .optimize = optimize,
             });
             addCSourceFilesCompat(exe, common_src, &.{});
-            exe.addIncludePath(lazyPath(b, libc_inc_path));
-            exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-            exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-            exe.linkLibrary(libc_only_std_static);
-            exe.linkLibrary(zig_start);
-            exe.linkLibrary(libc_only_posix);
+            addIncludePathCompat(exe, lazyPath(b, libc_inc_path));
+            addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+            addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+            linkLibraryCompat(exe, libc_only_std_static);
+            linkLibraryCompat(exe, zig_start);
+            linkLibraryCompat(exe, libc_only_posix);
             // These static artifacts do not currently propagate system-library dependencies.
             if (target.result.os.tag == .windows) {
-                exe.linkSystemLibrary("ntdll");
-                exe.linkSystemLibrary("kernel32");
-                exe.linkSystemLibrary("ws2_32");
+                linkSystemLibraryCompat(exe, "ntdll");
+                linkSystemLibraryCompat(exe, "kernel32");
+                linkSystemLibraryCompat(exe, "ws2_32");
             }
             libc_test_step.dependOn(&addRunArtifactCompat(b, exe).step);
         }
@@ -981,18 +981,18 @@ fn addTinyRegexCTests(
         addCSourceFilesCompat(exe, files.toOwnedSlice() catch unreachable, &.{
             "-std=c99",
         });
-        exe.addIncludePath(lazyPath(b, repo_path));
+        addIncludePathCompat(exe, lazyPath(b, repo_path));
 
-        exe.addIncludePath(lazyPath(b, "inc/libc"));
-        exe.addIncludePath(lazyPath(b, "inc/posix"));
-        exe.linkLibrary(libc_only_std_static);
-        exe.linkLibrary(zig_start);
-        exe.linkLibrary(zig_posix);
+        addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+        addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+        linkLibraryCompat(exe, libc_only_std_static);
+        linkLibraryCompat(exe, zig_start);
+        linkLibraryCompat(exe, zig_posix);
         // These static artifacts do not currently propagate system-library dependencies.
         if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ntdll");
-            exe.linkSystemLibrary("kernel32");
-            exe.linkSystemLibrary("ws2_32");
+            linkSystemLibraryCompat(exe, "ntdll");
+            linkSystemLibraryCompat(exe, "kernel32");
+            linkSystemLibraryCompat(exe, "ws2_32");
         }
 
         //const step = b.step("re", "build the re (tiny-regex-c) tool");
@@ -1047,15 +1047,15 @@ fn addLua(
         "-std=c99",
     });
 
-    lua_exe.addIncludePath(lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-    lua_exe.linkLibrary(libc_only_std_static);
-    lua_exe.linkLibrary(libc_only_posix);
-    lua_exe.linkLibrary(zig_start);
+    addIncludePathCompat(lua_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+    linkLibraryCompat(lua_exe, libc_only_std_static);
+    linkLibraryCompat(lua_exe, libc_only_posix);
+    linkLibraryCompat(lua_exe, zig_start);
     // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
-        lua_exe.addIncludePath(lazyPath(b, "inc/win32"));
-        lua_exe.linkSystemLibrary("ntdll");
-        lua_exe.linkSystemLibrary("kernel32");
+        addIncludePathCompat(lua_exe, lazyPath(b, "inc/win32"));
+        linkSystemLibraryCompat(lua_exe, "ntdll");
+        linkSystemLibraryCompat(lua_exe, "kernel32");
     }
 
     const step = b.step("lua", "build/install the LUA interpreter");
@@ -1117,16 +1117,16 @@ fn addCmph(
         "-std=c11",
     });
 
-    exe.addIncludePath(lazyPath(b, "inc/libc"));
-    exe.addIncludePath(lazyPath(b, "inc/posix"));
-    exe.addIncludePath(lazyPath(b, "inc/gnu"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
-    exe.linkLibrary(zig_posix);
+    addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/gnu"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_posix);
     // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
 
     const step = b.step("cmph", "build the cmph tool");
@@ -1193,15 +1193,15 @@ fn addYacc(
         "-std=c90",
     });
 
-    exe.addIncludePath(lazyPath(b, "inc/libc"));
-    exe.addIncludePath(lazyPath(b, "inc/posix"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
-    exe.linkLibrary(zig_posix);
+    addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_posix);
     // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
 
     const step = b.step("yacc", "build the yacc tool");
@@ -1245,18 +1245,18 @@ fn addYabfc(
         "-std=c99",
     });
 
-    exe.addIncludePath(lazyPath(b, "inc/libc"));
-    exe.addIncludePath(lazyPath(b, "inc/posix"));
-    exe.addIncludePath(lazyPath(b, "inc/linux"));
-    exe.addIncludePath(lazyPath(b, "inc/gnu"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
-    exe.linkLibrary(zig_posix);
-    exe.linkLibrary(zig_gnu);
+    addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/linux"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/gnu"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_posix);
+    linkLibraryCompat(exe, zig_gnu);
     // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
 
     const step = b.step("yabfc", "build/install the yabfc tool (Yet Another BrainFuck Compiler)");
@@ -1300,18 +1300,18 @@ fn addSecretGame(
         "-std=c90",
     });
 
-    exe.addIncludePath(lazyPath(b, "inc/libc"));
-    exe.addIncludePath(lazyPath(b, "inc/posix"));
-    exe.addIncludePath(lazyPath(b, "inc/linux"));
-    exe.addIncludePath(lazyPath(b, "inc/gnu"));
-    exe.linkLibrary(libc_only_std_static);
-    exe.linkLibrary(zig_start);
-    exe.linkLibrary(zig_posix);
-    exe.linkLibrary(zig_gnu);
+    addIncludePathCompat(exe, lazyPath(b, "inc/libc"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/posix"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/linux"));
+    addIncludePathCompat(exe, lazyPath(b, "inc/gnu"));
+    linkLibraryCompat(exe, libc_only_std_static);
+    linkLibraryCompat(exe, zig_start);
+    linkLibraryCompat(exe, zig_posix);
+    linkLibraryCompat(exe, zig_gnu);
     // These static artifacts do not currently propagate system-library dependencies.
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ntdll");
-        exe.linkSystemLibrary("kernel32");
+        linkSystemLibraryCompat(exe, "ntdll");
+        linkSystemLibraryCompat(exe, "kernel32");
     }
 
     const step = b.step("secret", "build/install the secret game");
@@ -1343,7 +1343,7 @@ fn addExecutableCompat(
     });
     if (opt.root_source_file) |root| {
         if (!has_zig_root) {
-            exe.addCSourceFile(.{
+            addCSourceFileCompat(exe, .{
                 .file = root,
                 .flags = &.{},
             });
@@ -1375,7 +1375,7 @@ fn addObjectCompat(
     });
     if (opt.root_source_file) |root| {
         if (!has_zig_root) {
-            obj.addCSourceFile(.{
+            addCSourceFileCompat(obj, .{
                 .file = root,
                 .flags = &.{},
             });
@@ -1390,11 +1390,31 @@ fn addCSourceFilesCompat(
     flags: []const []const u8,
 ) void {
     for (files) |file| {
-        step.addCSourceFile(.{
+        addCSourceFileCompat(step, .{
             .file = lazyPath(step.step.owner, file),
             .flags = flags,
         });
     }
+}
+
+fn addCSourceFileCompat(step: *std.Build.Step.Compile, source: std.Build.Module.CSourceFile) void {
+    step.root_module.addCSourceFile(source);
+}
+
+fn addIncludePathCompat(step: *std.Build.Step.Compile, path: std.Build.LazyPath) void {
+    step.root_module.addIncludePath(path);
+}
+
+fn linkLibraryCompat(step: *std.Build.Step.Compile, lib: *std.Build.Step.Compile) void {
+    step.root_module.linkLibrary(lib);
+}
+
+fn linkLibCCompat(step: *std.Build.Step.Compile) void {
+    step.root_module.linkSystemLibrary("c", .{});
+}
+
+fn linkSystemLibraryCompat(step: *std.Build.Step.Compile, name: []const u8) void {
+    step.root_module.linkSystemLibrary(name, .{});
 }
 
 fn lazyPath(b: *std.Build, path: []const u8) std.Build.LazyPath {

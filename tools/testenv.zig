@@ -2,7 +2,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 var temp_counter: usize = 0;
 
 const ExternalRunner = enum {
@@ -11,11 +10,8 @@ const ExternalRunner = enum {
     wine,
 };
 
-fn externalRunnerFromEnv() ExternalRunner {
-    // The build harness sets this only when the child binary must run under
-    // Darling/Wine. Native runs leave it unset so the helper uses plain host
-    // process execution with no emulator path rewriting.
-    const value = std.process.getEnvVarOwned(arena.allocator(), "ZIGLIBC_EXTERNAL_RUNNER") catch return .none;
+fn externalRunnerFromEnv(environ_map: *const std.process.Environ.Map) ExternalRunner {
+    const value = environ_map.get("ZIGLIBC_EXTERNAL_RUNNER") orelse return .none;
     if (std.mem.eql(u8, value, "darling")) return .darling;
     if (std.mem.eql(u8, value, "wine")) return .wine;
     return .none;
@@ -46,75 +42,76 @@ fn darlingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return allocator.dupe(u8, path_no_dot);
 }
 
-fn pathExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+fn pathExistsAbsolute(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
     return true;
 }
 
-fn normalizeDarwinPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+fn realPathAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+}
+
+fn normalizeDarwinPathAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
     if (std.mem.startsWith(u8, path_no_dot, "/Volumes/SystemRoot/")) {
         return allocator.dupe(u8, path_no_dot);
     }
     if (path_no_dot.len > 0 and path_no_dot[0] == '/') {
-        if (pathExistsAbsolute(path_no_dot)) {
-            return allocator.dupe(u8, path_no_dot);
-        }
+        if (pathExistsAbsolute(io, path_no_dot)) return allocator.dupe(u8, path_no_dot);
         return darlingPathAlloc(allocator, path_no_dot);
     }
-    const abs = std.fs.realpathAlloc(allocator, path_no_dot) catch |err| {
+    const abs = realPathAlloc(io, allocator, path_no_dot) catch |err| {
         const mapped = try darlingPathAlloc(allocator, path_no_dot);
-        if (pathExistsAbsolute(mapped)) return mapped;
+        if (pathExistsAbsolute(io, mapped)) return mapped;
         return err;
     };
-    if (pathExistsAbsolute(abs)) return abs;
+    if (pathExistsAbsolute(io, abs)) return abs;
 
     const mapped_abs = try darlingPathAlloc(allocator, abs);
-    if (pathExistsAbsolute(mapped_abs)) return mapped_abs;
+    if (pathExistsAbsolute(io, mapped_abs)) return mapped_abs;
     return abs;
 }
 
-fn normalizeProgramPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+fn normalizeProgramPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     if (builtin.os.tag == .windows) {
-        const cwd = try std.process.getCwdAlloc(allocator);
+        const cwd = try std.process.currentPathAlloc(io, allocator);
         return windowsPathAlloc(allocator, cwd, path);
     }
     if (builtin.os.tag.isDarwin()) {
-        return normalizeDarwinPathAlloc(allocator, path);
+        return normalizeDarwinPathAlloc(io, allocator, path);
     }
-    return std.fs.realpathAlloc(allocator, path);
+    return realPathAlloc(io, allocator, path);
 }
 
-fn normalizeChildCwd(allocator: std.mem.Allocator, dirname: []const u8) ![]const u8 {
+fn normalizeChildCwd(io: std.Io, allocator: std.mem.Allocator, dirname: []const u8) ![]const u8 {
     if (builtin.os.tag == .windows) {
-        const cwd = try std.process.getCwdAlloc(allocator);
+        const cwd = try std.process.currentPathAlloc(io, allocator);
         return windowsPathAlloc(allocator, cwd, dirname);
     }
     if (builtin.os.tag.isDarwin()) {
-        return normalizeDarwinPathAlloc(allocator, dirname);
+        return normalizeDarwinPathAlloc(io, allocator, dirname);
     }
-    return std.fs.cwd().realpathAlloc(allocator, dirname);
+    return realPathAlloc(io, allocator, dirname);
 }
 
-fn mapExistingPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+fn mapExistingPathAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const path_no_dot = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
-    std.fs.cwd().access(path_no_dot, .{}) catch return allocator.dupe(u8, path);
-    return std.fs.realpathAlloc(allocator, path_no_dot);
+    std.Io.Dir.cwd().access(io, path_no_dot, .{}) catch return allocator.dupe(u8, path);
+    return realPathAlloc(io, allocator, path_no_dot);
 }
 
-fn mapDarlingArgAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const mapped = try mapExistingPathAlloc(allocator, path);
+fn mapDarlingArgAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const mapped = try mapExistingPathAlloc(io, allocator, path);
     if (!std.fs.path.isAbsolute(mapped)) return mapped;
-    std.fs.accessAbsolute(mapped, .{}) catch return mapped;
+    std.Io.Dir.accessAbsolute(io, mapped, .{}) catch return mapped;
     return darlingPathAlloc(allocator, mapped);
 }
 
-fn normalizeForeignChildCwd(allocator: std.mem.Allocator, runner: ExternalRunner, dirname: []const u8) ![]const u8 {
-    const abs = try std.fs.cwd().realpathAlloc(allocator, dirname);
+fn normalizeForeignChildCwd(io: std.Io, allocator: std.mem.Allocator, runner: ExternalRunner, dirname: []const u8) ![]const u8 {
+    const abs = try realPathAlloc(io, allocator, dirname);
     return switch (runner) {
-        .darling => normalizeDarwinPathAlloc(allocator, abs),
-        .wine => abs,
-        .none => abs,
+        .darling => normalizeDarwinPathAlloc(io, allocator, abs),
+        .wine, .none => abs,
     };
 }
 
@@ -126,79 +123,88 @@ fn winePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return out;
 }
 
-fn initForeignRunnerChild(
+fn makeWineEnvMap(init: std.process.Init, allocator: std.mem.Allocator) !*std.process.Environ.Map {
+    const environ_map = try allocator.create(std.process.Environ.Map);
+    environ_map.* = try init.minimal.environ.createMap(allocator);
+    if (environ_map.get("WINEDEBUG") == null) {
+        try environ_map.put("WINEDEBUG", "-all");
+    }
+    return environ_map;
+}
+
+fn buildRunOptions(
+    init: std.process.Init,
     allocator: std.mem.Allocator,
     runner: ExternalRunner,
     program_path: []const u8,
-    args: []const []const u8,
-) !std.process.Child {
-    const abs_program = try std.fs.realpathAlloc(allocator, program_path);
-    var mapped_args = try allocator.alloc([]const u8, args.len);
+    extra_args: []const []const u8,
+    child_cwd: []const u8,
+) !std.process.RunOptions {
+    if (runner == .none) {
+        var child_args = try allocator.alloc([]const u8, extra_args.len + 1);
+        child_args[0] = try normalizeProgramPath(init.io, allocator, program_path);
+        @memcpy(child_args[1..], extra_args);
+        return .{
+            .argv = child_args,
+            .cwd = .{ .path = child_cwd },
+            .stdout_limit = .unlimited,
+            .stderr_limit = .unlimited,
+        };
+    }
 
-    var child = switch (runner) {
+    const abs_program = try realPathAlloc(init.io, allocator, program_path);
+    return switch (runner) {
         .darling => blk: {
-            for (args, 0..) |arg, i| {
-                mapped_args[i] = try mapDarlingArgAlloc(allocator, arg);
-            }
-            var child_args = try allocator.alloc([]const u8, args.len + 5);
+            var child_args = try allocator.alloc([]const u8, extra_args.len + 5);
             child_args[0] = "bash";
             child_args[1] = "-lc";
             child_args[2] = "darling shell /bin/bash -lc 'prog=\"$1\"; shift; \"$prog\" \"$@\"' _ \"$@\"";
             child_args[3] = "_";
             child_args[4] = try darlingPathAlloc(allocator, abs_program);
-            for (mapped_args, 0..) |arg, i| {
-                child_args[i + 5] = arg;
+            for (extra_args, 0..) |arg, i| {
+                child_args[i + 5] = try mapDarlingArgAlloc(init.io, allocator, arg);
             }
-            break :blk std.process.Child.init(child_args, allocator);
+            break :blk .{
+                .argv = child_args,
+                .cwd = .{ .path = child_cwd },
+                .stdout_limit = .unlimited,
+                .stderr_limit = .unlimited,
+            };
         },
         .wine => blk: {
-            for (args, 0..) |arg, i| {
-                mapped_args[i] = try mapExistingPathAlloc(allocator, arg);
-            }
-            var child_args = try allocator.alloc([]const u8, args.len + 2);
+            var child_args = try allocator.alloc([]const u8, extra_args.len + 2);
             child_args[0] = "wine";
             child_args[1] = try winePathAlloc(allocator, abs_program);
-            for (mapped_args, 0..) |arg, i| {
+            for (extra_args, 0..) |arg, i| {
+                const mapped = try mapExistingPathAlloc(init.io, allocator, arg);
                 child_args[i + 2] = argblk: {
-                    std.fs.cwd().access(if (std.mem.startsWith(u8, arg, "./")) arg[2..] else arg, .{}) catch break :argblk arg;
-                    break :argblk try winePathAlloc(allocator, arg);
+                    std.Io.Dir.cwd().access(init.io, if (std.mem.startsWith(u8, mapped, "./")) mapped[2..] else mapped, .{}) catch break :argblk arg;
+                    break :argblk try winePathAlloc(allocator, mapped);
                 };
             }
-            break :blk std.process.Child.init(child_args, allocator);
+            break :blk .{
+                .argv = child_args,
+                .cwd = .{ .path = child_cwd },
+                .environ_map = try makeWineEnvMap(init, allocator),
+                .stdout_limit = .unlimited,
+                .stderr_limit = .unlimited,
+                .create_no_window = true,
+            };
         },
         .none => unreachable,
     };
-    if (runner == .wine) {
-        const env_map = try allocator.create(std.process.EnvMap);
-        env_map.* = try std.process.getEnvMap(allocator);
-        if (env_map.get("WINEDEBUG") == null) {
-            try env_map.put("WINEDEBUG", "-all");
-        }
-        child.env_map = env_map;
-    }
-    return child;
 }
 
-pub fn main() !u8 {
-    const allocator = arena.allocator();
-    const full_args = try std.process.argsAlloc(allocator);
+pub fn main(init: std.process.Init) !u8 {
+    const allocator = init.arena.allocator();
+    const full_args = try init.minimal.args.toSlice(allocator);
     if (full_args.len <= 1) {
-        try std.fs.File.stderr().writeAll("Usage: testenv PROGRAM ARGS...\n");
+        try std.Io.File.stderr().writeStreamingAll(init.io, "Usage: testenv PROGRAM ARGS...\n");
         return 1;
     }
 
-    const runner = externalRunnerFromEnv();
+    const runner = externalRunnerFromEnv(init.environ_map);
     const args = full_args[1..];
-    var child = switch (runner) {
-        .none => blk: {
-            var child_args = try allocator.alloc([]const u8, args.len);
-            @memcpy(child_args, args);
-            child_args[0] = try normalizeProgramPath(allocator, args[0]);
-            break :blk std.process.Child.init(child_args, allocator);
-        },
-        .darling, .wine => try initForeignRunnerChild(allocator, runner, args[0], args[1..]),
-    };
-
     const dirname = blk: {
         const base = std.fs.path.basename(args[0]);
         var attempt: usize = 0;
@@ -210,11 +216,11 @@ pub fn main() !u8 {
                 .{
                     base,
                     attempt,
-                    @as(u64, @intCast(std.time.nanoTimestamp())),
+                    @as(u64, @intCast(@max(@as(i96, 0), std.Io.Timestamp.now(init.io, .real).nanoseconds))),
                     id,
                 },
             );
-            std.fs.cwd().makeDir(candidate) catch |err| switch (err) {
+            std.Io.Dir.cwd().createDir(init.io, candidate, .default_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => continue,
                 else => return err,
             };
@@ -222,35 +228,20 @@ pub fn main() !u8 {
         }
         return error.PathAlreadyExists;
     };
-    defer std.fs.cwd().deleteTree(dirname) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, dirname) catch {};
 
-    child.cwd = switch (runner) {
-        .none => normalizeChildCwd(allocator, dirname) catch |err| {
-            std.log.err("failed to normalize child cwd: {}", .{err});
-            return err;
-        },
-        .darling, .wine => normalizeForeignChildCwd(allocator, runner, dirname) catch |err| {
-            // Darling needs a cwd in its translated namespace. Wine does not:
-            // Wine itself is the host-side spawned process, so its cwd must stay
-            // as a host path while only argv-style paths get converted to `Z:\...`.
-            // Regressing this back to a Wine path makes the host spawn fail with
-            // FileNotFound before Wine even starts.
-            std.log.err("failed to normalize foreign child cwd: {}", .{err});
-            return err;
-        },
+    const child_cwd = switch (runner) {
+        .none => try normalizeChildCwd(init.io, allocator, dirname),
+        .darling, .wine => try normalizeForeignChildCwd(init.io, allocator, runner, dirname),
     };
 
-    child.spawn() catch |err| {
-        std.log.err("spawn failed: {}", .{err});
-        return err;
-    };
-    const result = try child.wait();
-    switch (result) {
-        .Exited => |code| {
-            // Darling's host-side wrapper reports target success as exit 127.
-            // Keep this normalization in the test harness only; the libc under
-            // test must still expose the real target exit status through APIs
-            // like system()/pclose().
+    const options = try buildRunOptions(init, allocator, runner, args[0], args[1..], child_cwd);
+    const result = try std.process.run(allocator, init.io, options);
+    try std.Io.File.stdout().writeStreamingAll(init.io, result.stdout);
+    try std.Io.File.stderr().writeStreamingAll(init.io, result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
             if (runner == .darling and code == 127) return 0;
             if (code != 0) return code;
         },

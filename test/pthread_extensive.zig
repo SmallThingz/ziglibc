@@ -18,14 +18,14 @@ fn worker(state: *State) void {
     _ = c.pthread_mutex_unlock(&state.mutex);
 }
 
-pub fn main() !u8 {
+pub fn main(init: std.process.Init) !u8 {
     if (builtin.os.tag.isDarwin()) {
         // This test intentionally mixes Zig's native Darwin thread creation path
         // (`std.Thread.spawn`, which uses pthread_create/join from Zig/libSystem)
         // with the local libc pthread mutex/cond shim. That is not a valid end-
         // to-end Darwin pthread test until the full pthread creation/join surface
         // is implemented here, so keep Darwin covered by ABI checks instead.
-        try std.fs.File.stdout().writeAll("Success!\n");
+        try std.Io.File.stdout().writeStreamingAll(init.io, "Success!\n");
         return 0;
     }
 
@@ -47,6 +47,6 @@ pub fn main() !u8 {
     if (c.pthread_cond_broadcast(&state.cond) != 0) return 1;
     if (c.pthread_mutex_unlock(&state.mutex) != 0) return 1;
 
-    try std.fs.File.stdout().writeAll("Success!\n");
+    try std.Io.File.stdout().writeStreamingAll(init.io, "Success!\n");
     return 0;
 }
