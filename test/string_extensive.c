@@ -11,6 +11,7 @@ static int fail(const char *name)
 int main(void)
 {
   char b[32];
+  const char mem_src[] = { 'a', 'b', '\0', 'c', 'd' };
   char *s;
   int i;
 
@@ -54,9 +55,17 @@ int main(void)
   strcpy(b, "aaababccdd0001122223");
   if (strchr(b, 'b') != b + 3) return fail("strchr");
   if (strrchr(b, 'b') != b + 5) return fail("strrchr");
+  if (strchr(b, '\0') != b + strlen(b)) return fail("strchr-nul");
+  if (strrchr(b, '\0') != b + strlen(b)) return fail("strrchr-nul");
+  if (memchr(mem_src, '\0', sizeof mem_src) != mem_src + 2) return fail("memchr-nul");
+  if (memchr(mem_src, 'z', sizeof mem_src) != NULL) return fail("memchr-miss");
   if (strspn(b, "abcd") != 10) return fail("strspn");
   if (strcspn(b, "0123") != 10) return fail("strcspn");
   if (strpbrk(b, "0123") != b + 10) return fail("strpbrk");
+
+  strcpy(b, "foo");
+  if (strcmp(strcat(b, ""), "foo") != 0) return fail("strcat-empty");
+  if (strcmp(strcat(b, "bar"), "foobar") != 0) return fail("strcat-append");
 
   strcpy(b, "abc   123; xyz; foo");
   s = strtok(b, " ");

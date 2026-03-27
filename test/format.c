@@ -6,9 +6,11 @@
 
 #include "expect.h"
 
-int main(int argc, char *argv[])
+int main(void)
 {
   char buffer[200];
+  char tiny[5];
+  char single[1];
   int rc;
   uint32_t u32 = 0xbeef;
   uint64_t u64 = UINT64_C(0xcafe);
@@ -33,21 +35,21 @@ int main(int argc, char *argv[])
   expect(0 == strcmp(buffer, "-123"));
   expect(1 == snprintf(buffer, sizeof(buffer), "%%"));
   expect(0 == strcmp(buffer, "%"));
-  expect(6 == snprintf(buffer, sizeof(buffer), "[%5d]", 12));
+  expect(7 == snprintf(buffer, sizeof(buffer), "[%5d]", 12));
   expect(0 == strcmp(buffer, "[   12]"));
-  expect(6 == snprintf(buffer, sizeof(buffer), "[%-5d]", 12));
+  expect(7 == snprintf(buffer, sizeof(buffer), "[%-5d]", 12));
   expect(0 == strcmp(buffer, "[12   ]"));
-  expect(6 == snprintf(buffer, sizeof(buffer), "[%05d]", 12));
+  expect(7 == snprintf(buffer, sizeof(buffer), "[%05d]", 12));
   expect(0 == strcmp(buffer, "[00012]"));
-  expect(6 == snprintf(buffer, sizeof(buffer), "[%+05d]", 12));
+  expect(7 == snprintf(buffer, sizeof(buffer), "[%+05d]", 12));
   expect(0 == strcmp(buffer, "[+0012]"));
-  expect(6 == snprintf(buffer, sizeof(buffer), "[% 05d]", 12));
+  expect(7 == snprintf(buffer, sizeof(buffer), "[% 05d]", 12));
   expect(0 == strcmp(buffer, "[ 0012]"));
-  expect(6 == snprintf(buffer, sizeof(buffer), "[%.5d]", 12));
+  expect(7 == snprintf(buffer, sizeof(buffer), "[%.5d]", 12));
   expect(0 == strcmp(buffer, "[00012]"));
-  expect(7 == snprintf(buffer, sizeof(buffer), "[%8.5d]", 12));
+  expect(10 == snprintf(buffer, sizeof(buffer), "[%8.5d]", 12));
   expect(0 == strcmp(buffer, "[   00012]"));
-  expect(7 == snprintf(buffer, sizeof(buffer), "[%-8.5d]", 12));
+  expect(10 == snprintf(buffer, sizeof(buffer), "[%-8.5d]", 12));
   expect(0 == strcmp(buffer, "[00012   ]"));
   expect(2 == snprintf(buffer, sizeof(buffer), "[%.0d]", 0));
   expect(0 == strcmp(buffer, "[]"));
@@ -57,21 +59,25 @@ int main(int argc, char *argv[])
   expect(0 == strcmp(buffer, "[0X2A]"));
   expect(5 == snprintf(buffer, sizeof(buffer), "[%#o]", 9));
   expect(0 == strcmp(buffer, "[011]"));
+  expect(1 == snprintf(buffer, sizeof(buffer), "%#.0o", 0));
+  expect(0 == strcmp(buffer, "0"));
+  expect(1 == snprintf(buffer, sizeof(buffer), "%#x", 0));
+  expect(0 == strcmp(buffer, "0"));
   expect(10 == snprintf(buffer, sizeof(buffer), "[%08X]", 0x2a));
   expect(0 == strcmp(buffer, "[0000002A]"));
   expect(6 == snprintf(buffer, sizeof(buffer), "[%*d]", 4, 12));
   expect(0 == strcmp(buffer, "[  12]"));
   expect(6 == snprintf(buffer, sizeof(buffer), "[%*d]", -4, 12));
   expect(0 == strcmp(buffer, "[12  ]"));
-  expect(7 == snprintf(buffer, sizeof(buffer), "[%.*s]", 3, "abcdef"));
+  expect(5 == snprintf(buffer, sizeof(buffer), "[%.*s]", 3, "abcdef"));
   expect(0 == strcmp(buffer, "[abc]"));
-  expect(7 == snprintf(buffer, sizeof(buffer), "[%8.3s]", "abcdef"));
+  expect(10 == snprintf(buffer, sizeof(buffer), "[%8.3s]", "abcdef"));
   expect(0 == strcmp(buffer, "[     abc]"));
-  expect(7 == snprintf(buffer, sizeof(buffer), "[%-8.3s]", "abcdef"));
+  expect(10 == snprintf(buffer, sizeof(buffer), "[%-8.3s]", "abcdef"));
   expect(0 == strcmp(buffer, "[abc     ]"));
-  expect(16 == snprintf(buffer, sizeof(buffer), "%" PRIi64 " %" PRIu64, INT64_C(-7), UINT64_C(8)));
+  expect(4 == snprintf(buffer, sizeof(buffer), "%" PRIi64 " %" PRIu64, INT64_C(-7), UINT64_C(8)));
   expect(0 == strcmp(buffer, "-7 8"));
-  expect(14 == snprintf(buffer, sizeof(buffer), "%" PRIX32 " %" PRIX64, u32, u64));
+  expect(9 == snprintf(buffer, sizeof(buffer), "%" PRIX32 " %" PRIX64, u32, u64));
   expect(0 == strcmp(buffer, "BEEF CAFE"));
   expect(4 == snprintf(buffer, sizeof(buffer), "%" PRIuPTR, uptr));
   expect(0 == strcmp(buffer, "2748"));
@@ -80,6 +86,11 @@ int main(int argc, char *argv[])
   expect(0 == strcmp(buffer, "abcd"));
   expect(3 == snprintf(buffer, sizeof(buffer), "%.*s", 3, "abcd"));
   expect(0 == strcmp(buffer, "abc"));
+  expect(7 == snprintf(tiny, sizeof(tiny), "hello %d", 7));
+  expect(0 == strcmp(tiny, "hell"));
+  expect(3 == snprintf(single, sizeof(single), "%d", 123));
+  expect(single[0] == 0);
+  expect(7 == snprintf(NULL, 0, "[%05d]", 12));
 
   errno = 0;
   rc = snprintf(buffer, sizeof(buffer), "%f", 1.0);

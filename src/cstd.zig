@@ -2138,15 +2138,13 @@ const FormatWriter = union(enum) {
         return switch (self.*) {
             .stream => |stream| _fwrite_buf(bytes.ptr, bytes.len, stream),
             .bounded => |*bounded| blk: {
-                if (!bounded.overflow) {
-                    if (bytes.len > bounded.len) {
-                        bounded.overflow = true;
-                    } else {
-                        @memcpy(bounded.buf[0..bytes.len], bytes);
-                        bounded.buf += bytes.len;
-                        bounded.len -= bytes.len;
-                    }
+                const copy_len = if (bounded.len > 0) @min(bytes.len, bounded.len - 1) else 0;
+                if (copy_len != 0) {
+                    @memcpy(bounded.buf[0..copy_len], bytes[0..copy_len]);
+                    bounded.buf += copy_len;
+                    bounded.len -= copy_len;
                 }
+                if (copy_len != bytes.len) bounded.overflow = true;
                 break :blk bytes.len;
             },
             .unbounded => |*unbounded| blk: {
@@ -2475,13 +2473,18 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 };
                 const raw = buf[0..len];
                 const is_zero = formatNumericValueZero(raw);
+                var int_precision = precision;
+                if (specifier == 'o' and flags.alternate_form) {
+                    const min_octal_digits: i32 = if (raw.len != 0 and raw[0] == '0') 1 else @as(i32, @intCast(raw.len + 1));
+                    if (int_precision < min_octal_digits) int_precision = min_octal_digits;
+                }
                 const prefix = switch (specifier) {
                     'x' => if (flags.alternate_form) "0x" else "",
                     'X' => if (flags.alternate_form) "0X" else "",
-                    'o' => if (flags.alternate_form) "0" else "",
+                    'o' => "",
                     else => "",
                 };
-                if (!writeFormattedInt(writer, out_written, raw, false, is_zero, prefix, precision, width, flags)) return false;
+                if (!writeFormattedInt(writer, out_written, raw, false, is_zero, prefix, int_precision, width, flags)) return false;
             },
             'p' => {
                 if (spec_length != .none) return false;
@@ -2560,7 +2563,7 @@ fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *c.va_list) callc
         if (n != 0) s[0] = 0;
         return -1;
     }
-    if (written < n) s[written] = 0;
+    if (n != 0) s[@min(written, n - 1)] = 0;
     return @intCast(written);
 }
 

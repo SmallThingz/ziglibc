@@ -47,6 +47,15 @@ typedef uint64_t uint_fast64_t;
 #define UINT32_MAX (0xffffffff)
 #define UINT64_MAX (0xffffffffffffffff)
 
+#define INT8_C(c) c
+#define UINT8_C(c) c##U
+#define INT16_C(c) c
+#define UINT16_C(c) c##U
+#define INT32_C(c) c
+#define UINT32_C(c) c##U
+#define INT64_C(c) c##LL
+#define UINT64_C(c) c##ULL
+
 #define INT_LEAST8_MIN INT8_MIN
 #define INT_LEAST16_MIN INT16_MIN
 #define INT_LEAST32_MIN INT32_MIN
@@ -86,6 +95,9 @@ typedef uint64_t uint_fast64_t;
 typedef long long intmax_t;
 typedef unsigned long long uintmax_t;
 typedef struct { intmax_t quot, rem; } imaxdiv_t;
+
+#define INTMAX_C(c) c##LL
+#define UINTMAX_C(c) c##ULL
 
 #if __STDC_VERSION__ >= 199901L
     typedef _zig_isize intptr_t;

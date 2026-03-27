@@ -29,8 +29,12 @@ int main(void)
   const char *sig_name = strsignal(SIGINT);
   char format_buf[128];
   char format_hex_buf[128];
+  char format_ptr_buf[128];
   int64_t i64 = -123;
   uint64_t u64 = 456;
+  int32_t i32 = -77;
+  uint32_t u32 = 99;
+  intptr_t iptr = (intptr_t)-42;
   uintptr_t uptr = (uintptr_t)0xabc;
   size_t max_size = SIZE_MAX;
 
@@ -45,6 +49,9 @@ int main(void)
   snprintf(format_hex_buf, sizeof(format_hex_buf),
            "%" PRIX32 " %" PRIX64 " %" PRIXPTR,
            (uint32_t)0xbeef, (uint64_t)0xcafe, uptr);
+  snprintf(format_ptr_buf, sizeof(format_ptr_buf),
+           "%" PRIi32 " %" PRIu32 " %" PRIdPTR,
+           i32, u32, iptr);
 
   expect(DBL_MAX > 1.0);
   expect(FLT_MAX > 1.0f);
@@ -56,6 +63,7 @@ int main(void)
   expect(sig_name[0] != 0);
   expect(strcmp(format_buf, "-123 456 2748") == 0);
   expect(strcmp(format_hex_buf, "BEEF CAFE ABC") == 0);
+  expect(strcmp(format_ptr_buf, "-77 99 -42") == 0);
   expect(sizeof(sa) >= sizeof(sa.sa_family));
   expect(sizeof(sin) >= sizeof(sin.sin_addr));
   expect(sizeof(st.st_size) >= 8);

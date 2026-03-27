@@ -285,8 +285,8 @@ const gnu_required_argument: c_int = 1;
 const gnu_optional_argument: c_int = 2;
 var fallback_umask: c.mode_t = 0o022;
 var fallback_umask_mutex: SpinLock = .{};
-var dirname_dot: [2:0]u8 = [_:0]u8{'.', 0};
-var dirname_root: [2:0]u8 = [_:0]u8{'/', 0};
+var dirname_dot: [2:0]u8 = [_:0]u8{ '.', 0 };
+var dirname_root: [2:0]u8 = [_:0]u8{ '/', 0 };
 
 const PopenPid = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) usize else os.pid_t;
 const PopenEntry = struct {
@@ -1430,7 +1430,7 @@ export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FI
         if (builtin.os.tag == .linux) {
             var env_buf: [32768]u8 = undefined;
             var env_ptrs = [_:null]?[*:0]u8{null} ** 1024;
-                if (compat.populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
+            if (compat.populateLinuxExecEnviron(&env_buf, &env_ptrs, env_ptrs.len)) {
                 _ = os.system.execve(shell_path, &argv, @ptrCast(&env_ptrs));
             }
         } else if (builtin.os.tag.isDarwin()) {
@@ -3198,10 +3198,7 @@ fn writeCTimespec(dst: *c.struct_timespec, src: anytype) void {
 }
 
 fn linuxMakeDev(major: u32, minor: u32) u64 {
-    return (@as(u64, minor & 0xff))
-        | (@as(u64, major) << 8)
-        | (@as(u64, minor & ~@as(u32, 0xff)) << 12)
-        | (@as(u64, major & ~@as(u32, 0xfff)) << 32);
+    return (@as(u64, minor & 0xff)) | (@as(u64, major) << 8) | (@as(u64, minor & ~@as(u32, 0xff)) << 12) | (@as(u64, major & ~@as(u32, 0xfff)) << 32);
 }
 
 fn copyLinuxStatxToC(buf: *c.struct_stat, statx_buf: std.os.linux.Statx) void {
@@ -3355,11 +3352,11 @@ export fn fstat(fd: c_int, buf: *c.struct_stat) c_int {
     } else {
         var stat_buf: os.Stat = undefined;
         if (builtin.os.tag.isDarwin()) {
-        // Keep Darwin on the fixed-arity libsyscall stub instead of the generic
-        // variadic `syscall()` bridge. Native Apple Silicon surfaced a real
-        // `fstat` corruption bug there that Darling did not reproduce. Apple's
-        // syscall maps route both macOS architectures through `___fstat64`;
-        // `@"fstat$INODE64"` is just the public x86_64 alias for the same stub.
+            // Keep Darwin on the fixed-arity libsyscall stub instead of the generic
+            // variadic `syscall()` bridge. Native Apple Silicon surfaced a real
+            // `fstat` corruption bug there that Darling did not reproduce. Apple's
+            // syscall maps route both macOS architectures through `___fstat64`;
+            // `@"fstat$INODE64"` is just the public x86_64 alias for the same stub.
             if (builtin.cpu.arch == .x86_64) {
                 switch (os.errno(darwin.@"fstat$INODE64"(fd, &stat_buf))) {
                     .SUCCESS => {
