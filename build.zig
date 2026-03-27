@@ -862,7 +862,11 @@ fn addGlibcCheck(
         return glibc_check_step;
     }
 
-    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "glibc-testsuite");
+    const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "glibc-testsuite";
+    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+        glibc_check_step.dependOn(MissingRepoStep.create(b, "missing glibc-testsuite dependency", repo_rel_path));
+        return glibc_check_step;
+    };
 
     inline for (.{ "io/tst-getcwd.c", "libio/test-fmemopen.c", "malloc/tst-malloc.c", "rt/tst-clock.c" }) |src| {
         const name = b.fmt("glibc-check-{s}", .{std.mem.replaceOwned(u8, b.allocator, src, "/", "-") catch unreachable});
@@ -898,7 +902,11 @@ fn addPosixTestSuite(
         return posix_test_suite_step;
     }
 
-    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "open_posix_testsuite");
+    const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "open_posix_testsuite";
+    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+        posix_test_suite_step.dependOn(MissingRepoStep.create(b, "missing open_posix_testsuite dependency", repo_rel_path));
+        return posix_test_suite_step;
+    };
     const include_path = b.pathJoin(&.{ repo_path, "include" });
 
     inline for (.{"conformance/interfaces/clock_gettime/1-1.c"}) |src| {
@@ -944,7 +952,11 @@ fn addAustinGroupTests(
         return austin_group_tests_step;
     }
 
-    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "libc-test");
+    const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "libc-test";
+    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+        austin_group_tests_step.dependOn(MissingRepoStep.create(b, "missing libc-test dependency", repo_rel_path));
+        return austin_group_tests_step;
+    };
     const common_inc_path = b.pathJoin(&.{ repo_path, "src", "common" });
     const common_src = &[_][]const u8{
         b.pathJoin(&.{ repo_path, "src", "common", "print.c" }),
@@ -987,8 +999,12 @@ fn addLibcTest(
     zig_start: *std.Build.Step.Compile,
     libc_only_posix: *std.Build.Step.Compile,
 ) *std.Build.Step {
-    const libc_test_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "libc-test");
     const libc_test_step = b.step("libc-test", "run tests from the libc-test project");
+    const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "libc-test";
+    const libc_test_path = findRepoPath(b, repo_rel_path) orelse {
+        libc_test_step.dependOn(MissingRepoStep.create(b, "missing libc-test dependency", repo_rel_path));
+        return libc_test_step;
+    };
 
     // inttypes
     inline for (.{ "assert", "ctype", "errno", "main", "stdbool", "stddef", "string" }) |name| {
@@ -1056,7 +1072,11 @@ fn addTinyRegexCTests(
         // harness instead of changing libc runtime behavior.
         return re_step;
     }
-    const repo_path = requireRepoPath(b, "dep" ++ std.fs.path.sep_str ++ "tiny-regex-c");
+    const repo_rel_path = "dep" ++ std.fs.path.sep_str ++ "tiny-regex-c";
+    const repo_path = findRepoPath(b, repo_rel_path) orelse {
+        re_step.dependOn(MissingRepoStep.create(b, "missing tiny-regex-c dependency", repo_rel_path));
+        return re_step;
+    };
     inline for (&[_][]const u8{ "test1", "test3" }) |test_name| {
         const exe = addExecutableCompat(b, .{
             .name = "re" ++ test_name,
