@@ -293,6 +293,22 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
+        const exe = addExecutableCompat(b, .{
+            .name = "bench-cstd",
+            .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "bench_cstd.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+        addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+        linkLibraryCompat(exe, libc_only_std_static);
+        linkLibraryCompat(exe, zig_start);
+        addPosix(exe, libc_only_posix);
+        const bench_step = b.step("bench-cstd", "Run cstd microbenchmarks");
+        const run_step = addRunArtifactCompat(b, exe);
+        bench_step.dependOn(&run_step.step);
+    }
+    {
         const exe = addTest("gnu_extensive", b, target, optimize, libc_only_std_static, zig_start);
         addIncludePathCompat(exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "gnu"));
         linkLibraryCompat(exe, libc_only_gnu);
@@ -410,25 +426,22 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
-        const exe = if (target.result.os.tag == .windows)
-            blk: {
-                const win_exe = addExecutableCompat(b, .{
-                    .name = "posix_extensive",
-                    .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "posix_extensive_windows.c"),
-                    .target = target,
-                    .optimize = optimize,
-                });
-                addCSourceFilesCompat(win_exe, &.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &.{});
-                addIncludePathCompat(win_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
-                addIncludePathCompat(win_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
-                linkLibraryCompat(win_exe, libc_only_std_static);
-                linkLibraryCompat(win_exe, zig_start);
-                linkSystemLibraryCompat(win_exe, "ntdll");
-                linkSystemLibraryCompat(win_exe, "kernel32");
-                break :blk win_exe;
-            }
-        else
-            addTestSource("posix_file_extensive", "posix_file_extensive.c", b, target, optimize, libc_only_std_static, zig_start);
+        const exe = if (target.result.os.tag == .windows) blk: {
+            const win_exe = addExecutableCompat(b, .{
+                .name = "posix_extensive",
+                .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "posix_extensive_windows.c"),
+                .target = target,
+                .optimize = optimize,
+            });
+            addCSourceFilesCompat(win_exe, &.{"test" ++ std.fs.path.sep_str ++ "expect.c"}, &.{});
+            addIncludePathCompat(win_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "libc"));
+            addIncludePathCompat(win_exe, lazyPath(b, "inc" ++ std.fs.path.sep_str ++ "posix"));
+            linkLibraryCompat(win_exe, libc_only_std_static);
+            linkLibraryCompat(win_exe, zig_start);
+            linkSystemLibraryCompat(win_exe, "ntdll");
+            linkSystemLibraryCompat(win_exe, "kernel32");
+            break :blk win_exe;
+        } else addTestSource("posix_file_extensive", "posix_file_extensive.c", b, target, optimize, libc_only_std_static, zig_start);
         addPosix(exe, libc_only_posix);
         const run_step = addRunArtifactCompat(b, test_env_exe);
         addArtifactArgCompat(run_step, b, exe);

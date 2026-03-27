@@ -89,6 +89,7 @@ typedef struct { intmax_t quot, rem; } imaxdiv_t;
 
 #if __STDC_VERSION__ >= 199901L
     typedef _zig_isize intptr_t;
+    typedef __UINTPTR_TYPE__ uintptr_t;
 #endif
 
 #endif /* _STDINT_H */

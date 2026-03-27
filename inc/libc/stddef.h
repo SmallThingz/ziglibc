@@ -9,5 +9,6 @@
 typedef _zig_isize ptrdiff_t;
 
 #define offsetof(type, member) __builtin_offsetof(type, member)
+#define SIZE_MAX __SIZE_MAX__
 
 #endif /* _STDDEF_H */

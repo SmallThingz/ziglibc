@@ -702,6 +702,9 @@ export fn wcstombs(s: ?[*]u8, pwcs: [*]const c.wchar_t, n: usize) callconv(.c) u
 }
 
 const SortCompareFn = *const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
+const word_bytes = @sizeOf(usize);
+const zero_ones = std.math.maxInt(usize) / 0xff;
+const zero_high_bits = zero_ones << 7;
 
 fn sortElemPtr(base: [*]u8, index: usize, size: usize) [*]u8 {
     return base + index * size;
@@ -767,6 +770,72 @@ export fn bsearch(
 export fn qsort(base: ?*anyopaque, nmemb: usize, size: usize, compar: SortCompareFn) callconv(.c) void {
     if (nmemb < 2 or size == 0 or base == null) return;
     qsortRange(@ptrCast(base.?), 0, nmemb, size, compar);
+}
+
+fn repeatedByte(byte: u8) usize {
+    return zero_ones * @as(usize, byte);
+}
+
+fn hasZeroByte(word: usize) bool {
+    return ((word -% zero_ones) & ~word & zero_high_bits) != 0;
+}
+
+fn loadWord(ptr: [*]const u8) usize {
+    return (@as(*align(1) const usize, @ptrCast(ptr))).*;
+}
+
+fn cCharByte(char: c_int) u8 {
+    return @as(u8, @truncate(@as(c_uint, @bitCast(char))));
+}
+
+fn findScalarOrZeroChunked(s: [*:0]const u8, needle: u8) ?[*:0]const u8 {
+    var ptr: [*]const u8 = @ptrCast(s);
+    while ((@intFromPtr(ptr) & (word_bytes - 1)) != 0) : (ptr += 1) {
+        if (ptr[0] == needle) return @ptrCast(ptr);
+        if (ptr[0] == 0) return null;
+    }
+
+    const mask = repeatedByte(needle);
+    while (true) : (ptr += word_bytes) {
+        const word = loadWord(ptr);
+        if (hasZeroByte(word ^ mask) or hasZeroByte(word)) {
+            var i: usize = 0;
+            while (i < word_bytes) : (i += 1) {
+                if (ptr[i] == needle) return @ptrCast(ptr + i);
+                if (ptr[i] == 0) return null;
+            }
+        }
+    }
+}
+
+fn findScalarChunked(s: [*]const u8, n: usize, needle: u8) ?[*]const u8 {
+    var ptr = s;
+    var remaining = n;
+    while (remaining != 0 and (@intFromPtr(ptr) & (word_bytes - 1)) != 0) : ({
+        ptr += 1;
+        remaining -= 1;
+    }) {
+        if (ptr[0] == needle) return ptr;
+    }
+
+    const mask = repeatedByte(needle);
+    while (remaining >= word_bytes) : ({
+        ptr += word_bytes;
+        remaining -= word_bytes;
+    }) {
+        if (hasZeroByte(loadWord(ptr) ^ mask)) {
+            var i: usize = 0;
+            while (i < word_bytes) : (i += 1) {
+                if (ptr[i] == needle) return ptr + i;
+            }
+        }
+    }
+
+    var i: usize = 0;
+    while (i < remaining) : (i += 1) {
+        if (ptr[i] == needle) return ptr + i;
+    }
+    return null;
 }
 
 // --------------------------------------------------------------------------------
@@ -838,26 +907,21 @@ export fn strncasecmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c)
 
 export fn strchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
     trace.log("strchr {f} c='{}'", .{ trace.fmtStr(s), char });
-    var next = s;
-    while (true) : (next += 1) {
-        if (next[0] == char) return next;
-        if (next[0] == 0) return null;
-    }
+    const target = cCharByte(char);
+    if (target == 0) return s + strlen(s);
+    return findScalarOrZeroChunked(s, target);
 }
 export fn memchr(s: [*]const u8, char: c_int, n: usize) callconv(.c) ?[*]const u8 {
     trace.log("memchr {*} c='{}' n={}", .{ s, char, n });
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        if (i == n) return null;
-        if (s[i] == char) return s + i;
-    }
+    return findScalarChunked(s, n, cCharByte(char));
 }
 
 export fn strrchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
     trace.log("strrchr {f} c='{}'", .{ trace.fmtStr(s), char });
+    const target = cCharByte(char);
     var next = s + strlen(s);
     while (true) {
-        if (next[0] == char) return next;
+        if (next[0] == target) return next;
         if (next == s) return null;
         next = next - 1;
     }
@@ -2233,7 +2297,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 out_written.* += written;
                 if (written != 1) return false;
             },
-            'd' => {
+            'd', 'i' => {
                 if (precision != precision_none) return false;
                 var buf: [100]u8 = undefined;
                 const len = switch (spec_length) {
@@ -2248,17 +2312,18 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 out_written.* += written;
                 if (written != len) return false;
             },
-            'u', 'x' => |specifier| {
+            'u', 'x', 'X' => |specifier| {
                 if (precision != precision_none) return false;
                 const base: u8 = if (specifier == 'u') 10 else 16;
                 var buf: [100]u8 = undefined;
+                const uppercase = specifier == 'X';
                 const len = switch (spec_length) {
-                    .none => formatIntCompat(&buf, vaArgCompat(args, c_uint), base),
-                    .short => formatIntCompat(&buf, @as(u16, @intCast(vaArgCompat(args, c_uint))), base),
-                    .char => formatIntCompat(&buf, @as(u8, @intCast(vaArgCompat(args, c_uint))), base),
-                    .long => formatIntCompat(&buf, vaArgCompat(args, c_ulong), base),
-                    .long_long => formatIntCompat(&buf, vaArgCompat(args, c_ulonglong), base),
-                    .size => formatIntCompat(&buf, vaArgCompat(args, usize), base),
+                    .none => formatIntCaseCompat(&buf, vaArgCompat(args, c_uint), base, uppercase),
+                    .short => formatIntCaseCompat(&buf, @as(u16, @intCast(vaArgCompat(args, c_uint))), base, uppercase),
+                    .char => formatIntCaseCompat(&buf, @as(u8, @intCast(vaArgCompat(args, c_uint))), base, uppercase),
+                    .long => formatIntCaseCompat(&buf, vaArgCompat(args, c_ulong), base, uppercase),
+                    .long_long => formatIntCaseCompat(&buf, vaArgCompat(args, c_ulonglong), base, uppercase),
+                    .size => formatIntCaseCompat(&buf, vaArgCompat(args, usize), base, uppercase),
                 };
                 const written = writer.write(buf[0..len]);
                 out_written.* += written;
@@ -2339,7 +2404,11 @@ fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *c.va_list) callc
     } };
     var written: usize = 0;
     const ok = vformatWithCVaListPtr(&written, &writer, format, arg);
-    std.debug.assert(ok);
+    if (!ok) {
+        errno = errnoConst("EINVAL", c.EINVAL);
+        if (n != 0) s[0] = 0;
+        return -1;
+    }
     if (written < n) s[written] = 0;
     return @intCast(written);
 }
@@ -2350,7 +2419,11 @@ fn _zvsprintf(s: [*]u8, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_i
     } };
     var written: usize = 0;
     const ok = vformatWithCVaListPtr(&written, &writer, format, arg);
-    std.debug.assert(ok);
+    if (!ok) {
+        errno = errnoConst("EINVAL", c.EINVAL);
+        s[0] = 0;
+        return -1;
+    }
     s[written] = 0;
     return @intCast(written);
 }
@@ -2829,11 +2902,18 @@ export fn _formatCUlonglong(buf: [*]u8, value: c_ulonglong, base: u8) callconv(.
 }
 
 fn formatIntCompat(buf: []u8, value: anytype, base: u8) usize {
+    return formatIntCaseCompat(buf, value, base, false);
+}
+
+fn formatIntCaseCompat(buf: []u8, value: anytype, base: u8, uppercase: bool) usize {
     const out = switch (base) {
         2 => std.fmt.bufPrint(buf, "{b}", .{value}) catch unreachable,
         8 => std.fmt.bufPrint(buf, "{o}", .{value}) catch unreachable,
         10 => std.fmt.bufPrint(buf, "{}", .{value}) catch unreachable,
-        16 => std.fmt.bufPrint(buf, "{x}", .{value}) catch unreachable,
+        16 => if (uppercase)
+            std.fmt.bufPrint(buf, "{X}", .{value}) catch unreachable
+        else
+            std.fmt.bufPrint(buf, "{x}", .{value}) catch unreachable,
         else => std.fmt.bufPrint(buf, "{}", .{value}) catch unreachable,
     };
     return out.len;
