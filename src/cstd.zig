@@ -1377,6 +1377,9 @@ const global = struct {
         reserved: bool = false,
         unread_valid: bool = false,
         unread_char: u8 = 0,
+        read_buf_start: usize = 0,
+        read_buf_end: usize = 0,
+        read_buf: [c.BUFSIZ]u8 = undefined,
         file: c.FILE = .{
             .fd = if (builtin.os.tag == .windows) undefined else -1,
             .eof = 0,
@@ -1416,6 +1419,8 @@ const global = struct {
         entry.file.errno = 0;
         entry.unread_valid = false;
         entry.unread_char = 0;
+        entry.read_buf_start = 0;
+        entry.read_buf_end = 0;
         clearRemainder(&entry.file);
         return &entry.file;
     }
@@ -1453,11 +1458,13 @@ const global = struct {
     }
 
     fn releaseFile(file: *c.FILE) void {
-        const entry: *FileEntry = @fieldParentPtr("file", file);
+        const entry: *FileEntry = @alignCast(@fieldParentPtr("file", file));
         file_pages_mutex.lock();
         defer file_pages_mutex.unlock();
         entry.unread_valid = false;
         entry.unread_char = 0;
+        entry.read_buf_start = 0;
+        entry.read_buf_end = 0;
         removeRemainder(file);
         file.eof = 0;
         file.errno = 0;
@@ -1494,6 +1501,15 @@ const global = struct {
             return state.index < state.bytes.items.len;
         }
         return false;
+    }
+
+    fn pendingRemainderLen(file: *c.FILE) usize {
+        remainder_mutex.lock();
+        defer remainder_mutex.unlock();
+        if (remainder_states.getPtr(@intFromPtr(file))) |state| {
+            return state.bytes.items.len - state.index;
+        }
+        return 0;
     }
 
     fn readRemainder(file: *c.FILE, dest: []u8) usize {
@@ -1576,7 +1592,7 @@ export const stdout: *c.FILE = &global.static_file_page[1].file;
 export const stderr: *c.FILE = &global.static_file_page[2].file;
 
 fn entryFromFile(stream: *c.FILE) *global.FileEntry {
-    return @fieldParentPtr("file", stream);
+    return @alignCast(@fieldParentPtr("file", stream));
 }
 
 fn closePosixFd(fd: c_int) bool {
@@ -1673,6 +1689,83 @@ export fn ungetc(char: c_int, stream: *c.FILE) callconv(.c) c_int {
     return char & 0xff;
 }
 
+fn entryBufferedReadLen(entry: *const global.FileEntry) usize {
+    return entry.read_buf_end - entry.read_buf_start;
+}
+
+fn drainEntryReadBuffer(entry: *global.FileEntry, dest: []u8) usize {
+    const pending = entryBufferedReadLen(entry);
+    if (pending == 0 or dest.len == 0) return 0;
+    const copy_len = @min(dest.len, pending);
+    const src = entry.read_buf[entry.read_buf_start..][0..copy_len];
+    @memcpy(dest[0..copy_len], src);
+    entry.read_buf_start += copy_len;
+    if (entry.read_buf_start == entry.read_buf_end) {
+        entry.read_buf_start = 0;
+        entry.read_buf_end = 0;
+    }
+    return copy_len;
+}
+
+fn clearEntryReadBuffer(entry: *global.FileEntry) void {
+    entry.read_buf_start = 0;
+    entry.read_buf_end = 0;
+}
+
+fn logicalReadAheadLen(stream: *c.FILE, entry: *const global.FileEntry) usize {
+    return @intFromBool(entry.unread_valid) + entryBufferedReadLen(entry) + global.pendingRemainderLen(stream);
+}
+
+fn readFromStreamFd(stream: *c.FILE, dest: []u8) usize {
+    if (dest.len == 0) return 0;
+    if (builtin.os.tag == .windows) {
+        const actual_read_len = @as(u32, @intCast(@min(@as(u32, std.math.maxInt(u32)), dest.len)));
+        while (true) {
+            var amt_read: u32 = undefined;
+            if (windows.ReadFile(stream.fd.?, dest.ptr, actual_read_len, &amt_read, null) == 0) {
+                switch (std.os.windows.GetLastError()) {
+                    .OPERATION_ABORTED => continue,
+                    .BROKEN_PIPE => return 0,
+                    .HANDLE_EOF => {
+                        stream.eof = 1;
+                        return 0;
+                    },
+                    else => |err| {
+                        const read_errno = winfd.errnoFromWin32(err);
+                        stream.errno = read_errno;
+                        errno = read_errno;
+                        return 0;
+                    },
+                }
+            }
+            if (amt_read == 0) stream.eof = 1;
+            stream.errno = 0;
+            return @as(usize, @intCast(amt_read));
+        }
+    }
+
+    const max_count = switch (builtin.os.tag) {
+        .linux => 0x7ffff000,
+        .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
+        else => std.math.maxInt(isize),
+    };
+    const adjusted_len = @min(max_count, dest.len);
+    const rc = std.posix.system.read(stream.fd, dest.ptr, adjusted_len);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {
+            if (rc == 0) stream.eof = 1;
+            stream.errno = 0;
+            return @as(usize, @intCast(rc));
+        },
+        else => |e| {
+            const read_errno = @intFromEnum(e);
+            stream.errno = read_errno;
+            errno = read_errno;
+            return 0;
+        },
+    }
+}
+
 export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usize {
     if (size == 0) return 0;
     var prefilled: usize = 0;
@@ -1687,55 +1780,29 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
         prefilled += global.readRemainder(stream, ptr[prefilled..size]);
         if (prefilled == size) return prefilled;
     }
-    const remaining = size - prefilled;
-    const dest = ptr + prefilled;
 
-    if (builtin.os.tag == .windows) {
-        const actual_read_len = @as(u32, @intCast(@min(@as(u32, std.math.maxInt(u32)), remaining)));
-        while (true) {
-            var amt_read: u32 = undefined;
-            if (windows.ReadFile(stream.fd.?, dest, actual_read_len, &amt_read, null) == 0) {
-                switch (std.os.windows.GetLastError()) {
-                    .OPERATION_ABORTED => continue,
-                    .BROKEN_PIPE => return prefilled,
-                    .HANDLE_EOF => return prefilled,
-                    else => |err| {
-                        stream.errno = winfd.errnoFromWin32(err);
-                        errno = stream.errno;
-                        return prefilled;
-                    },
-                }
-            }
-            if (amt_read == 0) stream.eof = 1;
-            return prefilled + @as(usize, @intCast(amt_read));
+    while (prefilled < size) {
+        prefilled += drainEntryReadBuffer(entry, ptr[prefilled..size]);
+        if (prefilled == size) break;
+
+        const remaining = size - prefilled;
+        if (remaining >= entry.read_buf.len) {
+            prefilled += readFromStreamFd(stream, ptr[prefilled..][0..remaining]);
+            break;
         }
-    }
 
-    // Prevents EINVAL.
-    const max_count = switch (builtin.os.tag) {
-        .linux => 0x7ffff000,
-        .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
-        else => std.math.maxInt(isize),
-    };
-    const adjusted_len = @min(max_count, remaining);
-
-    const rc = std.posix.system.read(stream.fd, dest, adjusted_len);
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => {
-            if (rc == 0) stream.eof = 1;
-            return prefilled + @as(usize, @intCast(rc));
-        },
-        else => |e| {
-            errno = @intFromEnum(e);
-            return prefilled;
-        },
+        clearEntryReadBuffer(entry);
+        const filled = readFromStreamFd(stream, entry.read_buf[0..]);
+        entry.read_buf_end = filled;
+        if (filled == 0) break;
     }
+    return prefilled;
 }
 
 export fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
     const entry = entryFromFile(stream);
     if (size == 0 or nmemb == 0) return 0;
-    if (stream.eof != 0 and !entry.unread_valid and !global.hasRemainder(stream)) {
+    if (stream.eof != 0 and !entry.unread_valid and entryBufferedReadLen(entry) == 0 and !global.hasRemainder(stream)) {
         return 0;
     }
     const total = size * nmemb;
@@ -1921,9 +1988,13 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
     stream.fd = new_stream.fd;
     stream.eof = 0;
     stream.errno = 0;
-    entryFromFile(stream).unread_valid = false;
+    const stream_entry = entryFromFile(stream);
+    stream_entry.unread_valid = false;
+    clearEntryReadBuffer(stream_entry);
     global.clearRemainder(stream);
-    entryFromFile(new_stream).unread_valid = false;
+    const new_entry = entryFromFile(new_stream);
+    new_entry.unread_valid = false;
+    clearEntryReadBuffer(new_entry);
     if (new_stream != stream) global.releaseFile(new_stream);
     return stream;
 }
@@ -1954,6 +2025,8 @@ export fn fclose(stream: *c.FILE) callconv(.c) c_int {
 export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_int {
     trace.log("fseek {*} offset={} whence={}", .{ stream, offset, whence });
     const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
+    const entry = entryFromFile(stream);
+    const ahead = @as(i64, @intCast(logicalReadAheadLen(stream, entry)));
     const off: i64 = switch (whence) {
         c.SEEK_SET => blk: {
             if (offset < 0) {
@@ -1963,7 +2036,8 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
             }
             break :blk @intCast(offset);
         },
-        c.SEEK_CUR, c.SEEK_END => @intCast(offset),
+        c.SEEK_CUR => @as(i64, @intCast(offset)) - ahead,
+        c.SEEK_END => @intCast(offset),
         else => {
             errno = c.EINVAL;
             stream.errno = errno;
@@ -2000,13 +2074,15 @@ export fn fseek(stream: *c.FILE, offset: c_long, whence: c_int) callconv(.c) c_i
     }
     stream.eof = 0;
     stream.errno = 0;
-    entryFromFile(stream).unread_valid = false;
+    entry.unread_valid = false;
+    clearEntryReadBuffer(entry);
     global.clearRemainder(stream);
     return 0;
 }
 
 export fn ftell(stream: *c.FILE) callconv(.c) c_long {
     const fd: std.posix.fd_t = if (builtin.os.tag == .windows) stream.fd.? else stream.fd;
+    const entry = entryFromFile(stream);
     var offset: i64 = undefined;
     if (builtin.os.tag == .windows) {
         var current: std.os.windows.LARGE_INTEGER = undefined;
@@ -2033,8 +2109,9 @@ export fn ftell(stream: *c.FILE) callconv(.c) c_long {
             return -1;
         }
     }
-    if (entryFromFile(stream).unread_valid and offset > 0) {
-        offset -= 1;
+    const ahead = @as(i64, @intCast(logicalReadAheadLen(stream, entry)));
+    if (ahead > 0) {
+        offset -= ahead;
     }
     if (offset > std.math.maxInt(c_long)) {
         errno = errnoConst("EOVERFLOW", c.ERANGE);
@@ -2855,31 +2932,91 @@ export fn fputs(s: [*:0]const u8, stream: *c.FILE) callconv(.c) c_int {
 }
 
 export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
-    if (stream.eof != 0) return null;
+    if (n <= 0) return null;
+    if (n == 1) {
+        s[0] = 0;
+        return s;
+    }
 
-    // This is intentionally simple and currently reads byte-at-a-time.
+    const entry = entryFromFile(stream);
+    if (stream.eof != 0 and !entry.unread_valid and entryBufferedReadLen(entry) == 0 and !global.hasRemainder(stream)) {
+        return null;
+    }
+
+    if (entry.unread_valid or global.hasRemainder(stream)) {
+        var total_read_fallback: usize = 0;
+        while (true) : (total_read_fallback += 1) {
+            if (total_read_fallback + 1 >= @as(usize, @intCast(n))) {
+                s[total_read_fallback] = 0;
+                return s;
+            }
+            stream.errno = 0;
+            const result = getc(stream);
+            if (result == c.EOF) {
+                if (stream.errno == 0) {
+                    stream.eof = 1;
+                    if (total_read_fallback > 0) {
+                        s[total_read_fallback] = 0;
+                        return s;
+                    }
+                }
+                return null;
+            }
+            s[total_read_fallback] = @as(u8, @intCast(result));
+            if (s[total_read_fallback] == '\n') {
+                s[total_read_fallback + 1] = 0;
+                return s;
+            }
+        }
+    }
+
     var total_read: usize = 0;
-    while (true) : (total_read += 1) {
-        if (total_read + 1 >= n) {
+    const limit = @as(usize, @intCast(n));
+    while (true) {
+        if (total_read + 1 >= limit) {
             s[total_read] = 0;
             return s;
         }
-        stream.errno = 0;
-        const result = getc(stream);
-        if (result == c.EOF) {
-            if (stream.errno == 0) {
-                stream.eof = 1;
-                if (total_read > 0) {
+
+        if (entryBufferedReadLen(entry) == 0) {
+            clearEntryReadBuffer(entry);
+            entry.read_buf_end = readFromStreamFd(stream, entry.read_buf[0..]);
+            if (entry.read_buf_end == 0) {
+                if (stream.errno == 0 and total_read > 0) {
                     s[total_read] = 0;
                     return s;
                 }
+                if (stream.errno == 0) {
+                    stream.eof = 1;
+                }
+                return if (total_read > 0) blk: {
+                    s[total_read] = 0;
+                    break :blk s;
+                } else null;
             }
-            return null;
         }
-        s[total_read] = @as(u8, @intCast(result));
-        if (s[total_read] == '\n') {
-            s[total_read + 1] = 0;
+
+        const pending = entry.read_buf[entry.read_buf_start..entry.read_buf_end];
+        const room = limit - total_read - 1;
+        const copy_len = @min(room, pending.len);
+        const chunk = pending[0..copy_len];
+        if (std.mem.indexOfScalar(u8, chunk, '\n')) |newline_index| {
+            const line_len = newline_index + 1;
+            @memcpy(s[total_read..][0..line_len], chunk[0..line_len]);
+            total_read += line_len;
+            entry.read_buf_start += line_len;
+            if (entry.read_buf_start == entry.read_buf_end) {
+                clearEntryReadBuffer(entry);
+            }
+            s[total_read] = 0;
             return s;
+        }
+
+        @memcpy(s[total_read..][0..copy_len], chunk);
+        total_read += copy_len;
+        entry.read_buf_start += copy_len;
+        if (entry.read_buf_start == entry.read_buf_end) {
+            clearEntryReadBuffer(entry);
         }
     }
 }
