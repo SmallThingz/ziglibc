@@ -542,10 +542,10 @@ export fn getopt(argc: c_int, argv: [*c][*:0]u8, optstring: [*:0]const u8) callc
         optind = 1;
         optchar_index = 1;
     }
-    trace.log("getopt argc={} argv={*} opstring={f} (err={}, ind={}, opt={})", .{
+    trace.log("getopt argc={} argv={*} opstring={*} (err={}, ind={}, opt={})", .{
         argc,
         argv,
-        trace.fmtStr(optstring),
+        optstring,
         opterr,
         optind,
         optopt,
@@ -1214,7 +1214,7 @@ export fn writev(fd: c_int, iov: [*]const c.struct_iovec, iovcnt: c_int) callcon
 // string
 // --------------------------------------------------------------------------------
 export fn strdup(s: [*:0]const u8) callconv(.c) ?[*:0]u8 {
-    trace.log("strdup '{f}'", .{trace.fmtStr(s)});
+    trace.log("strdup '{*}'", .{s});
     const len = c.strlen(s);
     const optional_new_s = @as(?[*]u8, @ptrCast(c.malloc(len + 1)));
     if (optional_new_s) |new_s| {
@@ -1231,7 +1231,7 @@ export fn mkstemp(template: [*:0]u8) callconv(.c) c_int {
 }
 
 export fn mkostemp(template: [*:0]u8, suffixlen: c_int, flags: c_int) callconv(.c) c_int {
-    trace.log("mkstemp '{f}'", .{trace.fmtStr(template)});
+    trace.log("mkstemp '{*}'", .{template});
     const rand_part: *[6]u8 = blk: {
         const len = c.strlen(template);
         if (6 + suffixlen > len) {
@@ -1309,7 +1309,7 @@ export fn fileno(stream: *c.FILE) callconv(.c) c_int {
 }
 
 export fn popen(command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
-    trace.log("popen '{f}' mode='{s}'", .{ trace.fmtStr(command), mode });
+    trace.log("popen '{*}' mode='{*}'", .{ command, mode });
     if (builtin.os.tag == .wasi) {
         c.errno = errnoConst("ENOSYS", c.EINVAL);
         return null;
@@ -1532,7 +1532,7 @@ fn close(fd: c_int) callconv(.c) c_int {
 }
 
 export fn access(path: [*:0]const u8, amode: c_int) callconv(.c) c_int {
-    trace.log("access '{f}' mode=0x{x}", .{ trace.fmtStr(path), amode });
+    trace.log("access '{*}' mode=0x{x}", .{ path, amode });
     if (builtin.os.tag.isDarwin()) {
         const valid_bits = c.R_OK | c.W_OK | c.X_OK;
         if ((amode & ~(valid_bits | c.F_OK)) != 0) {
@@ -1754,7 +1754,7 @@ export fn connect(sockfd: c_int, address: ?*const c.struct_sockaddr, address_len
     }
 }
 
-export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
+export fn getsockname(sockfd: c_int, noalias address: ?*c.struct_sockaddr, noalias address_len: ?*c.socklen_t) callconv(.c) c_int {
     trace.log("getsockname fd={}", .{sockfd});
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
@@ -1809,7 +1809,7 @@ export fn getsockname(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
     }
 }
 
-export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) c_int {
+export fn getpeername(sockfd: c_int, noalias address: ?*c.struct_sockaddr, noalias address_len: ?*c.socklen_t) callconv(.c) c_int {
     trace.log("getpeername fd={}", .{sockfd});
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
@@ -1860,7 +1860,7 @@ export fn getpeername(sockfd: c_int, address: ?*c.struct_sockaddr, address_len: 
     return 0;
 }
 
-export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, option_value: ?*anyopaque, option_len: ?*c.socklen_t) callconv(.c) c_int {
+export fn getsockopt(sockfd: c_int, level: c_int, option_name: c_int, noalias option_value: ?*anyopaque, noalias option_len: ?*c.socklen_t) callconv(.c) c_int {
     trace.log("getsockopt fd={} level={} opt={}", .{ sockfd, level, option_name });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
@@ -2055,7 +2055,7 @@ export fn recv(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int) 
     }
 }
 
-export fn recvfrom(sockfd: c_int, buffer: ?*anyopaque, length: usize, flags: c_int, address: ?*c.struct_sockaddr, address_len: ?*c.socklen_t) callconv(.c) isize {
+export fn recvfrom(sockfd: c_int, noalias buffer: ?*anyopaque, length: usize, flags: c_int, noalias address: ?*c.struct_sockaddr, noalias address_len: ?*c.socklen_t) callconv(.c) isize {
     trace.log("recvfrom fd={} len={} flags={}", .{ sockfd, length, flags });
     const sock = rawSocketFd(sockfd) orelse {
         c.errno = errnoConst("ENOTSOCK", c.EINVAL);
@@ -2660,6 +2660,7 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *c.timespec) callconv(.c) c_int
             }
             tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(tv.tv_sec));
             tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(tv.tv_usec * 1000));
+            c.errno = 0;
             return 0;
         }
 
@@ -2676,6 +2677,7 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *c.timespec) callconv(.c) c_int
             );
             tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(@divFloor(nanos, std.time.ns_per_s)));
             tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(@mod(nanos, std.time.ns_per_s)));
+            c.errno = 0;
             return 0;
         }
 
@@ -2688,6 +2690,7 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *c.timespec) callconv(.c) c_int
             const now = currentWindowsUnixTime();
             tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(now.sec));
             tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(now.nsec));
+            c.errno = 0;
             return 0;
         }
         c.errno = c.EINVAL;
@@ -2700,6 +2703,7 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *c.timespec) callconv(.c) c_int
         .SUCCESS => {
             tp.tv_sec = @as(@TypeOf(tp.tv_sec), @intCast(timespecSec(ts)));
             tp.tv_nsec = @as(@TypeOf(tp.tv_nsec), @intCast(timespecNsec(ts)));
+            c.errno = 0;
             return 0;
         },
         else => |e| {
@@ -2709,7 +2713,7 @@ export fn clock_gettime(clk_id: c.clockid_t, tp: *c.timespec) callconv(.c) c_int
     }
 }
 
-export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {
+export fn gettimeofday(noalias tv: *c.timeval, noalias tz: ?*anyopaque) callconv(.c) c_int {
     trace.log("gettimeofday tv={*} tz={*}", .{ tv, tz });
     if (builtin.os.tag.isDarwin()) {
         // Modern Darwin kernels expose gettimeofday as a 3-argument syscall:
@@ -2725,17 +2729,20 @@ export fn gettimeofday(tv: *c.timeval, tz: ?*anyopaque) callconv(.c) c_int {
             c.errno = darwin.__error().*;
             return -1;
         }
+        c.errno = 0;
         return 0;
     }
     if (builtin.os.tag == .windows) {
         const now = currentWindowsUnixTime();
         tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(now.sec));
         tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(now.usec));
+        c.errno = 0;
         return 0;
     }
     const ns = compat.nanoTimestamp();
     tv.tv_sec = @as(@TypeOf(tv.tv_sec), @intCast(@divFloor(ns, std.time.ns_per_s)));
     tv.tv_usec = @as(@TypeOf(tv.tv_usec), @intCast(@divFloor(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)));
+    c.errno = 0;
     return 0;
 }
 
@@ -2779,7 +2786,7 @@ export fn getitimer(which: c_int, value: *c.itimerval) callconv(.c) c_int {
     return -1;
 }
 
-export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerval) callconv(.c) c_int {
+export fn setitimer(which: c_int, noalias value: *const c.itimerval, noalias avalue: ?*c.itimerval) callconv(.c) c_int {
     trace.log("setitimer which={}", .{which});
     if (which != c.ITIMER_REAL and which != c.ITIMER_VIRTUAL and which != c.ITIMER_PROF) {
         c.errno = c.EINVAL;
@@ -2801,7 +2808,7 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         if (value_ns != 0 and ensureWindowsItimerThread() != 0) return -1;
 
         windows_itimer.mutex.lock();
-        if (!cPtrIsNull(avalue)) avalue.* = windowsCurrentItimerLocked();
+        if (avalue) |old_value| old_value.* = windowsCurrentItimerLocked();
         if (value_ns == 0) {
             windows_itimer.armed = false;
             windows_itimer.deadline_ns = 0;
@@ -2826,7 +2833,7 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
             return -1;
         };
         darwin_itimer.mutex.lock();
-        if (!cPtrIsNull(avalue)) avalue.* = darwin_itimer.value;
+        if (avalue) |old_value| old_value.* = darwin_itimer.value;
         darwin_itimer.value = value.*;
         darwin_itimer.mutex.unlock();
         return 0;
@@ -2844,13 +2851,13 @@ export fn setitimer(which: c_int, value: *const c.itimerval, avalue: *c.itimerva
         .setitimer,
         @as(usize, @bitCast(@as(isize, which))),
         @intFromPtr(&linux_new),
-        if (!cPtrIsNull(avalue)) @intFromPtr(&linux_old) else 0,
+        if (avalue) |_| @intFromPtr(&linux_old) else 0,
     );
     switch (os.errno(rc)) {
         .SUCCESS => {
-            if (!cPtrIsNull(avalue)) {
-                avalue.it_interval = linuxTimevalToC(linux_old.it_interval);
-                avalue.it_value = linuxTimevalToC(linux_old.it_value);
+            if (avalue) |old_value| {
+                old_value.it_interval = linuxTimevalToC(linux_old.it_interval);
+                old_value.it_value = linuxTimevalToC(linux_old.it_value);
             }
             return 0;
         },
@@ -2977,19 +2984,14 @@ const DarwinKernelSigaction = if (builtin.os.tag.isDarwin()) extern struct {
     flags: c_uint,
 } else void;
 
-fn cPtrIsNull(ptr: anytype) bool {
-    return @intFromPtr(ptr) == 0;
-}
-
-export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_sigaction) callconv(.c) c_int {
+export fn sigaction(sig: c_int, noalias act: ?*const c.struct_sigaction, noalias oact: ?*c.struct_sigaction) callconv(.c) c_int {
     trace.log("sigaction sig={}", .{sig});
     if (builtin.os.tag == .windows) {
         return cstd.__zwindows_sigaction(sig, act, oact);
     }
     if (builtin.os.tag.isDarwin()) {
         var native_act = std.mem.zeroes(DarwinKernelSigaction);
-        const native_act_ptr: ?*DarwinKernelSigaction = if (!cPtrIsNull(act)) blk: {
-            const new_act = act;
+        const native_act_ptr: ?*DarwinKernelSigaction = if (act) |new_act| blk: {
             native_act.mask = cSigsetToDarwin(new_act.sa_mask);
             native_act.flags = @as(c_uint, @bitCast(new_act.sa_flags));
             if ((native_act.flags & std.c.SA.SIGINFO) != 0) {
@@ -3007,14 +3009,13 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
         } else null;
 
         var native_old = std.mem.zeroes(std.c.Sigaction);
-        const native_old_ptr: ?*std.c.Sigaction = if (!cPtrIsNull(oact)) &native_old else null;
+        const native_old_ptr: ?*std.c.Sigaction = if (oact != null) &native_old else null;
         const rc = syscall(darwin_syscall.sigaction, darwinSysSigned(sig), native_act_ptr, native_old_ptr);
         if (rc == -1) {
             c.errno = darwin.__error().*;
             return -1;
         }
-        if (!cPtrIsNull(oact)) {
-            const old_act = oact;
+        if (oact) |old_act| {
             old_act.sa_mask = darwinSigsetToC(native_old.mask);
             old_act.sa_flags = @as(c_int, @bitCast(native_old.flags));
             if ((native_old.flags & std.c.SA.SIGINFO) != 0) {
@@ -3047,18 +3048,18 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
     }
 
     var linux_act: std.os.linux.Sigaction = undefined;
-    const linux_act_ptr: ?*std.os.linux.Sigaction = if (!cPtrIsNull(act)) blk: {
-        const new_act = act;
-        const flags_bits: c_uint = @bitCast(new_act.sa_flags);
+    const linux_act_ptr: ?*std.os.linux.Sigaction = if (act) |new_act| blk: {
+        const new_value = new_act.*;
+        const flags_bits: c_uint = @bitCast(new_value.sa_flags);
         linux_act = .{
             .handler = undefined,
-            .mask = cSigsetToLinux(new_act.sa_mask),
+            .mask = cSigsetToLinux(new_value.sa_mask),
             .flags = @as(@TypeOf(@as(std.os.linux.Sigaction, undefined).flags), @intCast(flags_bits)),
         };
         if ((flags_bits & std.os.linux.SA.SIGINFO) != 0) {
-            linux_act.handler = .{ .sigaction = cSigactionToLinux(cSigactionGetSigaction(new_act.*)) };
+            linux_act.handler = .{ .sigaction = cSigactionToLinux(cSigactionGetSigaction(new_value)) };
         } else {
-            linux_act.handler = .{ .handler = cHandlerToLinux(cSigactionGetHandler(new_act.*)) };
+            linux_act.handler = .{ .handler = cHandlerToLinux(cSigactionGetHandler(new_value)) };
         }
         break :blk &linux_act;
     } else null;
@@ -3067,12 +3068,11 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
     const rc = std.os.linux.sigaction(
         @as(std.os.linux.SIG, @enumFromInt(sig)),
         linux_act_ptr,
-        if (!cPtrIsNull(oact)) &linux_old else null,
+        if (oact != null) &linux_old else null,
     );
     switch (os.errno(rc)) {
         .SUCCESS => {
-            if (!cPtrIsNull(oact)) {
-                const old_act = oact;
+            if (oact) |old_act| {
                 const old_flags_bits: c_uint = @truncate(@as(usize, @intCast(linux_old.flags)));
                 old_act.sa_flags = @as(c_int, @bitCast(old_flags_bits));
                 old_act.sa_mask = linuxSigsetToC(linux_old.mask);
@@ -3100,7 +3100,7 @@ export fn sigaction(sig: c_int, act: *const c.struct_sigaction, oact: *c.struct_
 // --------------------------------------------------------------------------------
 // sys/stat.h
 // --------------------------------------------------------------------------------
-export fn stat(path: [*:0]const u8, buf: *c.struct_stat) callconv(.c) c_int {
+export fn stat(noalias path: [*:0]const u8, noalias buf: *c.struct_stat) callconv(.c) c_int {
     if (builtin.os.tag == .windows) {
         const fd = zopenRaw(path, c.O_RDONLY, 0);
         if (fd < 0) return -1;
@@ -3672,7 +3672,7 @@ export fn pthread_mutex_unlock(mutex: *c.pthread_mutex_t) callconv(.c) c_int {
     return 0;
 }
 
-export fn pthread_cond_init(cond: *c.pthread_cond_t, attr: ?*const c.pthread_condattr_t) callconv(.c) c_int {
+export fn pthread_cond_init(noalias cond: *c.pthread_cond_t, noalias attr: ?*const c.pthread_condattr_t) callconv(.c) c_int {
     trace.log("pthread_cond_init {*}", .{cond});
     _ = attr;
     if (condEntryFor(cond, true) == null) return errnoConst("ENOMEM", c.EINVAL);
@@ -3691,7 +3691,7 @@ export fn pthread_cond_destroy(cond: *c.pthread_cond_t) callconv(.c) c_int {
     return 0;
 }
 
-export fn pthread_cond_wait(cond: *c.pthread_cond_t, mutex: *c.pthread_mutex_t) callconv(.c) c_int {
+export fn pthread_cond_wait(noalias cond: *c.pthread_cond_t, noalias mutex: *c.pthread_mutex_t) callconv(.c) c_int {
     trace.log("pthread_cond_wait cond={*} mutex={*}", .{ cond, mutex });
     const cond_entry = condEntryFor(cond, true) orelse return errnoConst("ENOMEM", c.EINVAL);
     const target_seq = cond_entry.seq.load(.acquire);
@@ -3721,7 +3721,7 @@ export fn pthread_cond_signal(cond: *c.pthread_cond_t) callconv(.c) c_int {
 // libgen
 // --------------------------------------------------------------------------------
 export fn basename(path: ?[*:0]u8) callconv(.c) [*:0]u8 {
-    trace.log("basename {f}", .{trace.fmtStr(path)});
+    trace.log("basename {*}", .{path});
     const buf = path orelse return @as([*:0]u8, @ptrFromInt(@intFromPtr(".")));
     if (buf[0] == 0) return @as([*:0]u8, @ptrFromInt(@intFromPtr(".")));
 
@@ -3790,7 +3790,7 @@ export fn tcsetattr(
 // strings
 // --------------------------------------------------------------------------------
 export fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
-    trace.log("strcasecmp {f} {f}", .{ trace.fmtStr(a), trace.fmtStr(b) });
+    trace.log("strcasecmp {*} {*}", .{ a, b });
     var i: usize = 0;
     while (true) : (i += 1) {
         const a_ch = std.ascii.toLower(a[i]);
@@ -3979,10 +3979,10 @@ fn windowsSelectScanSet(comptime mode: WindowsSelectMode, nfds: c_int, fdset: *c
 
 export fn select(
     nfds: c_int,
-    readfds: ?*c.fd_set,
-    writefds: ?*c.fd_set,
-    errorfds: ?*c.fd_set,
-    timeout: ?*c.timeval,
+    noalias readfds: ?*c.fd_set,
+    noalias writefds: ?*c.fd_set,
+    noalias errorfds: ?*c.fd_set,
+    noalias timeout: ?*c.timeval,
 ) c_int {
     if (nfds < 0) {
         c.errno = c.EINVAL;
@@ -4129,11 +4129,11 @@ export fn select(
 
 export fn pselect(
     nfds: c_int,
-    readfds: ?*c.fd_set,
-    writefds: ?*c.fd_set,
-    errorfds: ?*c.fd_set,
-    timeout: ?*const c.timespec,
-    sigmask: ?*const c.sigset_t,
+    noalias readfds: ?*c.fd_set,
+    noalias writefds: ?*c.fd_set,
+    noalias errorfds: ?*c.fd_set,
+    noalias timeout: ?*const c.timespec,
+    noalias sigmask: ?*const c.sigset_t,
 ) c_int {
     if (nfds < 0) {
         c.errno = c.EINVAL;

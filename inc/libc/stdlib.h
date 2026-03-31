@@ -10,6 +10,7 @@
 #endif
 
 #include "private/null.h"
+#include "private/restrict.h"
 #include "private/size_t.h"
 #include "private/wchar_t.h"
 
@@ -19,9 +20,9 @@ typedef struct { long quot, rem; } ldiv_t;
 double atof(const char *nptr);
 int atoi(const char *nptr);
 long int atol(const char *nptr);
-double strtod(const char *nptr, char **endptr);
-long int strtol(const char *nptr, char **endptr, int base);
-unsigned long int strtoul(const char *nptr, char **endptr, int base);
+double strtod(const char *__zrestrict nptr, char **__zrestrict endptr);
+long int strtol(const char *__zrestrict nptr, char **__zrestrict endptr, int base);
+unsigned long int strtoul(const char *__zrestrict nptr, char **__zrestrict endptr, int base);
 int rand(void);
 void srand(unsigned int seed);
 void *calloc(size_t nmemb, size_t size);

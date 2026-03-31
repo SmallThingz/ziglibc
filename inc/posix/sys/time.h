@@ -5,6 +5,7 @@
 #include "../private/fd_set.h"
 
 #include "../../libc/private/time_t.h"
+#include "../../libc/private/restrict.h"
 #include "../private/timeval.h"
 
 #define ITIMER_REAL 0
@@ -17,10 +18,9 @@ struct itimerval {
 };
 
 int getitimer(int, struct itimerval *);
-int setitimer(int, const struct itimerval *, struct itimerval *);
-int gettimeofday(struct timeval *, void *);
-int select(int, fd_set *, fd_set *, fd_set *, struct timeval *);
+int setitimer(int, const struct itimerval *__zrestrict, struct itimerval *__zrestrict);
+int gettimeofday(struct timeval *__zrestrict, void *__zrestrict);
+int select(int, fd_set *__zrestrict, fd_set *__zrestrict, fd_set *__zrestrict, struct timeval *__zrestrict);
 int utimes(const char *, const struct timeval [2]);
 
 #endif /* _SYS_TIME_H */
-

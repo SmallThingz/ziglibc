@@ -21,12 +21,12 @@ export fn argp_usage(state: *const c.argp_state) callconv(.c) void {
 }
 
 export fn argp_parse(
-    argp: *c.argp,
+    noalias argp: *c.argp,
     argc: c_int,
-    argv: [*:null]?[*:0]u8,
+    noalias argv: [*:null]?[*:0]u8,
     flags: c_uint,
-    arg_index: *c_int,
-    input: *anyopaque,
+    noalias arg_index: *c_int,
+    noalias input: *anyopaque,
 ) callconv(.c) c.error_t {
     const parser = argp.parser orelse {
         arg_index.* = 0;
@@ -81,10 +81,10 @@ fn dupCString(slice: []const u8) ?[*:0]u8 {
 }
 
 export fn glob(
-    pattern: [*:0]const u8,
+    noalias pattern: [*:0]const u8,
     flags: c_int,
     errfunc: ?*const fn ([*:0]const u8, c_int) callconv(.c) c_int,
-    pglob: *c.glob_t,
+    noalias pglob: *c.glob_t,
 ) callconv(.c) c_int {
     _ = flags;
     _ = errfunc;

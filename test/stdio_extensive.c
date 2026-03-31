@@ -128,8 +128,12 @@ int main(int argc, char *argv[])
 
   {
     char tmp_name[L_tmpnam];
+    char *tmp_auto;
     expect(tmpnam(tmp_name) == tmp_name);
     expect(tmp_name[0] != 0);
+    tmp_auto = tmpnam(NULL);
+    expect(tmp_auto != NULL);
+    expect(tmp_auto[0] != 0);
   }
 
   {

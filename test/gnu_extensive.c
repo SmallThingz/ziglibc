@@ -50,6 +50,8 @@ int main(int argc, char *argv[])
   (void)argc;
   (void)argv;
 
+  expect(ARGP_ERR_UNKNOWN == E2BIG);
+
   {
     GNU_MARK("gnu:1");
     struct argp a = {0};

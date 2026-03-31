@@ -376,6 +376,27 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_step.step);
     }
     {
+        const exe = addTest("getauxval_extensive", b, target, optimize, libc_only_std_static, zig_start);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
+        const exe = addExecutableCompat(b, .{
+            .name = "zig_process_extensive",
+            .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "zig_process_extensive.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        linkLibraryCompat(exe, libc_only_std_static);
+        const run_step = addRunArtifactCompat(b, exe);
+        run_step.addArg("alpha");
+        run_step.addArg("beta");
+        run_step.setEnvironmentVariable("ZIGLIBC_PROCESS_CHECK", "1");
+        run_step.addCheck(.{ .expect_stdout_exact = "Success!\n" });
+        test_step.dependOn(&run_step.step);
+    }
+    {
         const exe = addExecutableCompat(b, .{
             .name = "pthread_extensive",
             .root_source_file = lazyPath(b, "test" ++ std.fs.path.sep_str ++ "pthread_extensive.zig"),

@@ -4,6 +4,7 @@
 #include "private/null.h"
 #include "private/size_t.h"
 #include "private/valist.h"
+#include "private/restrict.h"
 
 #define _IOFBF 0
 #define _IOLBF 1
@@ -47,20 +48,20 @@ FILE *fopen64(const char *filename, const char *mode);
 FILE *freopen(const char *filename, const char *mode, FILE *stream);
 void setbuf(FILE *stream, char *buf);
 int setvbuf(FILE *stream, char *buf, int mode, size_t size);
-int fprintf(FILE *stream, const char *format, ...);
-int fscanf(FILE *stream, const char *format, ...);
-int printf(const char *format, ...);
-int scanf(const char *format, ...);
-int sprintf(char *s, const char *format, ...);
-int sscanf(const char *s, const char *format, ...);
-int vfprintf(FILE *stream, const char *format, va_list arg);
-int vprintf(const char *format, va_list arg);
-int vsprintf(char *s, const char *format, va_list arg);
-int vsscanf(const char *s, const char *format, va_list arg);
+int fprintf(FILE *__zrestrict stream, const char *__zrestrict format, ...);
+int fscanf(FILE *__zrestrict stream, const char *__zrestrict format, ...);
+int printf(const char *__zrestrict format, ...);
+int scanf(const char *__zrestrict format, ...);
+int sprintf(char *__zrestrict s, const char *__zrestrict format, ...);
+int sscanf(const char *__zrestrict s, const char *__zrestrict format, ...);
+int vfprintf(FILE *__zrestrict stream, const char *__zrestrict format, va_list arg);
+int vprintf(const char *__zrestrict format, va_list arg);
+int vsprintf(char *__zrestrict s, const char *__zrestrict format, va_list arg);
+int vsscanf(const char *__zrestrict s, const char *__zrestrict format, va_list arg);
 int fgetc(FILE *stream);
-char *fgets(char *s, int n, FILE *stream);
+char *fgets(char *__zrestrict s, int n, FILE *__zrestrict stream);
 int fputc(int c, FILE *stream);
-int fputs(const char *s, FILE *stream);
+int fputs(const char *__zrestrict s, FILE *__zrestrict stream);
 int getc(FILE *stream);
 int getchar(void);
 char *gets(char *s);
@@ -68,8 +69,8 @@ int putc(int c, FILE *stream);
 int putchar(int c);
 int puts(const char *s);
 int ungetc(int c, FILE *stream);
-size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
-size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+size_t fread(void *__zrestrict ptr, size_t size, size_t nmemb, FILE *__zrestrict stream);
+size_t fwrite(const void *__zrestrict ptr, size_t size, size_t nmemb, FILE *__zrestrict stream);
 int fgetpos(FILE *stream, fpos_t *pos);
 int fseek(FILE *stream, long int offset, int whence);
 int fsetpos(FILE *stream, const fpos_t *pos);
@@ -81,8 +82,8 @@ int ferror(FILE *stream);
 void perror(const char *s);
 
 #if __STDC_VERSION__ >= 199901L
-    int snprintf(char * restrict s, size_t n, const char * restrict format, ...);
-    int vsnprintf(char *restrict s, size_t n, const char * restrict format, va_list arg);
+    int snprintf(char *__zrestrict s, size_t n, const char *__zrestrict format, ...);
+    int vsnprintf(char *__zrestrict s, size_t n, const char *__zrestrict format, va_list arg);
 #endif
 
 // NOTE: this stuff is defined by POSIX, not libc, but they need

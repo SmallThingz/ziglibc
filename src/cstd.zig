@@ -334,11 +334,14 @@ export fn abort() callconv(.c) noreturn {
     compat.abort();
 }
 
-export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
-    trace.log("getenv {f}", .{trace.fmtStr(name)});
-    const key = std.mem.span(name);
-    if (key.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, key, '=') != null) return null;
+fn getenvImpl(name: [*:0]const u8) ?[*:0]u8 {
+    trace.log("getenv {*}", .{name});
+    const key_len = sentinelLenVol(name);
+    if (key_len == 0) return null;
+    var key_index: usize = 0;
+    while (key_index < key_len) : (key_index += 1) {
+        if (name[key_index] == '=') return null;
+    }
     if (builtin.os.tag == .wasi) return null;
 
     if (builtin.os.tag == .windows) {
@@ -361,8 +364,8 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
             const begin = i;
             while (i < src_len and src[i] != 0) : (i += 1) {}
             const line = src[begin..i];
-            if (line.len > key.len and line[key.len] == '=' and std.mem.eql(u8, line[0..key.len], key)) {
-                const value = line[key.len + 1 ..];
+            if (line.len > key_len and line[key_len] == '=' and std.mem.eql(u8, line[0..key_len], name[0..key_len])) {
+                const value = line[key_len + 1 ..];
                 if (value.len >= global.getenv_tmp.len) return null;
                 @memcpy(global.getenv_tmp[0..value.len], value);
                 global.getenv_tmp[value.len] = 0;
@@ -377,9 +380,9 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
         const envp = _NSGetEnviron().*;
         var i: usize = 0;
         while (envp[i]) |entry| : (i += 1) {
-            const line = std.mem.span(entry);
-            if (line.len > key.len and line[key.len] == '=' and std.mem.eql(u8, line[0..key.len], key)) {
-                const value = line[key.len + 1 ..];
+            const line = sentinelSliceVol(entry);
+            if (line.len > key_len and line[key_len] == '=' and std.mem.eql(u8, line[0..key_len], name[0..key_len])) {
+                const value = line[key_len + 1 ..];
                 if (value.len >= global.getenv_tmp.len) return null;
                 @memcpy(global.getenv_tmp[0..value.len], value);
                 global.getenv_tmp[value.len] = 0;
@@ -389,6 +392,80 @@ export fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     }
 
     return null;
+}
+noinline fn zgetenv(name: [*:0]const u8) callconv(.c) ?[*:0]u8 {
+    return @call(.never_inline, getenvImpl, .{name});
+}
+
+comptime {
+    @export(&zgetenv, .{ .name = "getenv" });
+}
+
+export fn getauxval(kind: c_ulong) callconv(.c) c_ulong {
+    if (builtin.os.tag != .linux) {
+        errno = errnoConst("ENOSYS", c.ENOSYS);
+        return 0;
+    }
+
+    const openat_sym = if (@hasDecl(std.posix.system, "openat64"))
+        std.posix.system.openat64
+    else
+        std.posix.system.openat;
+    const fd_rc = openat_sym(c.AT_FDCWD, "/proc/self/auxv", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = switch (std.posix.errno(fd_rc)) {
+        .SUCCESS => @as(std.posix.fd_t, @intCast(fd_rc)),
+        else => |e| {
+            errno = @intFromEnum(e);
+            return 0;
+        },
+    };
+    defer _ = std.posix.system.close(fd);
+
+    var buf: [1024]u8 align(@alignOf(c_ulong)) = undefined;
+    const word_size = @sizeOf(c_ulong);
+    const entry_size = word_size * 2;
+    const endian = builtin.cpu.arch.endian();
+    var carry_len: usize = 0;
+    var found_end = false;
+
+    while (!found_end) {
+        const read_rc = std.posix.system.read(fd, buf[carry_len..].ptr, buf.len - carry_len);
+        const n = switch (std.posix.errno(read_rc)) {
+            .SUCCESS => @as(usize, @intCast(read_rc)),
+            .INTR => continue,
+            else => |e| {
+                errno = @intFromEnum(e);
+                return 0;
+            },
+        };
+        if (n == 0) break;
+
+        const total_len = carry_len + n;
+        var offset: usize = 0;
+        while (offset + entry_size <= total_len) : (offset += entry_size) {
+            const entry_kind = std.mem.readInt(c_ulong, buf[offset..][0..word_size], endian);
+            const entry_value = std.mem.readInt(c_ulong, buf[offset + word_size ..][0..word_size], endian);
+            if (entry_kind == std.elf.AT_NULL) {
+                found_end = true;
+                carry_len = 0;
+                break;
+            }
+            if (entry_kind == kind) {
+                return entry_value;
+            }
+        }
+
+        if (found_end) break;
+        carry_len = total_len - offset;
+        std.mem.copyForwards(u8, buf[0..carry_len], buf[offset..][0..carry_len]);
+    }
+    if (carry_len != 0) {
+        errno = errnoConst("EIO", c.EINVAL);
+        return 0;
+    }
+
+    errno = errnoConst("ENOENT", c.EINVAL);
+    return 0;
 }
 
 fn signalName(sig: c_int) ?[]const u8 {
@@ -426,7 +503,7 @@ export fn strsignal(sig: c_int) callconv(.c) [*:0]u8 {
 }
 
 export fn system(string: ?[*:0]const u8) callconv(.c) c_int {
-    trace.log("system {f}", .{trace.fmtStr(string)});
+    trace.log("system {*}", .{string});
     if (builtin.os.tag == .windows) {
         if (string == null) {
             return if (winproc.hasShell()) 1 else 0;
@@ -760,27 +837,30 @@ fn loadWord(ptr: [*]const u8) usize {
     return (@as(*align(1) const usize, @ptrCast(ptr))).*;
 }
 
+fn loadByteVolatile(ptr: [*]const u8) u8 {
+    return (@as(*align(1) const volatile u8, @ptrCast(ptr))).*;
+}
+
+fn sentinelLenVol(s: [*:0]const u8) usize {
+    var len: usize = 0;
+    while (loadByteVolatile(@ptrCast(s + len)) != 0) : (len += 1) {}
+    return len;
+}
+
+fn sentinelSliceVol(s: [*:0]const u8) []const u8 {
+    return s[0..sentinelLenVol(s)];
+}
+
 fn cCharByte(char: c_int) u8 {
     return @as(u8, @truncate(@as(c_uint, @bitCast(char))));
 }
 
 fn findScalarOrZeroChunked(s: [*:0]const u8, needle: u8) ?[*:0]const u8 {
-    var ptr: [*]const u8 = @ptrCast(s);
-    while ((@intFromPtr(ptr) & (word_bytes - 1)) != 0) : (ptr += 1) {
-        if (ptr[0] == needle) return @ptrCast(ptr);
-        if (ptr[0] == 0) return null;
-    }
-
-    const mask = repeatedByte(needle);
-    while (true) : (ptr += word_bytes) {
-        const word = loadWord(ptr);
-        if (hasZeroByte(word ^ mask) or hasZeroByte(word)) {
-            var i: usize = 0;
-            while (i < word_bytes) : (i += 1) {
-                if (ptr[i] == needle) return @ptrCast(ptr + i);
-                if (ptr[i] == 0) return null;
-            }
-        }
+    var ptr = s;
+    while (true) : (ptr += 1) {
+        const byte = loadByteVolatile(@ptrCast(ptr));
+        if (byte == needle) return ptr;
+        if (byte == 0) return null;
     }
 }
 
@@ -817,11 +897,14 @@ fn findScalarChunked(s: [*]const u8, n: usize, needle: u8) ?[*]const u8 {
 // --------------------------------------------------------------------------------
 // string
 // --------------------------------------------------------------------------------
-export fn strlen(s: [*:0]const u8) callconv(.c) usize {
-    trace.log("strlen {f}", .{trace.fmtStr(s)});
-    const result = std.mem.len(s);
+fn strlenImpl(s: [*:0]const u8) usize {
+    trace.log("strlen {*}", .{s});
+    const result = sentinelLenVol(s);
     trace.log("strlen return {}", .{result});
     return result;
+}
+noinline fn zstrlen(s: [*:0]const u8) callconv(.c) usize {
+    return @call(.never_inline, strlenImpl, .{s});
 }
 // Keep `strnlen` here for now even though some platforms expose it through POSIX.
 fn strnlen(s: [*:0]const u8, max_len: usize) usize {
@@ -833,7 +916,7 @@ fn strnlen(s: [*:0]const u8, max_len: usize) usize {
 }
 
 export fn strcmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
-    trace.log("strcmp {f} {f}", .{ trace.fmtStr(a), trace.fmtStr(b) });
+    trace.log("strcmp {*} {*}", .{ a, b });
     var a_next = a;
     var b_next = b;
     while (a_next[0] == b_next[0] and a_next[0] != 0) {
@@ -859,14 +942,20 @@ export fn strcoll(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) c_int {
     return strcmp(s1, s2);
 }
 
-export fn strxfrm(s1: ?[*]u8, s2: [*:0]const u8, n: usize) callconv(.c) usize {
-    const len = strlen(s2);
+fn strxfrmImpl(s1: ?[*]u8, s2: [*:0]const u8, n: usize) usize {
+    const len = strlenImpl(s2);
     if (s1 != null and n != 0) {
         const copy_len = @min(len, n - 1);
-        @memcpy(s1.?[0..copy_len], s2[0..copy_len]);
+        var i: usize = 0;
+        while (i < copy_len) : (i += 1) {
+            s1.?[i] = s2[i];
+        }
         s1.?[copy_len] = 0;
     }
     return len;
+}
+noinline fn zstrxfrm(noalias s1: ?[*]u8, noalias s2: [*:0]const u8, n: usize) callconv(.c) usize {
+    return @call(.never_inline, strxfrmImpl, .{ s1, s2, n });
 }
 
 export fn strncasecmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c) c_int {
@@ -882,9 +971,9 @@ export fn strncasecmp(a: [*:0]const u8, b: [*:0]const u8, n: usize) callconv(.c)
 }
 
 export fn strchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
-    trace.log("strchr {f} c='{}'", .{ trace.fmtStr(s), char });
+    trace.log("strchr {*} c='{}'", .{ s, char });
     const target = cCharByte(char);
-    if (target == 0) return s + strlen(s);
+    if (target == 0) return s + strlenImpl(s);
     return findScalarOrZeroChunked(s, target);
 }
 export fn memchr(s: [*]const u8, char: c_int, n: usize) callconv(.c) ?[*]const u8 {
@@ -892,21 +981,24 @@ export fn memchr(s: [*]const u8, char: c_int, n: usize) callconv(.c) ?[*]const u
     return findScalarChunked(s, n, cCharByte(char));
 }
 
-export fn strrchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
-    trace.log("strrchr {f} c='{}'", .{ trace.fmtStr(s), char });
+fn strrchrImpl(s: [*:0]const u8, char: c_int) ?[*:0]const u8 {
+    trace.log("strrchr {*} c='{}'", .{ s, char });
     const target = cCharByte(char);
-    var next = s + strlen(s);
+    var next = s + strlenImpl(s);
     while (true) {
         if (next[0] == target) return next;
         if (next == s) return null;
         next = next - 1;
     }
 }
+noinline fn zstrrchr(s: [*:0]const u8, char: c_int) callconv(.c) ?[*:0]const u8 {
+    return @call(.never_inline, strrchrImpl, .{ s, char });
+}
 
-export fn strstr(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) ?[*:0]const u8 {
-    trace.log("strstr {f} {f}", .{ trace.fmtStr(s1), trace.fmtStr(s2) });
-    const s1_len = strlen(s1);
-    const s2_len = strlen(s2);
+fn strstrImpl(s1: [*:0]const u8, s2: [*:0]const u8) ?[*:0]const u8 {
+    trace.log("strstr {*} {*}", .{ s1, s2 });
+    const s1_len = strlenImpl(s1);
+    const s2_len = strlenImpl(s2);
     var i: usize = 0;
     while (i + s2_len <= s1_len) : (i += 1) {
         const search = s1 + i;
@@ -914,15 +1006,25 @@ export fn strstr(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) ?[*:0]const 
     }
     return null;
 }
-
-export fn strcpy(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
-    trace.log("strcpy {*} {*}", .{ s1, s2 });
-    @memcpy(s1[0 .. std.mem.len(s2) + 1], s2);
-    return @as([*:0]u8, @ptrCast(s1));
+noinline fn zstrstr(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) ?[*:0]const u8 {
+    return @call(.never_inline, strstrImpl, .{ s1, s2 });
 }
 
-export fn strcat(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
-    trace.log("strcat {*} {f}", .{ s1, trace.fmtStr(s2) });
+fn strcpyImpl(s1: [*]u8, s2: [*:0]const u8) [*:0]u8 {
+    trace.log("strcpy {*} {*}", .{ s1, s2 });
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        s1[i] = s2[i];
+        if (s2[i] == 0) break;
+    }
+    return @as([*:0]u8, @ptrCast(s1));
+}
+noinline fn zstrcpy(noalias s1: [*]u8, noalias s2: [*:0]const u8) callconv(.c) [*:0]u8 {
+    return @call(.never_inline, strcpyImpl, .{ s1, s2 });
+}
+
+export fn strcat(noalias s1: [*]u8, noalias s2: [*:0]const u8) callconv(.c) [*:0]u8 {
+    trace.log("strcat {*} {*}", .{ s1, s2 });
     var i: usize = 0;
     while (s1[i] != 0) : (i += 1) {}
     const len = std.mem.len(s2);
@@ -931,8 +1033,8 @@ export fn strcat(s1: [*]u8, s2: [*:0]const u8) callconv(.c) [*:0]u8 {
 }
 
 // `strncpy` is part of the ISO C string API.
-export fn strncpy(s1: [*]u8, s2: [*:0]const u8, n: usize) callconv(.c) [*]u8 {
-    trace.log("strncpy {*} {f} n={}", .{ s1, trace.fmtStr(s2), n });
+export fn strncpy(noalias s1: [*]u8, noalias s2: [*:0]const u8, n: usize) callconv(.c) [*]u8 {
+    trace.log("strncpy {*} {*} n={}", .{ s1, s2, n });
     const len = strnlen(s2, n);
     @memcpy(s1[0..len], s2);
     @memset(s1[len..][0 .. n - len], 0);
@@ -950,14 +1052,14 @@ export fn strlcpy(dst: ?[*]u8, src: [*:0]const u8, size: usize) callconv(.c) usi
     // `dst`. Using a non-null Zig pointer here lets the backend assume the
     // pointer is always valid, which can turn this libc edge case into
     // target-specific crashes that only show up on some ABIs/backends.
-    if (size == 0) return strlen(src);
+    if (size == 0) return strlenImpl(src);
     const out = dst.?;
     var i: usize = 0;
     while (true) : (i += 1) {
         if (i == size) {
             if (size > 0)
                 out[size - 1] = 0;
-            return i + strlen(src + i);
+            return i + strlenImpl(src + i);
         }
         out[i] = src[i];
         if (src[i] == 0) {
@@ -966,15 +1068,15 @@ export fn strlcpy(dst: ?[*]u8, src: [*:0]const u8, size: usize) callconv(.c) usi
     }
 }
 export fn strlcat(dst: [*:0]u8, src: [*:0]const u8, size: usize) callconv(.c) usize {
-    trace.log("strlcat {f} {f} n={}", .{ trace.fmtStr(dst), trace.fmtStr(src), size });
+    trace.log("strlcat {*} {*} n={}", .{ dst, src, size });
     const dst_len = strnlen(dst, size);
-    if (dst_len == size) return dst_len + strlen(src);
+    if (dst_len == size) return dst_len + strlenImpl(src);
     return dst_len + strlcpy(dst + dst_len, src, size - dst_len);
 }
 
-export fn strncat(s1: [*:0]u8, s2: [*:0]const u8, n: usize) callconv(.c) [*:0]u8 {
-    trace.log("strncat {f} {f} n={}", .{ trace.fmtStr(s1), trace.fmtStr(s2), n });
-    const dest = s1 + strlen(s1);
+fn strncatImpl(s1: [*:0]u8, s2: [*:0]const u8, n: usize) [*:0]u8 {
+    trace.log("strncat {*} {*} n={}", .{ s1, s2, n });
+    const dest = s1 + strlenImpl(s1);
     var i: usize = 0;
     while (s2[i] != 0 and i < n) : (i += 1) {
         dest[i] = s2[i];
@@ -982,9 +1084,21 @@ export fn strncat(s1: [*:0]u8, s2: [*:0]const u8, n: usize) callconv(.c) [*:0]u8
     dest[i] = 0;
     return s1;
 }
+noinline fn zstrncat(noalias s1: [*:0]u8, noalias s2: [*:0]const u8, n: usize) callconv(.c) [*:0]u8 {
+    return @call(.never_inline, strncatImpl, .{ s1, s2, n });
+}
+
+comptime {
+    @export(&zstrlen, .{ .name = "strlen" });
+    @export(&zstrxfrm, .{ .name = "strxfrm" });
+    @export(&zstrrchr, .{ .name = "strrchr" });
+    @export(&zstrstr, .{ .name = "strstr" });
+    @export(&zstrcpy, .{ .name = "strcpy" });
+    @export(&zstrncat, .{ .name = "strncat" });
+}
 
 export fn strspn(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) usize {
-    trace.log("strspn {f} {f}", .{ trace.fmtStr(s1), trace.fmtStr(s2) });
+    trace.log("strspn {*} {*}", .{ s1, s2 });
     var spn: usize = 0;
     while (true) : (spn += 1) {
         if (s1[spn] == 0 or null == strchr(s2, s1[spn])) return spn;
@@ -992,7 +1106,7 @@ export fn strspn(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) usize {
 }
 
 export fn strcspn(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) usize {
-    trace.log("strcspn {f} {f}", .{ trace.fmtStr(s1), trace.fmtStr(s2) });
+    trace.log("strcspn {*} {*}", .{ s1, s2 });
     var spn: usize = 0;
     while (true) : (spn += 1) {
         if (s1[spn] == 0 or null != strchr(s2, s1[spn])) return spn;
@@ -1000,20 +1114,21 @@ export fn strcspn(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) usize {
 }
 
 export fn strpbrk(s1: [*:0]const u8, s2: [*:0]const u8) callconv(.c) ?[*]const u8 {
-    trace.log("strpbrk {f} {f}", .{ trace.fmtStr(s1), trace.fmtStr(s2) });
+    trace.log("strpbrk {*} {*}", .{ s1, s2 });
     var next = s1;
     while (true) : (next += 1) {
-        if (next[0] == 0) return null;
-        if (strchr(s2, next[0]) != null) return next;
+        const byte = loadByteVolatile(@ptrCast(next));
+        if (byte == 0) return null;
+        if (strchr(s2, byte) != null) return next;
     }
 }
 
-export fn strtok(s1: ?[*:0]u8, s2: [*:0]const u8) callconv(.c) ?[*:0]u8 {
+export fn strtok(noalias s1: ?[*:0]u8, noalias s2: [*:0]const u8) callconv(.c) ?[*:0]u8 {
     if (s1 != null) {
-        trace.log("strtok {f} {f}", .{ trace.fmtStr(s1.?), trace.fmtStr(s2) });
+        trace.log("strtok {*} {*}", .{ s1.?, s2 });
         global.strtok_ptr = s1;
     } else {
-        trace.log("strtok NULL {f}", .{trace.fmtStr(s2)});
+        trace.log("strtok NULL {*}", .{s2});
     }
     var next = global.strtok_ptr.?;
     next += strspn(next, s2);
@@ -1140,7 +1255,7 @@ fn strto(comptime T: type, str: [*:0]const u8, optional_endptr: [*c][*:0]const u
 
 fn _zstrtod(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque) callconv(.c) f64 {
     const endptr: [*c][*:0]const u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
-    trace.log("strtod {f}", .{trace.fmtStr(nptr)});
+    trace.log("strtod {*}", .{nptr});
     var i: usize = 0;
     while (isWhitespaceByte(nptr[i])) : (i += 1) {}
     const token_start = i;
@@ -1186,25 +1301,25 @@ fn _zstrtod(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque) callconv(.c) f64
 
 fn _zstrtol(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_long {
     const endptr: [*c][*:0]const u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
-    trace.log("strtol {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
+    trace.log("strtol {*} endptr={*} base={}", .{ nptr, endptr, base });
     return strto(c_long, nptr, endptr, base);
 }
 
 fn _zstrtoll(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_longlong {
     const endptr: [*c][*:0]const u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
-    trace.log("strtoll {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
+    trace.log("strtoll {*} endptr={*} base={}", .{ nptr, endptr, base });
     return strto(c_longlong, nptr, endptr, base);
 }
 
 fn _zstrtoul(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_ulong {
     const endptr: [*c][*:0]u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
-    trace.log("strtoul {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
+    trace.log("strtoul {*} endptr={*} base={}", .{ nptr, endptr, base });
     return strto(c_ulong, nptr, @ptrCast(endptr), base);
 }
 
 fn _zstrtoull(nptr: [*:0]const u8, endptr_ptr: ?*const anyopaque, base: c_int) callconv(.c) c_ulonglong {
     const endptr: [*c][*:0]u8 = if (endptr_ptr) |ptr| @ptrCast(@alignCast(@constCast(ptr))) else null;
-    trace.log("strtoull {f} endptr={*} base={}", .{ trace.fmtStr(nptr), endptr, base });
+    trace.log("strtoull {*} endptr={*} base={}", .{ nptr, endptr, base });
     return strto(c_ulonglong, nptr, @ptrCast(endptr), base);
 }
 
@@ -1412,6 +1527,7 @@ const global = struct {
     var remainder_states: std.AutoHashMapUnmanaged(usize, RemainderState) = .empty;
     var remainder_mutex = compat.Mutex{};
     var tmpnam_counter: u32 = 0;
+    var tmpnam_storage: [c.L_tmpnam]u8 = [_]u8{0} ** c.L_tmpnam;
     var tmpfile_counter: u32 = 0;
 
     fn resetReservedEntry(entry: *FileEntry) *c.FILE {
@@ -1611,12 +1727,12 @@ export fn __zreserveFile() callconv(.c) ?*c.FILE {
 }
 
 export fn remove(filename: [*:0]const u8) callconv(.c) c_int {
-    trace.log("remove {f}", .{trace.fmtStr(filename)});
+    trace.log("remove {*}", .{filename});
     return zunlinkCompat(filename);
 }
 
 export fn rename(old: [*:0]const u8, new: [*:0]const u8) callconv(.c) c_int {
-    trace.log("rename {f} {f}", .{ trace.fmtStr(old), trace.fmtStr(new) });
+    trace.log("rename {*} {*}", .{ old, new });
     if (builtin.os.tag.isDarwin()) {
         const rc = syscall(darwin_syscall.rename, old, new);
         if (rc == -1) {
@@ -1799,7 +1915,7 @@ export fn _fread_buf(ptr: [*]u8, size: usize, stream: *c.FILE) callconv(.c) usiz
     return prefilled;
 }
 
-export fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
+export fn fread(noalias ptr: [*]u8, size: usize, nmemb: usize, noalias stream: *c.FILE) callconv(.c) usize {
     const entry = entryFromFile(stream);
     if (size == 0 or nmemb == 0) return 0;
     if (stream.eof != 0 and !entry.unread_valid and entryBufferedReadLen(entry) == 0 and !global.hasRemainder(stream)) {
@@ -1830,7 +1946,7 @@ fn fopenImpl(
     force_largefile: bool,
     comptime func_name: []const u8,
 ) ?*c.FILE {
-    trace.log("{s} {f} mode={f}", .{ func_name, trace.fmtStr(filename), trace.fmtStr(mode) });
+    trace.log("{s} {*} mode={*}", .{ func_name, filename, mode });
     const ModeKind = enum { read, write, append };
     const ParsedMode = struct {
         kind: ModeKind,
@@ -1838,13 +1954,12 @@ fn fopenImpl(
         excl: bool = false,
     };
     const parsed: ParsedMode = blk: {
-        const mode_slice = std.mem.span(mode);
-        if (mode_slice.len == 0) {
+        if (mode[0] == 0) {
             errno = c.EINVAL;
             return null;
         }
         var p = ParsedMode{
-            .kind = switch (mode_slice[0]) {
+            .kind = switch (mode[0]) {
                 'r' => .read,
                 'w' => .write,
                 'a' => .append,
@@ -1854,7 +1969,9 @@ fn fopenImpl(
                 },
             },
         };
-        for (mode_slice[1..]) |mode_char| {
+        var mode_index: usize = 1;
+        while (mode[mode_index] != 0) : (mode_index += 1) {
+            const mode_char = mode[mode_index];
             switch (mode_char) {
                 'b', 't', 'e' => {},
                 '+' => p.plus = true,
@@ -1953,16 +2070,16 @@ fn fopenImpl(
     return file;
 }
 
-pub export fn fopen(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
-    return fopenImpl(filename, mode, false, "fopen");
+noinline fn zfopen(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
+    return @call(.never_inline, fopenImpl, .{ filename, mode, false, "fopen" });
 }
 
-pub export fn fopen64(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
-    return fopenImpl(filename, mode, true, "fopen64");
+noinline fn zfopen64(filename: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*c.FILE {
+    return @call(.never_inline, fopenImpl, .{ filename, mode, true, "fopen64" });
 }
 
-export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE) callconv(.c) ?*c.FILE {
-    const new_stream = fopenImpl(filename, mode, false, "freopen") orelse return null;
+noinline fn zfreopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE) callconv(.c) ?*c.FILE {
+    const new_stream = @call(.never_inline, fopenImpl, .{ filename, mode, false, "freopen" }) orelse return null;
     if (builtin.os.tag == .windows) {
         if (winfd.fdFromHandle(stream.fd.?)) |fd| {
             const close_errno = winfd.closeFd(fd);
@@ -1997,6 +2114,12 @@ export fn freopen(filename: [*:0]const u8, mode: [*:0]const u8, stream: *c.FILE)
     clearEntryReadBuffer(new_entry);
     if (new_stream != stream) global.releaseFile(new_stream);
     return stream;
+}
+
+comptime {
+    @export(&zfopen, .{ .name = "fopen" });
+    @export(&zfopen64, .{ .name = "fopen64" });
+    @export(&zfreopen, .{ .name = "freopen" });
 }
 
 export fn fclose(stream: *c.FILE) callconv(.c) c_int {
@@ -2401,7 +2524,7 @@ inline fn vaArgCompat(args: VaListCursor, comptime T: type) T {
 
 fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args: VaListCursor) callconv(.c) bool {
     out_written.* = 0;
-    const fmt_slice = std.mem.span(fmt);
+    const fmt_slice = sentinelSliceVol(fmt);
     var i: usize = 0;
 
     while (true) {
@@ -2498,7 +2621,7 @@ fn vformat(out_written: *usize, writer: *FormatWriter, fmt: [*:0]const u8, args:
                 const maybe_s = vaArgCompat(args, ?[*:0]const u8);
                 const s = maybe_s orelse "(null)";
                 const len = if (precision == precision_none or precision < 0)
-                    std.mem.len(s)
+                    sentinelLenVol(s)
                 else
                     stringPrintLen(s, @intCast(precision));
                 if (!writeFormattedField(writer, out_written, "", s[0..len], width, flags.left_adjust, ' ')) return false;
@@ -2616,7 +2739,7 @@ fn vformatWithCVaListPtr(
     @compileError("unsupported C va_list representation");
 }
 
-fn _zvfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+fn zvfprintfImpl(noalias stream: *c.FILE, noalias format: [*:0]const u8, arg: *c.va_list) c_int {
     var writer = FormatWriter{ .stream = stream };
     var written: usize = 0;
     const ok = vformatWithCVaListPtr(&written, &writer, format, arg);
@@ -2627,8 +2750,11 @@ fn _zvfprintf(stream: *c.FILE, format: [*:0]const u8, arg: *c.va_list) callconv(
         return -1;
     }
 }
+noinline fn _zvfprintf(noalias stream: *c.FILE, noalias format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+    return @call(.never_inline, zvfprintfImpl, .{ stream, format, arg });
+}
 
-fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+fn zvsnprintfImpl(noalias s: [*]u8, n: usize, noalias format: [*:0]const u8, arg: *c.va_list) c_int {
     var writer = FormatWriter{ .bounded = .{
         .buf = s,
         .len = n,
@@ -2643,8 +2769,11 @@ fn _zvsnprintf(s: [*]u8, n: usize, format: [*:0]const u8, arg: *c.va_list) callc
     if (n != 0) s[@min(written, n - 1)] = 0;
     return @intCast(written);
 }
+noinline fn _zvsnprintf(noalias s: [*]u8, n: usize, noalias format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+    return @call(.never_inline, zvsnprintfImpl, .{ s, n, format, arg });
+}
 
-fn _zvsprintf(s: [*]u8, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+fn zvsprintfImpl(noalias s: [*]u8, noalias format: [*:0]const u8, arg: *c.va_list) c_int {
     var writer = FormatWriter{ .unbounded = .{
         .buf = s,
     } };
@@ -2657,6 +2786,9 @@ fn _zvsprintf(s: [*]u8, format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_i
     }
     s[written] = 0;
     return @intCast(written);
+}
+noinline fn _zvsprintf(noalias s: [*]u8, noalias format: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+    return @call(.never_inline, zvsprintfImpl, .{ s, format, arg });
 }
 
 const ScanKind = enum {
@@ -2769,7 +2901,7 @@ fn getNextScan(fmt: []const u8, index: *usize) Scan {
 }
 
 fn vscan(reader: *FixedReader, fmt: [*:0]const u8, args: VaListCursor) callconv(.c) c_int {
-    const fmt_slice = std.mem.span(fmt);
+    const fmt_slice = sentinelSliceVol(fmt);
     var fmt_index: usize = 0;
     var scan_count: c_int = 0;
 
@@ -2876,9 +3008,12 @@ fn vscanWithCVaListPtr(reader: *FixedReader, fmt: [*:0]const u8, arg: *c.va_list
     @compileError("unsupported C va_list representation");
 }
 
-fn _zvsscanf(s: [*:0]const u8, fmt: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+fn zvsscanfImpl(noalias s: [*:0]const u8, noalias fmt: [*:0]const u8, arg: *c.va_list) c_int {
     var reader = FixedReader{ .buf = s };
     return vscanWithCVaListPtr(&reader, fmt, arg);
+}
+noinline fn _zvsscanf(noalias s: [*:0]const u8, noalias fmt: [*:0]const u8, arg: *c.va_list) callconv(.c) c_int {
+    return @call(.never_inline, zvsscanfImpl, .{ s, fmt, arg });
 }
 
 comptime {
@@ -2895,7 +3030,7 @@ comptime {
     }
 }
 
-export fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *c.FILE) callconv(.c) usize {
+export fn fwrite(noalias ptr: [*]const u8, size: usize, nmemb: usize, noalias stream: *c.FILE) callconv(.c) usize {
     trace.log("fwrite {*} size={} n={} stream={*}", .{ ptr, size, nmemb, stream });
     if (size == 0 or nmemb == 0) return 0;
     const total = size * nmemb;
@@ -2915,23 +3050,34 @@ export fn putchar(ch: c_int) callconv(.c) c_int {
     return if (1 == _fwrite_buf(&buf, 1, stdout)) buf[0] else c.EOF;
 }
 
-export fn puts(s: [*:0]const u8) callconv(.c) c_int {
-    trace.log("puts {f}", .{trace.fmtStr(s)});
-    const len = std.mem.len(s);
+fn putsImpl(s: [*:0]const u8) c_int {
+    trace.log("puts {*}", .{s});
+    const len = sentinelLenVol(s);
     if (_fwrite_buf(s, len, stdout) != len) return c.EOF;
     const newline = [_]u8{'\n'};
     if (_fwrite_buf(&newline, 1, stdout) != 1) return c.EOF;
     return 1;
 }
+noinline fn zputs(s: [*:0]const u8) callconv(.c) c_int {
+    return @call(.never_inline, putsImpl, .{s});
+}
 
-export fn fputs(s: [*:0]const u8, stream: *c.FILE) callconv(.c) c_int {
-    trace.log("fputs {f} stream={*}", .{ trace.fmtStr(s), stream });
-    const len = std.mem.len(s);
+fn fputsImpl(noalias s: [*:0]const u8, noalias stream: *c.FILE) c_int {
+    trace.log("fputs {*} stream={*}", .{ s, stream });
+    const len = sentinelLenVol(s);
     const written = _fwrite_buf(s, len, stream);
     return if (written == len) 1 else c.EOF;
 }
+noinline fn zfputs(noalias s: [*:0]const u8, noalias stream: *c.FILE) callconv(.c) c_int {
+    return @call(.never_inline, fputsImpl, .{ s, stream });
+}
 
-export fn fgets(s: [*]u8, n: c_int, stream: *c.FILE) callconv(.c) ?[*]u8 {
+comptime {
+    @export(&zputs, .{ .name = "puts" });
+    @export(&zfputs, .{ .name = "fputs" });
+}
+
+export fn fgets(noalias s: [*]u8, n: c_int, noalias stream: *c.FILE) callconv(.c) ?[*]u8 {
     if (n <= 0) return null;
     if (n == 1) {
         s[0] = 0;
@@ -3123,13 +3269,18 @@ export fn tmpfile() callconv(.c) ?*c.FILE {
     return null;
 }
 
-export fn tmpnam(s: [*]u8) callconv(.c) [*]u8 {
+export fn tmpnam(s: ?[*]u8) callconv(.c) ?[*]u8 {
     const id = @atomicRmw(u32, &global.tmpnam_counter, .Add, 1, .seq_cst);
     var tmp: [c.L_tmpnam]u8 = [_]u8{0} ** c.L_tmpnam;
     const name = std.fmt.bufPrint(tmp[0 .. tmp.len - 1], "zltmp{x:0>8}", .{id}) catch unreachable;
-    @memcpy(s[0..name.len], name);
-    s[name.len] = 0;
-    return s;
+    if (s) |out| {
+        @memcpy(out[0..name.len], name);
+        out[name.len] = 0;
+        return out;
+    }
+    @memcpy(global.tmpnam_storage[0..name.len], name);
+    global.tmpnam_storage[name.len] = 0;
+    return &global.tmpnam_storage;
 }
 
 export fn clearerr(stream: *c.FILE) callconv(.c) void {
@@ -3158,16 +3309,23 @@ export fn ferror(stream: *c.FILE) callconv(.c) c_int {
     return stream.errno;
 }
 
-export fn perror(s: [*:0]const u8) callconv(.c) void {
-    trace.log("perror {f}", .{trace.fmtStr(s)});
-    const prefix_len = std.mem.len(s);
+fn perrorImpl(s: [*:0]const u8) void {
+    trace.log("perror {*}", .{s});
+    const prefix_len = sentinelLenVol(s);
     if (prefix_len != 0) {
         _ = _fwrite_buf(s, prefix_len, stderr);
         _ = _fwrite_buf(": ", 2, stderr);
     }
-    const message = std.mem.span(strerror(errno));
-    _ = _fwrite_buf(message.ptr, message.len, stderr);
+    const message = strerror(errno);
+    _ = _fwrite_buf(message, sentinelLenVol(message), stderr);
     _ = _fwrite_buf("\n", 1, stderr);
+}
+noinline fn zperror(s: [*:0]const u8) callconv(.c) void {
+    @call(.never_inline, perrorImpl, .{s});
+}
+
+comptime {
+    @export(&zperror, .{ .name = "perror" });
 }
 
 // NOTE: this is not a libc function, it's exported so it can be used

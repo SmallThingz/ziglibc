@@ -1,6 +1,8 @@
 #ifndef _PTHREAD_H
 #define _PTHREAD_H
 
+#include "../libc/private/restrict.h"
+
 #define PTHREAD_BARRIER_SERIAL_THREAD (-1)
 #define PTHREAD_CANCEL_ASYNCHRONOUS 1
 #define PTHREAD_CANCEL_ENABLE 0
@@ -70,7 +72,7 @@ typedef int pthread_spinlock_t;
 #define _PTHREAD_MUTEX_SIG_init 0x32AAABA7L
 #define _PTHREAD_COND_SIG_init 0x3CB0B1BBL
 #define PTHREAD_MUTEX_INITIALIZER {_PTHREAD_MUTEX_SIG_init, {0}}
-int pthread_mutex_init(pthread_mutex_t *restrict, const pthread_mutexattr_t *restrict);
+int pthread_mutex_init(pthread_mutex_t *, const pthread_mutexattr_t *);
 int pthread_mutex_destroy(pthread_mutex_t *);
 int pthread_mutex_lock(pthread_mutex_t *);
 int pthread_mutex_unlock(pthread_mutex_t *);
@@ -78,16 +80,16 @@ int pthread_mutex_unlock(pthread_mutex_t *);
 #define PTHREAD_COND_INITIALIZER {_PTHREAD_COND_SIG_init, {0}}
 #else
 #define PTHREAD_MUTEX_INITIALIZER 0
-int pthread_mutex_init(pthread_mutex_t *restrict, const pthread_mutexattr_t *restrict);
+int pthread_mutex_init(pthread_mutex_t *, const pthread_mutexattr_t *);
 int pthread_mutex_destroy(pthread_mutex_t *);
 int pthread_mutex_lock(pthread_mutex_t *);
 int pthread_mutex_unlock(pthread_mutex_t *);
 
 #define PTHREAD_COND_INITIALIZER 0
 #endif
-int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr);
+int pthread_cond_init(pthread_cond_t *__zrestrict cond, const pthread_condattr_t *__zrestrict attr);
 int pthread_cond_destroy(pthread_cond_t *cond);
-int pthread_cond_wait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex);
+int pthread_cond_wait(pthread_cond_t *__zrestrict cond, pthread_mutex_t *__zrestrict mutex);
 int pthread_cond_broadcast(pthread_cond_t *cond);
 int pthread_cond_signal(pthread_cond_t *cond);
 
